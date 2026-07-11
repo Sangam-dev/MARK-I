@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+.env/
+
+test_genai.py/
+
+graphify-out/
+protoypes/
+
+
+.env
+.env.*
+!.env.example
+
