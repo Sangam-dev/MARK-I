@@ -23,8 +23,8 @@ load_dotenv()
 VOICE = "en-US-AriaNeural"
 SAMPLE_RATE = 16000
 CHUNK_DURATION = 0.03
-CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)
-SILENCE_THRESH = 0.01
+CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)  # now actually used as blocksize
+SILENCE_THRESH = 0.01  # fallback default if calibration fails
 SILENCE_LIMIT = 1.5
 MAX_DURATION = 15.0
 MIN_SPEECH_SECS = 0.5
@@ -32,6 +32,18 @@ MAX_HISTORY = 12
 SPEECH_START_SECS = 0.24
 LOW_CONFIDENCE_AUDIO_RMS = 0.025
 LOW_CONFIDENCE_AUDIO_SECS = 1.2
+
+# FIX #2: onset tolerance — how many low-RMS chunks we allow during the
+# "is this really speech starting" window before we give up and reset.
+# Unvoiced consonants (t, s, p, k, f) routinely dip below threshold for
+# 1-2 frames even mid-word, let alone at onset. Without this, fast speech
+# gets its first syllable eaten constantly.
+ONSET_TOLERANCE_CHUNKS = 3  # ~90ms of tolerated dips during onset
+
+# FIX #3: calibration settings for noise-floor-relative threshold instead
+# of a hardcoded magic number that only works for one mic/room/gain combo.
+CALIBRATION_SECS = 0.3
+CALIBRATION_MULTIPLIER = 3.5
 
 SILENCE_HALLUCINATIONS = {
     "thank you",
@@ -86,19 +98,64 @@ def _is_probable_silence_hallucination(text: str, audio: np.ndarray) -> bool:
     return duration < LOW_CONFIDENCE_AUDIO_SECS or rms < LOW_CONFIDENCE_AUDIO_RMS
 
 
+async def _calibrate_noise_floor(
+    sample_rate: int = SAMPLE_RATE,
+    calibration_secs: float = CALIBRATION_SECS,
+    multiplier: float = CALIBRATION_MULTIPLIER,
+    fallback: float = SILENCE_THRESH,
+) -> float:
+    """
+    Sample a short burst of ambient audio and derive a silence threshold
+    relative to the actual noise floor, instead of relying on a hardcoded
+    constant that only makes sense for one specific mic/gain/room.
+    """
+    try:
+        frames = int(sample_rate * calibration_secs)
+        rec = sd.rec(
+            frames,
+            samplerate=sample_rate,
+            channels=1,
+            dtype="float32",
+            blocksize=CHUNK_SIZE,
+        )
+        sd.wait()
+        noise_rms = _audio_rms(rec.flatten())
+
+        threshold = max(noise_rms * multiplier, fallback * 0.5)
+        print(f"🎚 Calibrated noise floor: {noise_rms:.5f} -> threshold {threshold:.5f}")
+        return threshold
+    except Exception as exc:
+        print(f"⚠ Calibration failed ({exc}), using fallback threshold {fallback}")
+        return fallback
+
+
 async def listen(
     sample_rate: int = SAMPLE_RATE,
-    chunk_duration: float = 0.03,
-    silence_threshold: float = 0.01,
-    silence_limit: float = 1.5,
-    max_duration: float = 15.0,
+    chunk_duration: float = CHUNK_DURATION,
+    silence_threshold: float | None = None,
+    silence_limit: float = SILENCE_LIMIT,
+    max_duration: float = MAX_DURATION,
     min_speech_secs: float = MIN_SPEECH_SECS,
+    calibrate: bool = True,
 ) -> np.ndarray | None:
     """
     Listen until speech ends using simple RMS-based VAD.
+
+    If silence_threshold is None and calibrate=True, the threshold is
+    derived from a short ambient-noise sample instead of using a fixed
+    magic number (FIX #3).
     """
 
+    if silence_threshold is None:
+        silence_threshold = (
+            await _calibrate_noise_floor(sample_rate)
+            if calibrate
+            else SILENCE_THRESH
+        )
+
     print("\n🎤 Listening...")
+
+    chunk_size = int(sample_rate * chunk_duration)
 
     chunks = []
     pending_speech_chunks = []
@@ -106,6 +163,7 @@ async def listen(
     started = False
     silent_chunks = 0
     speech_start_chunks = 0
+    onset_gap_chunks = 0  # FIX #2: tracks tolerated dips during onset
     total_chunks = 0
 
     max_chunks = int(max_duration / chunk_duration)
@@ -120,6 +178,7 @@ async def listen(
         nonlocal started
         nonlocal silent_chunks
         nonlocal speech_start_chunks
+        nonlocal onset_gap_chunks
         nonlocal total_chunks
         nonlocal blocked_by_tts
 
@@ -140,8 +199,13 @@ async def listen(
 
         if rms > silence_threshold:
             if not started:
+                # FIX #2: any above-threshold frame resets the onset gap
+                # counter and keeps accumulating pending speech, instead
+                # of requiring an unbroken run of loud chunks.
                 pending_speech_chunks.append(indata.copy())
                 speech_start_chunks += 1
+                onset_gap_chunks = 0
+
                 if speech_start_chunks < speech_start_chunks_required:
                     return
 
@@ -156,8 +220,16 @@ async def listen(
             silent_chunks = 0
 
         else:
-            speech_start_chunks = 0
-            pending_speech_chunks.clear()
+            if not started:
+                # FIX #2: tolerate brief dips (unvoiced consonants, etc.)
+                # during onset instead of nuking the buffer on frame one.
+                onset_gap_chunks += 1
+                if onset_gap_chunks > ONSET_TOLERANCE_CHUNKS:
+                    speech_start_chunks = 0
+                    pending_speech_chunks.clear()
+                    onset_gap_chunks = 0
+                # else: keep pending_speech_chunks and speech_start_chunks
+                # as-is, give the next chunk a chance to recover.
 
         if started and rms <= silence_threshold:
             chunks.append(indata.copy())
@@ -171,10 +243,15 @@ async def listen(
         if total_chunks >= max_chunks:
             loop.call_soon_threadsafe(stop_event.set)
 
+    # FIX #1: blocksize was computed (CHUNK_SIZE) but never passed to the
+    # stream, so PortAudio picked its own buffer size and every duration-based
+    # threshold in this function (onset, silence, max) was operating on a
+    # false assumption about how much audio each callback represented.
     with sd.InputStream(
         samplerate=sample_rate,
         channels=1,
         dtype="float32",
+        blocksize=chunk_size,
         callback=callback,
     ):
         await stop_event.wait()
@@ -246,10 +323,10 @@ async def transcribe(audio: np.ndarray) -> str:
 
 async def listen_and_transcribe(
     sample_rate: int = SAMPLE_RATE,
-    chunk_duration: float = 0.03,
-    silence_threshold: float = 0.01,
-    silence_limit: float = 1.5,
-    max_duration: float = 15.0,
+    chunk_duration: float = CHUNK_DURATION,
+    silence_threshold: float | None = None,
+    silence_limit: float = SILENCE_LIMIT,
+    max_duration: float = MAX_DURATION,
     min_speech_secs: float = MIN_SPEECH_SECS,
 ) -> str | None:
     """
