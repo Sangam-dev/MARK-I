@@ -398,12 +398,14 @@ class MicrophoneListener:
         self._wake_word_gated = wake_word_gated
         self._running = False
         self._wake_event = asyncio.Event()
+        self._current_state = AssistantState.IDLE
 
     def register(self) -> None:
         """Subscribe to bus events."""
         if self._wake_word_gated:
             self._bus.subscribe(WakeWordDetected, self._on_wake_word)
         self._bus.subscribe(ShutdownRequested, self._on_shutdown)
+        self._bus.subscribe(AssistantStateChanged, self._on_state_changed)
 
     async def _on_wake_word(self, event: WakeWordDetected) -> None:
         """Signal that we should start one listen-transcribe cycle."""
@@ -412,6 +414,10 @@ class MicrophoneListener:
     async def _on_shutdown(self, event: ShutdownRequested) -> None:
         self._running = False
         self._wake_event.set()  # unblock any waiting
+
+    async def _on_state_changed(self, event: AssistantStateChanged) -> None:
+        if event.session_id == self._session_id:
+            self._current_state = event.state
 
     async def run(self) -> None:
         """Main loop — call this as an asyncio task."""
@@ -440,11 +446,12 @@ class MicrophoneListener:
                 text = await listen_and_transcribe()
             except Exception as exc:
                 _stt_logger.exception("listen_and_transcribe error: %s", exc)
-                self._bus.emit(
-                    AssistantStateChanged(
-                        state=AssistantState.IDLE, session_id=self._session_id
+                if self._current_state == AssistantState.LISTENING:
+                    self._bus.emit(
+                        AssistantStateChanged(
+                            state=AssistantState.IDLE, session_id=self._session_id
+                        )
                     )
-                )
                 await asyncio.sleep(0.5)
                 continue
 
@@ -484,11 +491,13 @@ class MicrophoneListener:
             else:
                 # No usable speech captured this cycle — back to idle rather
                 # than leaving the UI stuck showing "listening".
-                self._bus.emit(
-                    AssistantStateChanged(
-                        state=AssistantState.IDLE, session_id=self._session_id
+                # But only if the state is currently LISTENING (to avoid overriding THINKING or SPEAKING).
+                if self._current_state == AssistantState.LISTENING:
+                    self._bus.emit(
+                        AssistantStateChanged(
+                            state=AssistantState.IDLE, session_id=self._session_id
+                        )
                     )
-                )
                 if not self._wake_word_gated:
                     # Brief pause before re-listening in continuous mode
                     await asyncio.sleep(0.1)
