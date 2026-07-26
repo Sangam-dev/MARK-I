@@ -52,41 +52,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Core ──────────────────────────────────────────────────────────────────────
-from core.bus import EventBus
-from core.events import (
-    IntentIdentified,
-    MemoryRetrieved,
-    ReasoningRequested,
-    ShutdownRequested,
-    SystemError,
-)
+from core.events import ShutdownRequested
+from core.pipeline import build_pipeline, shutdown_pipeline
 from core.project_logging import setup_logging
 
 # ── Input: text (always available) ────────────────────────────────────────────
 from input.text_input import TextInputHandler
 
-# ── Memory ────────────────────────────────────────────────────────────────────
-from memory.manager import MemoryManager
-
-# ── NLU ───────────────────────────────────────────────────────────────────────
-from nlu.classifier import NLUClassifier
-from output.response_formatter import ResponseFormatter
-
-# ── Output ────────────────────────────────────────────────────────────────────
-from output.tts import TTSHandler
-from reasoning.coordinator import ReasoningCoordinator
-
-# ── Reasoning ─────────────────────────────────────────────────────────────────
-from reasoning.llm_client import GeminiClient
-# RAG is intentionally disabled for now.
-# from reasoning.rag import RAGPipeline
-
-# ── Tasks ─────────────────────────────────────────────────────────────────────
-from tasks.executor import TaskExecutor
-
 # ── Input: STT/voice (requires groq package) ──────────────────────────────────
 # Imported lazily inside _run() when --voice mode is selected so that
 # missing `groq` never prevents --text mode from starting.
+#
+# NOTE: all other module wiring (EventBus, Memory, LLM, NLU, Reasoning,
+# TaskExecutor, output handlers) now lives in core/pipeline.py, shared with
+# api/server.py. See answers/guide.md for how the two entry points relate.
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 _DATA_DIR = Path(__file__).parent / "memory" / "data"
@@ -146,9 +125,9 @@ def _parse_args() -> argparse.Namespace:
         help="Max tokens passed in LLM context window (default: 4000)",
     )
     parser.add_argument(
-    "--script",
-    metavar="FILE",
-    help="Execute a scripted demonstration from a JSON file",
+        "--script",
+        metavar="FILE",
+        help="Execute a scripted demonstration from a JSON file",
     )
 
     return parser.parse_args()
@@ -168,113 +147,40 @@ async def _run(args: argparse.Namespace) -> None:
     logger.info("JARVIS starting  (session=%s)", args.session)
     logger.info("=" * 60)
 
-    # ── 1. EventBus ───────────────────────────────────────────────────────────
-    bus = EventBus()
-    logger.debug("EventBus created: %r", bus)
+    # ── 1–10. Shared pipeline (EventBus, Memory, LLM, NLU, Reasoning, Tasks, Output) ──
+    # All of this used to be inline here. It now lives in core/pipeline.py so
+    # api/server.py can build the exact same pipeline for the WebSocket/REST
+    # front door without duplicating the wiring. See answers/guide.md.
+    pipeline = await build_pipeline(
+        session_id=args.session,
+        data_dir=_DATA_DIR,
+        enable_tts=not args.no_tts,
+        enable_console_formatter=True,
+    )
+    bus = pipeline.bus
+    logger.debug("Pipeline built: %r", pipeline)
 
-    # Shutdown coordination — any module emits ShutdownRequested to exit.
+    # Shutdown coordination ── any module emits ShutdownRequested to exit.
     _shutdown_event = asyncio.Event()
 
     async def _handle_shutdown(event: ShutdownRequested) -> None:
-        logger.info("Shutdown requested: %s — stopping…", event.reason)
+        logger.info("Shutdown requested: %s ── stopping…", event.reason)
         _shutdown_event.set()
 
     bus.subscribe(ShutdownRequested, _handle_shutdown)
 
-    # Central system-error logger so nothing is silently swallowed.
-    async def _handle_system_error(event: SystemError) -> None:
-        lvl = logging.WARNING if event.recoverable else logging.ERROR
-        logger.log(
-            lvl, "SystemError [%s]: %s", event.source_module, event.error_message
-        )
-
-    bus.subscribe(SystemError, _handle_system_error)
-
-    # ── 2. Memory ─────────────────────────────────────────────────────────────
-    memory = MemoryManager(bus=bus, data_dir=_DATA_DIR, session_id=args.session)
-    try:
-        await memory.initialize()
-        logger.info("Memory initialised  (structured facts=SQLite, vector/RAG=disabled)")
-    except Exception as exc:
-        logger.warning(
-            "Memory initialisation failure: %s — continuing without persistent memory.",
-            exc,
-        )
-
-    # Wire MemoryManager's @subscribe-decorated handlers into the bus.
-    bus.register_handlers(memory)
-    logger.debug("MemoryManager event handlers registered via @subscribe decorators")
-
-    # ── 3. LLM Client ─────────────────────────────────────────────────────────
-    llm = GeminiClient()
-    await llm.initialize()
-    key_count = len(llm.pool._entries) if llm.pool else 0
+    key_count = len(pipeline.llm.pool._entries) if pipeline.llm.pool else 0
     logger.info("GeminiClient initialised  (%d API key(s) in pool)", key_count)
-
-    # ── 5. NLU Classifier ─────────────────────────────────────────────────────
-    # Subscribes to: TextInputReceived, TranscriptReady
-    # Emits:         IntentIdentified
-    nlu = NLUClassifier(llm_client=llm, bus=bus)
-    nlu.register()
+    logger.info("Memory initialised  (structured facts=SQLite, vector/RAG=disabled)")
     logger.info("NLUClassifier registered  (regex fast-path + LLM fallback)")
-
-    # ── 6. Reasoning request bridge ──────────────────────────────────────────
-    # RAG is intentionally disabled. This bridge forwards intents to reasoning
-    # with only durable user facts from SQLite, and no vector/episodic context.
-    async def _handle_intent_identified(event: IntentIdentified) -> None:
-        facts = await memory.get_all_facts()
-        memory_event = MemoryRetrieved(
-            session_id=event.session_id,
-            query=event.raw_input,
-            structured_context=facts,
-            episodic_context=[],
-        )
-        bus.emit(
-            ReasoningRequested(
-                session_id=event.session_id,
-                intent_event=event,
-                memory_events=[memory_event],
-            )
-        )
-
-    bus.subscribe(IntentIdentified, _handle_intent_identified)
     logger.info("Reasoning bridge registered  (facts only, RAG disabled)")
-
-    # ── 7. Reasoning Coordinator ──────────────────────────────────────────────
-    # Subscribes to: ReasoningRequested, TaskCompleted
-    # Emits:         TaskExecutionRequested  (for task intents)
-    #                ResponseReady            (for conversational intents + post-task)
-    #                MemoryUpdateNeeded       (to persist turns)
-    coordinator = ReasoningCoordinator(
-        bus=bus,
-        gemini_client=llm,
-        memory_manager=memory,
-    )
-    coordinator.register()
     logger.info("ReasoningCoordinator registered")
-
-    # ── 8. Task Executor ──────────────────────────────────────────────────────
-    # Subscribes to: TaskExecutionRequested
-    # Emits:         TaskCompleted
-    task_executor = TaskExecutor(bus=bus)
-    task_executor.register()
     logger.info(
         "TaskExecutor registered  "
         "(tasks: open_app, set_alarm, list_alarms, cancel_alarms, "
         "get_weather, sleep, shutdown, restart, file_operation)"
     )
-
-    # ── 9. Output: console formatter (always active) ──────────────────────────
-    # Subscribes to: ResponseReady
-    formatter = ResponseFormatter(bus=bus)
-    formatter.register()
-    logger.debug("ResponseFormatter registered")
-
-    # ── 10. Output: TTS (optional) ────────────────────────────────────────────
-    # Subscribes to: ResponseReady
-    if not args.no_tts:
-        tts_handler = TTSHandler(bus=bus)
-        tts_handler.register()
+    if pipeline.tts is not None:
         logger.info("TTSHandler registered  (edge-tts + sounddevice, mutex-serialised)")
     else:
         logger.info("TTS disabled  (--no-tts flag set)")
@@ -291,7 +197,9 @@ async def _run(args: argparse.Namespace) -> None:
         print("  Type  exit  or  quit  to shut down.")
         print("=" * 60 + "\n")
 
-        text_handler = TextInputHandler(bus=bus, session_id=args.session, script_file=args.script)
+        text_handler = TextInputHandler(
+            bus=bus, session_id=args.session, script_file=args.script
+        )
         input_tasks.append(asyncio.create_task(text_handler.run(), name="text_input"))
 
     else:
@@ -347,21 +255,8 @@ async def _run(args: argparse.Namespace) -> None:
             except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 pass
 
-    # Drain any still-running event handlers (give them up to 3 s).
-    try:
-        await asyncio.wait_for(bus.drain(), timeout=3.0)
-    except asyncio.TimeoutError:
-        logger.warning("Bus drain timed out — some handlers may not have completed")
-
-    # Close the bus (cancels stray tasks, clears handler registry).
-    await bus.close()
-
-    # Close memory backends (flush SQLite WAL).
-    try:
-        await memory.close()
-        logger.debug("Memory backends closed")
-    except Exception as exc:
-        logger.warning("Memory close error (non-fatal): %s", exc)
+    # Drain in-flight event handlers, close the bus, and flush memory backends.
+    await shutdown_pipeline(pipeline)
 
     logger.info("JARVIS stopped. Goodbye.")
     print("\nJARVIS: Goodbye.\n")

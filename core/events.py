@@ -147,6 +147,34 @@ class ResponseReady(BaseEvent):
     requires_task: bool = False
 
 
+# -------------- UI / Presentation Events -----------------#
+
+
+class AssistantState(str, Enum):
+    IDLE = "idle"
+    LISTENING = "listening"
+    THINKING = "thinking"
+    SPEAKING = "speaking"
+
+
+@dataclass(frozen=True)
+class AssistantStateChanged(BaseEvent):
+    """
+    Event triggered when the assistant's high-level UI state changes.
+
+    This exists purely to drive presentation layers (e.g. the jarvis_frontend
+    orb animation) — it carries no business data, only a state label.
+
+    emitted by: input/stt.py (listening -> thinking), output/tts.py
+                (speaking -> idle), api/server.py (thinking, for text input
+                which has no "listening" phase; idle fallback when TTS is
+                disabled)
+    consumed by: api/bridge.py (forwards to WebSocket clients)
+    """
+
+    state: AssistantState = AssistantState.IDLE
+
+
 @dataclass(frozen=True)
 class TaskExecutionRequested(BaseEvent):
     """

@@ -5,10 +5,12 @@ import re
 import sys
 import time
 import wave
-from core.audio_state import audio_state
+
 import numpy as np
 import sounddevice as sd
 from dotenv import load_dotenv
+
+from core.audio_state import audio_state
 
 try:
     from groq import Groq
@@ -148,9 +150,7 @@ async def listen(
 
     if silence_threshold is None:
         silence_threshold = (
-            await _calibrate_noise_floor(sample_rate)
-            if calibrate
-            else SILENCE_THRESH
+            await _calibrate_noise_floor(sample_rate) if calibrate else SILENCE_THRESH
         )
 
     print("\n🎤 Listening...")
@@ -367,7 +367,13 @@ async def listen_and_transcribe(
 import logging as _stt_logging
 
 from core.bus import EventBus
-from core.events import ShutdownRequested, TranscriptReady, WakeWordDetected
+from core.events import (
+    AssistantState,
+    AssistantStateChanged,
+    ShutdownRequested,
+    TranscriptReady,
+    WakeWordDetected,
+)
 
 _stt_logger = _stt_logging.getLogger("kancha.input.stt")
 
@@ -423,10 +429,22 @@ class MicrophoneListener:
                 if not self._running:
                     break
 
+            # UI state: the mic is open and actively recording/listening.
+            self._bus.emit(
+                AssistantStateChanged(
+                    state=AssistantState.LISTENING, session_id=self._session_id
+                )
+            )
+
             try:
                 text = await listen_and_transcribe()
             except Exception as exc:
                 _stt_logger.exception("listen_and_transcribe error: %s", exc)
+                self._bus.emit(
+                    AssistantStateChanged(
+                        state=AssistantState.IDLE, session_id=self._session_id
+                    )
+                )
                 await asyncio.sleep(0.5)
                 continue
 
@@ -435,6 +453,16 @@ class MicrophoneListener:
 
             if text and text.strip():
                 _stt_logger.info("Transcript: %r", text)
+
+                # UI state: recording finished, a transcript is ready — the
+                # rest of the pipeline (NLU -> Reasoning -> LLM) is now
+                # "thinking". TTSHandler will move this to SPEAKING/IDLE once
+                # a response is ready (see output/tts.py).
+                self._bus.emit(
+                    AssistantStateChanged(
+                        state=AssistantState.THINKING, session_id=self._session_id
+                    )
+                )
 
                 self._bus.emit(
                     TranscriptReady(
@@ -454,6 +482,13 @@ class MicrophoneListener:
                 #
                 await audio_state.wait_until_idle()
             else:
+                # No usable speech captured this cycle — back to idle rather
+                # than leaving the UI stuck showing "listening".
+                self._bus.emit(
+                    AssistantStateChanged(
+                        state=AssistantState.IDLE, session_id=self._session_id
+                    )
+                )
                 if not self._wake_word_gated:
                     # Brief pause before re-listening in continuous mode
                     await asyncio.sleep(0.1)

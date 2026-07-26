@@ -12,12 +12,14 @@ While sentence N plays, N+1 is already synthesizing — zero gap between sentenc
 """
 
 from __future__ import annotations
-from core.audio_state import audio_state
+
 import asyncio
 import io
 import re
 import sys
 import time
+
+from core.audio_state import audio_state
 
 try:
     import edge_tts
@@ -29,7 +31,7 @@ except ImportError:
 import logging
 
 from core.bus import EventBus
-from core.events import ResponseReady
+from core.events import AssistantState, AssistantStateChanged, ResponseReady
 
 logger = logging.getLogger("kancha.output.tts")
 
@@ -224,8 +226,18 @@ class TTSHandler:
         logger.info("TTS: ResponseReady received, speaking...")
 
         audio_state.speaking_started()
+        self._bus.emit(
+            AssistantStateChanged(
+                state=AssistantState.SPEAKING, session_id=event.session_id
+            )
+        )
 
         try:
             await speak(event.text)
         finally:
             audio_state.speaking_finished()
+            self._bus.emit(
+                AssistantStateChanged(
+                    state=AssistantState.IDLE, session_id=event.session_id
+                )
+            )
