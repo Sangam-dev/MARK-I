@@ -1844,121 +1844,58 @@ export default function App() {
                             );
                         })()}
 
-                    {/* State controls */}
+                    {/* Chat toggle — centered below the orb */}
                     <g
                         className="no-drag"
-                        transform={`translate(${CX - 148},${VH - 30})`}
+                        transform={`translate(${CX - 34},${VH - 30})`}
                     >
-                        {(
-                            [
-                                "idle",
-                                "listening",
-                                "thinking",
-                                "speaking",
-                            ] as AState[]
-                        ).map((s, i) => {
-                            const active = astate === s,
-                                W = 68,
-                                H = 18,
-                                G = 8,
-                                x = i * (W + G);
-                            return (
-                                <g
-                                    key={s}
-                                    style={{ cursor: "pointer" }}
-                                    onClick={() => setAstate(s)}
-                                >
-                                    <rect
-                                        x={x}
-                                        y={0}
-                                        width={W}
-                                        height={H}
-                                        rx={3}
-                                        fill={
-                                            active
-                                                ? "rgba(0,229,255,.16)"
-                                                : "rgba(0,229,255,.03)"
-                                        }
-                                        stroke={
-                                            active ? CYN : "rgba(0,229,255,.14)"
-                                        }
-                                        strokeWidth={active ? 1.1 : 0.4}
-                                        filter={
-                                            active ? "url(#glow3)" : undefined
-                                        }
-                                    />
-                                    <text
-                                        x={x + W / 2}
-                                        y={H / 2 + 3}
-                                        textAnchor="middle"
-                                        fill={
-                                            active ? CYN : "rgba(0,229,255,.26)"
-                                        }
-                                        fontSize="6"
-                                        fontFamily="'Share Tech Mono',monospace"
-                                        letterSpacing="0.5"
-                                    >
-                                        {s.toUpperCase()}
-                                    </text>
-                                </g>
-                            );
-                        })}
-                        {(() => {
-                            const i = 4,
-                                W = 68,
-                                H = 18,
-                                G = 8,
-                                x = i * (W + G);
-                            return (
-                                <g
-                                    style={{ cursor: "pointer" }}
-                                    onClick={() => setChatOpen((v) => !v)}
-                                >
-                                    <rect
-                                        x={x}
-                                        y={0}
-                                        width={W}
-                                        height={H}
-                                        rx={3}
-                                        fill={
-                                            chatOpen
-                                                ? "rgba(0,255,136,.16)"
-                                                : "rgba(0,229,255,.03)"
-                                        }
-                                        stroke={
-                                            chatOpen
-                                                ? GRN
-                                                : "rgba(0,229,255,.14)"
-                                        }
-                                        strokeWidth={chatOpen ? 1.1 : 0.4}
-                                        filter={
-                                            chatOpen ? "url(#glow3)" : undefined
-                                        }
-                                    />
-                                    <circle
-                                        cx={x + 8}
-                                        cy={H / 2}
-                                        r={2.5}
-                                        fill={wsConnected ? GRN : RED}
-                                    />
-                                    <text
-                                        x={x + W / 2 + 6}
-                                        y={H / 2 + 3}
-                                        textAnchor="middle"
-                                        fill={
-                                            chatOpen
-                                                ? GRN
-                                                : "rgba(0,229,255,.26)"
-                                        }
-                                        fontSize="6"
-                                        fontFamily="'Share Tech Mono',monospace"
-                                        letterSpacing="0.5"
-                                    >
-                                        CHAT
-                                    </text>
-                                </g>
-                            );
-                        })()}
+                        <g
+                            style={{ cursor: "pointer" }}
+                            onClick={() => setChatOpen((v) => !v)}
+                        >
+                            <rect
+                                x={0}
+                                y={0}
+                                width={68}
+                                height={18}
+                                rx={3}
+                                fill={
+                                    chatOpen
+                                        ? "rgba(0,255,136,.16)"
+                                        : "rgba(0,229,255,.03)"
+                                }
+                                stroke={
+                                    chatOpen
+                                        ? GRN
+                                        : "rgba(0,229,255,.14)"
+                                }
+                                strokeWidth={chatOpen ? 1.1 : 0.4}
+                                filter={
+                                    chatOpen ? "url(#glow3)" : undefined
+                                }
+                            />
+                            <circle
+                                cx={8}
+                                cy={9}
+                                r={2.5}
+                                fill={wsConnected ? GRN : RED}
+                            />
+                            <text
+                                x={40}
+                                y={12}
+                                textAnchor="middle"
+                                fill={
+                                    chatOpen
+                                        ? GRN
+                                        : "rgba(0,229,255,.26)"
+                                }
+                                fontSize="6"
+                                fontFamily="'Share Tech Mono',monospace"
+                                letterSpacing="0.5"
+                            >
+                                CHAT
+                            </text>
+                        </g>
                     </g>
                 </svg>
 
