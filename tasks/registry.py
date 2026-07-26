@@ -100,6 +100,13 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
         ),
         param_types={"action": str, "path": str, "name": str},
     ),
+    "execute_protocol": TaskSpec(
+        name="execute_protocol",
+        description="Execute a predefined protocol script (e.g., genesis protocol).",
+        required_params=("protocol_name",),
+        optional_params=("original_request",),
+        param_types={"protocol_name": str, "original_request": str},
+    ),
 }
 
 

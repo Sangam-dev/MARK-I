@@ -10,7 +10,7 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass
 from typing import Literal
-
+from google.genai import models
 
 @dataclass(frozen=True)
 class Turn:

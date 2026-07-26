@@ -21,3 +21,8 @@ protoypes/
 .env.*
 !.env.example
 
+answers/
+ 
+**/node_modules/
+
+answers/

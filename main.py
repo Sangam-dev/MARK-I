@@ -145,6 +145,12 @@ def _parse_args() -> argparse.Namespace:
         metavar="N",
         help="Max tokens passed in LLM context window (default: 4000)",
     )
+    parser.add_argument(
+    "--script",
+    metavar="FILE",
+    help="Execute a scripted demonstration from a JSON file",
+    )
+
     return parser.parse_args()
 
 
@@ -285,7 +291,7 @@ async def _run(args: argparse.Namespace) -> None:
         print("  Type  exit  or  quit  to shut down.")
         print("=" * 60 + "\n")
 
-        text_handler = TextInputHandler(bus=bus, session_id=args.session)
+        text_handler = TextInputHandler(bus=bus, session_id=args.session, script_file=args.script)
         input_tasks.append(asyncio.create_task(text_handler.run(), name="text_input"))
 
     else:

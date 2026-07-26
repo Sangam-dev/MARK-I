@@ -11,27 +11,106 @@ from core.events import ShutdownRequested, TextInputReceived
 class TextInputHandler:
 	bus: EventBus
 	session_id: str = "default"
+	script_file: str | None = None
+
+	# async def run(self) -> None:
+	# 	try:
+	# 		while True:
+	# 			line = await self._read_line()
+	# 			if line is None:
+	# 				await self.bus.emit_and_wait(ShutdownRequested(reason="EOF"))
+	# 				return
+
+	# 			text = line.strip()
+	# 			if not text:
+	# 				continue
+
+	# 			if text.lower() in {"exit", "quit"}:
+	# 				await self.bus.emit_and_wait(ShutdownRequested(reason="user requested"))
+	# 				return
+
+	# 			await self.bus.emit_and_wait(TextInputReceived(text=text, session_id=self.session_id))
+	# 	except KeyboardInterrupt:
+	# 		await self.bus.emit_and_wait(ShutdownRequested(reason="keyboard interrupt"))
 
 	async def run(self) -> None:
 		try:
+			if self.script_file:
+				import json
+				import subprocess
+
+				with open(self.script_file, "r") as f:
+					script = json.load(f)
+
+				for step in script:
+					step_type = step["type"]
+
+					if step_type == "command":
+						text = step["text"]
+
+						print(f"\n> {text}\n")
+
+						await self.bus.emit_and_wait(
+							TextInputReceived(
+								text=text,
+								session_id=self.session_id,
+							)
+						)
+
+					elif step_type == "wait":
+						await asyncio.sleep(step["seconds"])
+
+					elif step_type == "announce":
+						print(f"\n[JARVIS] {step['text']}\n")
+
+					elif step_type == "shell":
+						subprocess.run(
+							step["command"],
+							shell=True,
+						)
+
+					else:
+						print(f"Unknown step type: {step_type}")
+
+				await self.bus.emit_and_wait(
+					ShutdownRequested(
+						reason="Genesis Protocol Completed"
+					)
+				)
+
+				return
+
 			while True:
 				line = await self._read_line()
+
 				if line is None:
-					await self.bus.emit_and_wait(ShutdownRequested(reason="EOF"))
+					await self.bus.emit_and_wait(
+						ShutdownRequested(reason="EOF")
+					)
 					return
 
 				text = line.strip()
+
 				if not text:
 					continue
 
 				if text.lower() in {"exit", "quit"}:
-					await self.bus.emit_and_wait(ShutdownRequested(reason="user requested"))
+					await self.bus.emit_and_wait(
+						ShutdownRequested(reason="user requested")
+					)
 					return
 
-				await self.bus.emit_and_wait(TextInputReceived(text=text, session_id=self.session_id))
-		except KeyboardInterrupt:
-			await self.bus.emit_and_wait(ShutdownRequested(reason="keyboard interrupt"))
+				await self.bus.emit_and_wait(
+					TextInputReceived(
+						text=text,
+						session_id=self.session_id,
+					)
+				)
 
+		except KeyboardInterrupt:
+			await self.bus.emit_and_wait(
+				ShutdownRequested(reason="keyboard interrupt")
+			)
 	async def _read_line(self) -> str | None:
 		loop = asyncio.get_running_loop()
 		try:

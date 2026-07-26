@@ -10,6 +10,7 @@ from actions.alarms import cancel_alarms, list_alarms, set_alarm
 from actions.apps import open_app
 from actions.file_controller import file_controller
 from actions.power import restart, shutdown, sleep
+from actions.system_commands import SystemCommandExecutor
 from actions.weather import get_weather
 from core.bus import EventBus
 from core.events import TaskCompleted, TaskExecutionRequested
@@ -144,5 +145,33 @@ class TaskExecutor:
                 not _FILE_FAILURE_RE.match(result_text.strip()),
                 result_text,
             )
+
+        if task_name == "execute_protocol":
+            protocol_name = params.get("protocol_name", "")
+            original_request = params.get("original_request", "")
+            
+            # Map protocol names to script paths
+            protocol_scripts = {
+                "genesis": "tests/scripts.py",
+            }
+            
+            script_path = protocol_scripts.get(protocol_name)
+            if not script_path:
+                return TaskExecutionResult(
+                    False, 
+                    f"Unknown protocol: {protocol_name}. Available: {list(protocol_scripts.keys())}"
+                )
+            
+            # Run the protocol script using SystemCommandExecutor
+            executor = SystemCommandExecutor()
+            # Add "uv" to allowed commands since it's not in the default allowlist
+            executor.add_allowed_command("uv")
+            command = f"uv run main.py --text --script scripts/{protocol_name}.json"
+            result = await executor.execute(command)
+            
+            if result.success:
+                return TaskExecutionResult(True, f"Protocol '{protocol_name}' executed successfully")
+            else:
+                return TaskExecutionResult(False, f"Protocol '{protocol_name}' failed: {result.stderr}")
 
         return TaskExecutionResult(False, f"No handler found for task: {task_name}")

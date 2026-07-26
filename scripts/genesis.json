@@ -1,0 +1,134 @@
+[
+    {
+        "type": "announce",
+        "text": "Genesis Protocol acknowledged, sir."
+    },
+
+    {
+        "type": "wait",
+        "seconds": 2
+    },
+
+    {
+        "type": "command",
+        "text": "Introduce yourself , who are you , why were you created  (Make it brief and short,donot ask any thing on the end)."
+    },
+
+    {
+        "type": "wait",
+        "seconds": 15
+    },
+    {
+        "type": "announce",
+        "text": "Demonstrating capabilities of the Genesis Protocol."
+    },
+
+    {
+        "type": "wait",
+        "seconds": 2
+
+    },
+    {
+        "type": "announce",
+        "text": "Demonstrating filesystem automation."
+    },
+
+    {
+        "type": "command",
+        "text": "Create a folder named Genesis Demo on Desktop."
+    },
+
+    {
+        "type": "wait",
+        "seconds": 3
+    },
+
+    {
+        "type": "shell",
+        "command": "xdg-open ~/Desktop/Genesis\\ Demo"
+    },
+
+    {
+        "type": "wait",
+        "seconds": 2
+    },
+
+    {
+        "type": "command",
+        "text": "Create a file named notes.txt inside Genesis Demo you just created."
+    },
+
+    {
+        "type": "wait",
+        "seconds": 3
+    },
+
+    {
+        "type": "shell",
+        "command": "xdg-open ~/Desktop/"
+    },
+
+    {
+        "type": "wait",
+        "seconds": 4
+    },
+    {
+        "type": "announce",
+        "text": "Demonstrating application control."
+    },
+
+    {
+        "type": "command",
+        "text": "Open Calculator."
+    },
+
+    {
+        "type": "wait",
+        "seconds": 5
+    },
+
+    {
+        "type": "command",
+        "text": "Open Visual Studio Code."
+    },
+
+    {
+        "type": "wait",
+        "seconds": 7
+    },
+
+    {
+        "type": "announce",
+        "text": "Demonstrating scheduling."
+    },
+
+    {
+        "type": "command",
+        "text": "Set an alarm for one minute from now."
+    },
+
+    {
+        "type": "wait",
+        "seconds": 5
+    },
+
+    {
+        "type": "announce",
+        "text": "Retrieving environmental information."
+    },
+
+    {
+        "type": "command",
+        "text": "What's the weather in lalitpur today?"
+    },
+
+    {
+        "type": "wait",
+        "seconds": 8
+    },
+
+    {
+        "type": "announce",
+        "text": "Genesis Protocol completed successfully."
+    }
+]

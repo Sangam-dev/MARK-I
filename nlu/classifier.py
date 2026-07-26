@@ -138,6 +138,59 @@ def _classify_file_request(cleaned: str) -> ToolDecision | None:
     return None
 
 
+def _classify_protocol_request(cleaned: str) -> ToolDecision | None:
+    """Detect protocol execution requests like 'run genesis protocol', 'execute jarvis protocol', etc."""
+    lowered = cleaned.lower()
+
+    # Pattern to match protocol execution commands
+    protocol_pattern = re.compile(
+        r"\b(?:run|execute|trigger|initiate|launch|start|activate)\s+(?:the\s+)?(?P<protocol>\w+(?:\s+\w+)?)\s+protocol\b",
+        re.IGNORECASE,
+    )
+
+    match = protocol_pattern.search(lowered)
+    if match:
+        protocol_name = match.group("protocol").strip().lower()
+        # Normalize protocol names
+        protocol_map = {
+            "genesis": "genesis",
+            "jarvis": "jarvis",
+            "core": "jarvis",
+            "core protocol": "jarvis",
+        }
+        normalized_protocol = protocol_map.get(protocol_name, protocol_name.replace(" ", "_"))
+
+        return ToolDecision(
+            task_name="execute_protocol",
+            parameters={
+                "protocol_name": normalized_protocol,
+                "original_request": cleaned,
+            },
+        )
+
+    # Also match "genesis protocol" without explicit verb
+    if re.search(r"\bgenesis\s+protocol\b", lowered):
+        return ToolDecision(
+            task_name="execute_protocol",
+            parameters={
+                "protocol_name": "genesis",
+                "original_request": cleaned,
+            },
+        )
+
+    # Match "jarvis protocol" or "core protocol" without explicit verb
+    if re.search(r"\b(?:jarvis|core)\s+protocol\b", lowered):
+        return ToolDecision(
+            task_name="execute_protocol",
+            parameters={
+                "protocol_name": "jarvis",
+                "original_request": cleaned,
+            },
+        )
+
+    return None
+
+
 def classify_tool_request(text: str) -> ToolDecision | None:
     cleaned = " ".join(text.strip().split()).rstrip(".?!")
     if not cleaned:
@@ -155,6 +208,11 @@ def classify_tool_request(text: str) -> ToolDecision | None:
     file_decision = _classify_file_request(cleaned)
     if file_decision is not None:
         return file_decision
+
+    # Check for protocol execution requests
+    protocol_decision = _classify_protocol_request(cleaned)
+    if protocol_decision is not None:
+        return protocol_decision
 
     if lowered.startswith(
         (
@@ -264,8 +322,7 @@ Classify intent into one of:
   * "sleep" (no params)
   * "shutdown" (no params)
   * "restart" (no params)
-  * "file_operation" (params: action (required), path, name, content, destination, new_name, extension (optional). Action values: list, create_file, create_folder, delete, move, copy, rename, read, write, find, largest, disk_usage, organize_desktop, info)
-- "conversational": Casual greetings, chitchat, or social statements (e.g., "hi", "how are you?", "nice to meet you").
+  * "file_operation" (params: action (required), path, name, content, destination, new_name, extension (optional). Action values: list, create_file, create_folder, delete, move, copy, rename, read, write, find, largest, disk_usage, organize_desktop, info)- "execute_protocol" (params: protocol_name (required), original_request (optional))- "conversational": Casual greetings, chitchat, or social statements (e.g., "hi", "how are you?", "nice to meet you").
 
 Return ONLY valid JSON matching this schema:
 {

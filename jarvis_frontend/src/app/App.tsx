@@ -621,7 +621,7 @@ export default function App() {
           <line x1={CX}      y1={CY - 11} x2={CX}      y2={CY + 11} stroke={CYN} strokeWidth=".4" opacity=".2"/>
           {[45, 135, 225, 315].map(a => { const [x1,y1]=polar(CORE-3,a),[x2,y2]=polar(CORE-9,a); return <line key={a} x1={x1} y1={y1} x2={x2} y2={y2} stroke={CYN} strokeWidth=".9" opacity=".32"/>; })}
 
-          <text x={CX} y={CY - 12} textAnchor="middle" fill="white" fontSize="17" fontFamily="Orbitron,monospace" fontWeight="700" letterSpacing="6" style={{ animation: "flicker 14s ease-in-out infinite" }}>AURA</text>
+          <text x={CX} y={CY - 12} textAnchor="middle" fill="white" fontSize="17" fontFamily="Orbitron,monospace" fontWeight="700" letterSpacing="6" style={{ animation: "flicker 14s ease-in-out infinite" }}>JARVIS</text>
           <text x={CX} y={CY + 4}  textAnchor="middle" fill={CYN} fontSize="6.5" fontFamily="'Share Tech Mono',monospace" letterSpacing="2" opacity=".4">v2.6.3</text>
           <text x={CX} y={CY + 20} textAnchor="middle" fill={CYN} fontSize="8.5" fontFamily="'Share Tech Mono',monospace" letterSpacing="2" style={{ animation: "breathe 2s ease-in-out infinite" }}>{STATE_LBL[astate]}</text>
 
