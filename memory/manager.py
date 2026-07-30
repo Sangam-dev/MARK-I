@@ -82,6 +82,14 @@ class MemoryManager:
         # Structured memory (SQLite)
         self._structured = StructuredMemory(data_dir / "structured.db")
 
+        # Plan output cache: plan_id -> {task_id: result_str}. Used by
+        # the planner's ReferenceResolver to bind conversational
+        # references ("it", "that folder") against the most recent
+        # completed task results. Keyed by plan_id so two plans never
+        # collide; kept in-memory only because plans themselves are
+        # in-memory (see planning/scheduler.py).
+        self._recent_plan_outputs: dict[str, dict[str, str]] = {}
+
         # RAG/vector memory is intentionally disabled for now.
         # self._vector = VectorMemory(
         #     persist_dir=data_dir / "vector",
@@ -293,6 +301,48 @@ class MemoryManager:
     async def update_task_status(self, task_id: str, status: str) -> bool:
         """Update task status."""
         return await self._structured.update_task_status(task_id, status)
+
+    # --- Plan-output cache (used by the planner) ---
+
+    def record_plan_output(
+        self,
+        plan_id: str,
+        task_id: str,
+        result: str,
+    ) -> None:
+        """Cache a completed task's result for reference resolution.
+
+        Called by :class:`planning.scheduler.PlanScheduler` after each
+        task completion. Used by the planner on the next user request
+        to bind references like "it" against the most recent artifact.
+        """
+        bucket = self._recent_plan_outputs.setdefault(plan_id, {})
+        bucket[task_id] = result
+
+    def get_recent_plan_outputs(
+        self,
+        plan_id: str | None = None,
+    ) -> dict[str, str]:
+        """Return plan outputs as a flat ``{task_id: result}`` map.
+
+        With no ``plan_id`` argument, returns the union of all known
+        plan outputs (newer plans override older ones on overlap, since
+        Python dicts preserve insertion order). Used by the
+        ReferenceResolver when the user starts a fresh request and the
+        most recent prior plan's outputs should be the binding source.
+        """
+        if plan_id is not None:
+            return dict(self._recent_plan_outputs.get(plan_id, {}))
+        merged: dict[str, str] = {}
+        for bucket in self._recent_plan_outputs.values():
+            merged.update(bucket)
+        return merged
+
+    def clear_plan_outputs(self, plan_id: str | None = None) -> None:
+        if plan_id is None:
+            self._recent_plan_outputs.clear()
+        else:
+            self._recent_plan_outputs.pop(plan_id, None)
 
     async def clear_session(self) -> int:
         """Clear all memory for this session."""
