@@ -230,6 +230,83 @@ class ShutdownRequested(BaseEvent):
     reason: str = "user requested"
 
 
+# -------------- Planning Events -----------------#
+
+
+@dataclass(frozen=True)
+class PlanCreated(BaseEvent):
+    """
+    Event triggered when the Planner has produced an ExecutionPlan.
+
+    emitted by: planning/planner.py
+    consumed by: planning/scheduler.py
+
+    The plan is serialized to a dict (events are frozen dataclasses)
+    and rebuilt into an ExecutionPlan inside the Scheduler.
+    """
+
+    plan: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TaskStarted(BaseEvent):
+    """
+    Event triggered when the PlanExecutor dispatches a single task.
+
+    emitted by: planning/executor.py
+    consumed by: UI / telemetry (optional)
+    """
+
+    plan_id: str = ""
+    task_id: str = ""
+    tool: str = ""
+
+
+@dataclass(frozen=True)
+class PlanReplanRequested(BaseEvent):
+    """
+    Event triggered when a task has permanently failed and the Planner
+    should rebuild the remaining steps.
+
+    emitted by: planning/scheduler.py
+    consumed by: planning/planner.py
+    """
+
+    plan_id: str = ""
+    failed_task_id: str = ""
+    reason: str = ""
+    remaining_tasks: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PlanCompleted(BaseEvent):
+    """
+    Event triggered when an ExecutionPlan reaches a terminal state.
+
+    emitted by: planning/scheduler.py
+    consumed by: reasoning/coordinator.py (to emit ResponseReady)
+
+    status: "completed" | "failed" | "partial" | "cancelled"
+    """
+
+    plan_id: str = ""
+    status: str = "completed"
+    summary: str = ""
+
+
+@dataclass(frozen=True)
+class PlanCancelled(BaseEvent):
+    """
+    Event triggered when an in-flight plan is cancelled (e.g. shutdown).
+
+    emitted by: any module
+    consumed by: planning/scheduler.py
+    """
+
+    plan_id: str = ""
+    reason: str = ""
+
+
 # -------------------------------------- TESTING --------------------------------------#
 
 # if __name__ == "__main__":
