@@ -2,10 +2,11 @@
 
 Both the CLI entry point (``main.py``) and the FastAPI/WebSocket server
 (``api/server.py``) need the exact same EventBus wiring: EventBus -> Memory ->
-LLM -> NLU -> Reasoning bridge -> ReasoningCoordinator -> TaskExecutor ->
-output handlers. Before this module existed, that ~150 lines of wiring lived
-inline inside ``main.py:_run()``, which meant the API server would have had
-to duplicate it (and the two copies would inevitably drift).
+LLM -> NLU -> Reasoning bridge -> ReasoningCoordinator -> Planner ->
+PlanScheduler -> TaskExecutor -> output handlers. Before this module existed,
+that ~150 lines of wiring lived inline inside ``main.py:_run()``, which meant
+the API server would have had to duplicate it (and the two copies would
+inevitably drift).
 
 ``build_pipeline()`` is now the single source of truth. Anything that needs a
 running KANCHA pipeline (CLI, API server, tests, a future gRPC front door,
@@ -32,6 +33,8 @@ from memory.manager import MemoryManager
 from nlu.classifier import NLUClassifier
 from output.response_formatter import ResponseFormatter
 from output.tts import TTSHandler
+from planning.planner import Planner
+from planning.scheduler import PlanScheduler
 from reasoning.coordinator import ReasoningCoordinator
 from reasoning.llm_client import GeminiClient
 from tasks.executor import TaskExecutor
@@ -56,6 +59,8 @@ class Pipeline:
     nlu: NLUClassifier
     coordinator: ReasoningCoordinator
     task_executor: TaskExecutor
+    planner: Planner
+    plan_scheduler: PlanScheduler
     formatter: ResponseFormatter
     tts: TTSHandler | None
     session_id: str
@@ -153,6 +158,22 @@ async def build_pipeline(
     task_executor = TaskExecutor(bus=bus)
     task_executor.register()
 
+    # ── Planner + Plan Scheduler ──────────────────────────────────────────
+    # These run on top of the existing task executor. The Planner decomposes
+    # multi-step requests; the PlanScheduler walks the dependency graph and
+    # dispatches individual tasks via the existing TaskExecutor (re-using
+    # TaskExecutionRequested).
+    planner = Planner(
+        bus=bus,
+        llm=llm,
+        memory=memory,
+    )
+    planner.register()
+
+    plan_scheduler = PlanScheduler(bus=bus)
+    plan_scheduler.register()
+    plan_scheduler.executor.register()
+
     # ── Output: console formatter ────────────────────────────────────────
     formatter = ResponseFormatter(bus=bus)
     if enable_console_formatter:
@@ -178,6 +199,8 @@ async def build_pipeline(
         nlu=nlu,
         coordinator=coordinator,
         task_executor=task_executor,
+        planner=planner,
+        plan_scheduler=plan_scheduler,
         formatter=formatter,
         tts=tts_handler,
         session_id=session_id,

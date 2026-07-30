@@ -6,12 +6,14 @@ from typing import Any
 
 from core.bus import EventBus
 from core.events import (
+    Intent,
+    IntentIdentified,
     MemoryRetrieved,
     MemoryUpdateNeeded,
+    PlanCompleted,
     ReasoningRequested,
     ResponseReady,
     TaskCompleted,
-    TaskExecutionRequested,
 )
 from memory.manager import MemoryManager
 from reasoning.llm_client import GeminiClient
@@ -55,6 +57,7 @@ class ReasoningCoordinator:
     def register(self) -> None:
         self.bus.subscribe(ReasoningRequested, self.on_reasoning_requested)
         self.bus.subscribe(TaskCompleted, self.on_task_completed)
+        self.bus.subscribe(PlanCompleted, self.on_plan_completed)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -131,21 +134,18 @@ class ReasoningCoordinator:
         # ── Step 2: Ask memory to save durable facts only ─────────────────
         self._persist_turn(session_id, "user", user_input)
 
-        # ── Step 3: Task path — defer to TaskExecutor ─────────────────────
+        # ── Step 3: Task path — defer to Planner ────────────────────────
+        # The Planner (planning/planner.py) is already subscribed to
+        # IntentIdentified and will decompose this request into an
+        # ExecutionPlan, dispatch it via the PlanScheduler, and emit
+        # PlanCompleted when it's done. We just record the user input
+        # for memory; we do NOT emit TaskExecutionRequested ourselves.
         if intent_event.requires_task:
             logger.info(
-                "Task intent detected: %s  params=%s",
+                "Task intent detected: %s  params=%s — handed off to Planner",
                 intent_event.task_type,
                 intent_event.task_params,
             )
-            self._pending_turns[session_id] = {
-                "user_input": user_input,
-                "memory_event": (
-                    event.memory_events[0] if event.memory_events else None
-                ),
-                "task_type": intent_event.task_type,
-                "task_params": dict(intent_event.task_params),
-            }
             self._last_tasks[session_id] = {
                 "task_type": intent_event.task_type,
                 "task_params": dict(intent_event.task_params),
@@ -154,16 +154,13 @@ class ReasoningCoordinator:
                     event.memory_events[0] if event.memory_events else None
                 ),
             }
-            self.bus.emit(
-                TaskExecutionRequested(
-                    task_name=intent_event.task_type or "",
-                    parameters=intent_event.task_params,
-                    session_id=session_id,
-                )
-            )
             return
 
-        # ── Step 3b: Retry path — repeat the last concrete task ───────────
+        # ── Step 3b: Retry path — re-plan from the last user request ─────
+        # "Do it again" used to re-emit a single TaskExecutionRequested.
+        # We now treat it as a fresh request to the Planner: the user
+        # wants the same plan re-run. The Planner decides whether to
+        # one-shot it (single task) or decompose.
         if self._is_retry_request(user_input):
             last_task = self._last_tasks.get(session_id)
             if last_task is None:
@@ -173,22 +170,23 @@ class ReasoningCoordinator:
                 self.bus.emit(ResponseReady(text=response_text, session_id=session_id))
                 return
 
-            task_type = last_task.get("task_type") or ""
-            task_params = dict(last_task.get("task_params") or {})
-            self._pending_turns[session_id] = {
-                "user_input": user_input,
-                "memory_event": last_task.get("memory_event"),
-                "task_type": task_type,
-                "task_params": task_params,
-            }
-            logger.info("Retrying last task: %s  params=%s", task_type, task_params)
-            self.bus.emit(
-                TaskExecutionRequested(
-                    task_name=task_type,
-                    parameters=task_params,
-                    session_id=session_id,
-                )
+            # Rebuild a synthetic IntentIdentified from the last known
+            # task so the Planner's existing subscription picks it up.
+            retry_intent = IntentIdentified(
+                intent=Intent.TASK,
+                raw_input=last_task.get("user_input", user_input),
+                confidence=1.0,
+                session_id=session_id,
+                requires_task=True,
+                task_type=last_task.get("task_type") or "",
+                task_params=last_task.get("task_params") or {},
             )
+            logger.info(
+                "Retrying via Planner: %s params=%s",
+                retry_intent.task_type,
+                retry_intent.task_params,
+            )
+            self.bus.emit(retry_intent)
             return
 
         # ── Step 4: Conversational path — call LLM ────────────────────────
@@ -233,6 +231,33 @@ class ReasoningCoordinator:
 
         # Add assistant response to short_term. Memory ignores assistant turns
         # for durable storage so the DB does not fill with full conversations.
+        self.memory_manager.short_term.add("assistant", response_text)
+        self._persist_turn(session_id, "assistant", response_text)
+
+        self.bus.emit(ResponseReady(text=response_text, session_id=session_id))
+
+    async def on_plan_completed(self, event: PlanCompleted) -> None:
+        """Emit a user-facing response when a plan finishes.
+
+        The Planner/Executor/Scheduler run the tools; this turns the
+        machine outcome into natural language.
+        """
+        session_id = event.session_id
+        status = event.status
+        summary = event.summary or "Plan completed."
+
+        # Map plan status to user-friendly phrasing.
+        if status == "completed":
+            response_text = f"All done! {summary}"
+        elif status == "partial":
+            response_text = f"Partially completed: {summary}"
+        elif status == "failed":
+            response_text = f"Plan failed: {summary}"
+        elif status == "cancelled":
+            response_text = f"Plan cancelled: {summary}"
+        else:
+            response_text = f"Plan finished with status '{status}': {summary}"
+
         self.memory_manager.short_term.add("assistant", response_text)
         self._persist_turn(session_id, "assistant", response_text)
 
