@@ -9,7 +9,6 @@ from core.events import (
     Intent,
     IntentIdentified,
     MemoryRetrieved,
-    MemoryUpdateNeeded,
     PlanCompleted,
     ReasoningRequested,
     ResponseReady,
@@ -39,8 +38,10 @@ class ReasoningCoordinator:
     --------------------------------
     The coordinator owns the short-term in-memory buffer directly.
     It adds user/assistant turns synchronously so the context is
-    always up-to-date before the LLM call.  DB persistence is handled
-    asynchronously via MemoryUpdateNeeded events.
+    always up-to-date before the LLM call.  Durable memory (SQL facts
+    and RAG entries) is carried inline by the primary Gemini response
+    JSON envelope and persisted here via MemoryManager.save_sql /
+    append_rag — there is no separate extraction step anymore.
     """
 
     def __init__(
@@ -97,16 +98,29 @@ class ReasoningCoordinator:
             for m in self.memory_manager.short_term.get_recent()
         ]
 
-    def _persist_turn(self, session_id: str, role: str, content: str) -> None:
-        """Fire-and-forget: let memory extract durable facts from user turns."""
-        self.bus.emit(
-            MemoryUpdateNeeded(
-                session_id=session_id,
-                role=role,
-                content=content,
-                metadata={},
-            )
-        )
+    async def _persist_response_memory(self, payload: dict[str, Any]) -> None:
+        """Persist sql/rag memory carried by the primary Gemini response.
+
+        Best-effort: a failure to persist must never break the reply.
+        Absent keys ("sql"/"rag") are simply skipped.
+        """
+        sql = payload.get("sql")
+        if sql:
+            try:
+                saved = await self.memory_manager.save_sql(sql)
+                if saved:
+                    logger.info("Persisted %d SQL fact(s) from response", saved)
+            except Exception as exc:
+                logger.warning("SQL memory persist failed (non-fatal): %s", exc)
+
+        rag = payload.get("rag")
+        if rag:
+            try:
+                appended = await self.memory_manager.append_rag(rag)
+                if appended:
+                    logger.info("Appended %d RAG entries to rag.txt", appended)
+            except Exception as exc:
+                logger.warning("RAG memory append failed (non-fatal): %s", exc)
 
     def _is_retry_request(self, user_input: str) -> bool:
         return bool(_RETRY_RE.match(user_input))
@@ -135,10 +149,7 @@ class ReasoningCoordinator:
         # message as part of the conversation (not just appended externally).
         self.memory_manager.short_term.add("user", user_input)
 
-        # ── Step 2: Ask memory to save durable facts only ─────────────────
-        self._persist_turn(session_id, "user", user_input)
-
-        # ── Step 3: Task path — defer to Planner ────────────────────────
+        # ── Step 2: Task path — defer to Planner ────────────────────────
         # The Planner (planning/planner.py) is already subscribed to
         # IntentIdentified and will decompose this request into an
         # ExecutionPlan, dispatch it via the PlanScheduler, and emit
@@ -170,7 +181,6 @@ class ReasoningCoordinator:
             if last_task is None:
                 response_text = "I don't have a previous action to retry."
                 self.memory_manager.short_term.add("assistant", response_text)
-                self._persist_turn(session_id, "assistant", response_text)
                 self.bus.emit(ResponseReady(text=response_text, session_id=session_id))
                 return
 
@@ -193,7 +203,7 @@ class ReasoningCoordinator:
             self.bus.emit(retry_intent)
             return
 
-        # ── Step 4: Conversational path — call LLM ────────────────────────
+        # ── Step 3: Conversational path — call LLM (JSON envelope) ────────
         memory_event = event.memory_events[0] if event.memory_events else None
         system = self._build_system_prompt(memory_event)
 
@@ -206,16 +216,21 @@ class ReasoningCoordinator:
             len(system),
         )
 
-        response_text = await self.gemini_client.generate_with_history(
+        payload = await self.gemini_client.generate_with_history_json(
             history=history,
             system=system,
             hedge_width=1,
             call_site="conversational",
         )
+        response_text = payload.get("message", "").strip()
 
-        # ── Step 5: Add assistant turn to short_term SYNCHRONOUSLY ────────
+        # ── Step 4: Add assistant turn to short_term SYNCHRONOUSLY ────────
         self.memory_manager.short_term.add("assistant", response_text)
-        self._persist_turn(session_id, "assistant", response_text)
+
+        # ── Step 5: Persist memory from the primary Gemini response ───────
+        # Memory now comes directly from the response JSON envelope — no
+        # separate extraction step after the conversation.
+        await self._persist_response_memory(payload)
 
         # ── Step 6: Emit response ─────────────────────────────────────────
         self.bus.emit(ResponseReady(text=response_text, session_id=session_id))
@@ -235,10 +250,8 @@ class ReasoningCoordinator:
 
         response_text = self._format_task_response(event)
 
-        # Add assistant response to short_term. Memory ignores assistant turns
-        # for durable storage so the DB does not fill with full conversations.
+        # Add assistant response to short_term.
         self.memory_manager.short_term.add("assistant", response_text)
-        self._persist_turn(session_id, "assistant", response_text)
 
         self.bus.emit(ResponseReady(text=response_text, session_id=session_id))
 
@@ -262,6 +275,5 @@ class ReasoningCoordinator:
         )
 
         self.memory_manager.short_term.add("assistant", response_text)
-        self._persist_turn(session_id, "assistant", response_text)
 
         self.bus.emit(ResponseReady(text=response_text, session_id=session_id))

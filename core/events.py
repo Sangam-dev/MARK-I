@@ -98,6 +98,11 @@ class MemoryUpdateNeeded(BaseEvent):
     """
     Event triggered when an update to memory is needed.
 
+    NOTE: currently unused by the active pipeline. Durable memory is fed
+    directly by the primary Gemini response JSON envelope (sql/rag) in
+    reasoning/coordinator.py. Kept as part of the event schema for the
+    disconnected episodic memory implementation.
+
     emitted by: Intent module
     consumed by: Memory module
     """

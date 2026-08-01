@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+import re
+from typing import Any, AsyncIterator
 
 from memory.token_log import TokenLog
 
@@ -11,9 +12,82 @@ from reasoning.llm_client_mulapi import (
     get_pool,
     hedged_generate,
     hedged_generate_conv,
+
 )
 
 logger = logging.getLogger("kancha.reasoning.llm_client")
+
+# Format the model must follow for conversational responses. Memory (SQL
+# facts + RAG entries) is carried inline in the primary response — there
+# is no separate extraction step anymore.
+MEMORY_RESPONSE_FORMAT = """\
+Respond with ONLY one JSON object, no markdown, no code fences, no preamble:
+
+{
+  "message": "Your reply to the user",
+  "sql": [{"key": "...", "value": "..."}],
+  "rag": [{"type": "...", "title": "...", "content": "..."}]
+}
+
+Rules:
+- "message" is REQUIRED and is the only text shown to the user.
+- "sql" is OPTIONAL: durable facts to remember. Existing keys are
+  updated in place; new keys are inserted. Never duplicate a key.
+- "rag" is OPTIONAL: long-term knowledge entries. Each entry needs
+  "type", "title" and "content".
+- Omit "sql" and "rag" entirely when there is nothing to store.
+  Never return empty arrays and never return null.
+"""
+
+
+_MSG_KEY_RE = re.compile(r'"message"\s*:\s*"')
+
+
+
+def parse_memory_response(raw: str) -> dict[str, Any]:
+    """Parse the model's JSON memory envelope into ``{message, sql?, rag?}``.
+
+    Tolerant parser — never raises. Falls back to ``{"message": <raw>}``
+    when the model returns plain text or malformed JSON. ``sql``/``rag``
+    are omitted (never empty arrays, never null) so callers can safely
+    test ``if "sql" in response``.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return {"message": ""}
+
+    cleaned = text
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return {"message": text}
+
+    if not isinstance(data, dict):
+        return {"message": text}
+
+    message = data.get("message")
+    if not isinstance(message, str):
+        message = text
+
+    payload: dict[str, Any] = {"message": message}
+
+    sql = data.get("sql")
+    if isinstance(sql, list) and sql:
+        payload["sql"] = sql
+
+    rag = data.get("rag")
+    if isinstance(rag, list) and rag:
+        payload["rag"] = rag
+
+    return payload
 
 
 class GeminiClient:
@@ -150,6 +224,115 @@ class GeminiClient:
         except Exception as e:
             logger.exception("generate_with_history failed: %s", e)
             return "I'm having trouble thinking right now. Could you try again?"
+
+    async def generate_with_history_stream(
+        self,
+        history: list[dict],
+        system: str = "",
+        hedge_width: int | None = None,
+        call_site: str = "conversational",
+    ) -> AsyncIterator[str]:
+        """Stream a conversational response as text deltas.
+
+        Augments *system* with :data:`MEMORY_RESPONSE_FORMAT` exactly like
+        :meth:`generate_with_history_json`, then streams the raw token
+        deltas from the model (the JSON envelope, token by token). The
+        caller is responsible for extracting the ``message`` field via
+        :func:`extract_streamed_message` while it streams and parsing the
+        full envelope at the end via :func:`parse_memory_response`.
+
+        On failure, yields a single fallback message (never raises), so the
+        conversational path always produces something for the user.
+        """
+        full_system = system.strip()
+        if full_system:
+            full_system = f"{full_system}\n\n{MEMORY_RESPONSE_FORMAT}"
+        else:
+            full_system = MEMORY_RESPONSE_FORMAT
+
+        from google.genai import types
+
+        if not history:
+            # No history: fall back to a plain (non-stream) call so we still
+            # return something; rare on the conversational path.
+            yield await self.generate(prompt="", system=full_system)
+            return
+
+        # Convert to Gemini native Content objects (same as generate_with_history).
+        contents = []
+        for msg in history:
+            role = "user" if msg["role"] == "user" else "model"
+            contents.append(
+                types.Content(
+                    role=role,
+                    parts=[types.Part(text=msg["content"])],
+                )
+            )
+        if not contents or contents[-1].role != "user":
+            contents.append(types.Content(role="user", parts=[types.Part(text="")]))
+
+        config = (
+            types.GenerateContentConfig(system_instruction=full_system)
+            if full_system
+            else None
+        )
+
+        if self.pool is None:
+            raise RuntimeError("GeminiClient is not initialized")
+
+        buffer: list[str] = []
+        try:
+            async for chunk in hedged_stream_conv(
+                pool=self.pool,
+                models=ALL_MODELS,
+                contents=contents,
+                config=config,
+                hedge_width=(
+                    hedge_width if hedge_width is not None else self.default_hedge_width
+                ),
+                timeout=self.timeout,
+            ):
+                buffer.append(chunk)
+                yield chunk
+
+            if self.token_log is not None:
+                self.token_log.record(
+                    call_site=call_site,
+                    model=self.model,
+                    input_tokens=max(1, len(str(history)) // 4),
+                    output_tokens=max(1, sum(len(c) for c in buffer) // 4),
+                )
+        except Exception as exc:
+            logger.exception("generate_with_history_stream failed: %s", exc)
+            yield "I'm having trouble thinking right now. Could you try again?"
+
+    async def generate_with_history_json(
+        self,
+        history: list[dict],
+        system: str = "",
+        hedge_width: int | None = None,
+        call_site: str = "conversational",
+    ) -> dict[str, Any]:
+        """Generate a conversational response and parse the JSON envelope.
+
+        Augments *system* with :data:`MEMORY_RESPONSE_FORMAT` so the
+        model returns ``{"message": ..., "sql"?: [...], "rag"?: [...]}``.
+        Returns the parsed dict — ``sql``/``rag`` keys are absent when
+        there is nothing to store.
+        """
+        full_system = system.strip()
+        if full_system:
+            full_system = f"{full_system}\n\n{MEMORY_RESPONSE_FORMAT}"
+        else:
+            full_system = MEMORY_RESPONSE_FORMAT
+
+        raw = await self.generate_with_history(
+            history=history,
+            system=full_system,
+            hedge_width=hedge_width,
+            call_site=call_site,
+        )
+        return parse_memory_response(raw)
 
     async def generate_json(
         self,

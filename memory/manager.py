@@ -1,21 +1,29 @@
-"""MemoryManager orchestrates short-term context and structured facts."""
+"""MemoryManager orchestrates short-term context and durable memories.
+
+Durable memory (SQL facts + RAG entries) is fed exclusively by the
+primary Gemini response: the model returns a JSON envelope
+``{message, sql?, rag?}`` and the coordinator calls
+:meth:`save_sql` / :meth:`append_rag` directly. There is no separate
+extraction step after the conversation.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from core.bus import EventBus, subscribe
-from core.events import MemoryRetrieved, MemoryUpdateNeeded
+from core.bus import EventBus
+from core.events import MemoryRetrieved
 
 from .structured import StructuredMemory
 
 # RAG/vector memory is intentionally disabled for now.
 # from .vector import VectorMemory
+
+_RAG_SEPARATOR = "-" * 40
 
 
 @dataclass(frozen=True)
@@ -130,108 +138,6 @@ class MemoryManager:
         await self._structured.close()
         self._initialized = False
 
-    # --- Event handlers ---
-
-    _FACT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-        (
-            re.compile(r"\bmy name is\s+(.+?)[.!?]*$", re.IGNORECASE),
-            "name",
-        ),
-        (
-            re.compile(r"\bi am called\s+(.+?)[.!?]*$", re.IGNORECASE),
-            "name",
-        ),
-        (
-            re.compile(r"\bcall me\s+(.+?)[.!?]*$", re.IGNORECASE),
-            "preferred_name",
-        ),
-        (
-            re.compile(r"\bi live in\s+(.+?)[.!?]*$", re.IGNORECASE),
-            "location",
-        ),
-        (
-            re.compile(r"\bi am from\s+(.+?)[.!?]*$", re.IGNORECASE),
-            "origin",
-        ),
-        (
-            re.compile(r"\bmy birthday is\s+(.+?)[.!?]*$", re.IGNORECASE),
-            "birthday",
-        ),
-        (
-            re.compile(r"\bmy email is\s+(.+?)[.!?]*$", re.IGNORECASE),
-            "email",
-        ),
-        (
-            re.compile(r"\bmy phone(?: number)? is\s+(.+?)[.!?]*$", re.IGNORECASE),
-            "phone",
-        ),
-        (
-            re.compile(r"\bi (?:like|love|prefer)\s+(.+?)[.!?]*$", re.IGNORECASE),
-            "preference",
-        ),
-        (
-            re.compile(r"\bi do not like\s+(.+?)[.!?]*$", re.IGNORECASE),
-            "dislike",
-        ),
-        (
-            re.compile(r"\bi hate\s+(.+?)[.!?]*$", re.IGNORECASE),
-            "dislike",
-        ),
-        (
-            re.compile(r"\bremember that\s+(.+?)[.!?]*$", re.IGNORECASE),
-            "remembered_fact",
-        ),
-    )
-
-    @classmethod
-    def _extract_fact(cls, content: str) -> tuple[str, str] | None:
-        """Extract one explicit durable fact from a user message."""
-        text = " ".join(content.strip().split())
-        if not text:
-            return None
-
-        for pattern, key in cls._FACT_PATTERNS:
-            match = pattern.search(text)
-            if not match:
-                continue
-            value = match.group(1).strip(" .!?\"'")
-            if len(value) < 2:
-                return None
-            if key in {"preference", "dislike", "remembered_fact"}:
-                key = f"{key}:{value[:48].lower()}"
-            return key, value
-
-        return None
-
-    @subscribe(MemoryUpdateNeeded)
-    async def _on_memory_update(self, event: MemoryUpdateNeeded) -> None:
-        """
-        Persist only durable facts to SQLite.
-
-        Short-term memory (in-memory buffer) is managed directly by the
-        ReasoningCoordinator with synchronous adds — NOT via this event
-        handler — to avoid race conditions. This handler is DB-only and
-        intentionally does not store whole conversation turns.
-        """
-        if event.session_id != self._session_id:
-            return
-        if event.role != "user":
-            return
-
-        fact = self._extract_fact(event.content)
-        if fact is None:
-            return
-
-        key, value = fact
-        try:
-            await self._structured.store_fact(key, value, self._session_id)
-        except Exception as exc:
-            import logging
-
-            logging.getLogger("kancha.memory.manager").warning(
-                "Fact store failed: %s", exc
-            )
-
     async def retrieve_context(
         self,
         query: str,
@@ -258,15 +164,78 @@ class MemoryManager:
     async def add_interaction(
         self, role: str, content: str, metadata: dict[str, Any] | None = None
     ) -> None:
-        """Add an interaction to short-term memory and store user facts only."""
-        # Short-term
+        """Add an interaction to short-term memory only.
+
+        Durable memory is no longer extracted from raw turns — it comes
+        exclusively from the primary Gemini response via
+        :meth:`save_sql` and :meth:`append_rag`.
+        """
         self._short_term.add(role, content, metadata)
 
-        if role == "user":
-            fact = self._extract_fact(content)
-            if fact is not None:
-                key, value = fact
-                await self._structured.store_fact(key, value, self._session_id)
+    async def save_sql(self, items: list[dict[str, Any]]) -> int:
+        """Upsert ``{key, value}`` items into structured (SQLite) memory.
+
+        Reuses :meth:`StructuredMemory.store_fact`, which updates
+        existing keys in place, inserts missing keys, and never creates
+        duplicate records. Returns the number of items persisted.
+        """
+        saved = 0
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            key = item.get("key")
+            value = item.get("value")
+            if key is None or value is None:
+                continue
+            await self._structured.store_fact(str(key), str(value), self._session_id)
+            saved += 1
+        return saved
+
+    async def append_rag(self, items: list[dict[str, Any]]) -> int:
+        """Append ``{type, title, content}`` entries to ``memory/rag.txt``.
+
+        The file is created automatically on first use and is append-only
+        — existing content is never overwritten. Returns the number of
+        entries appended.
+        """
+        path = self._rag_file_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        entries = [
+            self._format_rag_entry(
+                type_=str(item.get("type", "")),
+                title=str(item.get("title", "")),
+                content=str(item.get("content", "")),
+            )
+            for item in items or []
+            if isinstance(item, dict) and str(item.get("content", "")).strip()
+        ]
+        if not entries:
+            return 0
+
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write("".join(entries))
+        return len(entries)
+
+    @staticmethod
+    def _rag_file_path() -> Path:
+        """Location of the RAG memory file, inside the ``memory/`` package."""
+        return Path(__file__).resolve().parent / "rag.txt"
+
+    @staticmethod
+    def _format_rag_entry(type_: str, title: str, content: str) -> str:
+        """Render one RAG entry block for ``rag.txt``."""
+        timestamp = datetime.utcnow().isoformat()
+        return (
+            f"{_RAG_SEPARATOR}\n"
+            f"Timestamp: {timestamp}\n"
+            f"Type: {type_}\n"
+            f"Title: {title}\n"
+            f"\n"
+            f"{content}\n"
+            f"\n"
+            f"{_RAG_SEPARATOR}\n"
+        )
 
     async def store_fact(self, key: str, value: str) -> str:
         """Store a fact in structured memory."""
