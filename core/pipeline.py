@@ -30,6 +30,7 @@ from core.events import (
     SystemError,
 )
 from memory.manager import MemoryManager
+from memory.token_log import TokenLog, jsonl_sink
 from nlu.classifier import NLUClassifier
 from output.response_formatter import ResponseFormatter
 from output.tts import TTSHandler
@@ -117,8 +118,12 @@ async def build_pipeline(
         )
     bus.register_handlers(memory)
 
-    # ── LLM ───────────────────────────────────────────────────────────────
-    llm = GeminiClient()
+    # ── LLM + token logging ─────────────────────────────────────────────
+    token_log = TokenLog(
+        session_id=session_id,
+        sink=jsonl_sink(data_dir / "token_log.jsonl"),
+    )
+    llm = GeminiClient(token_log=token_log)
     await llm.initialize()
 
     # ── NLU ───────────────────────────────────────────────────────────────
@@ -151,6 +156,7 @@ async def build_pipeline(
         bus=bus,
         gemini_client=llm,
         memory_manager=memory,
+        token_log=token_log,
     )
     coordinator.register()
 
@@ -167,6 +173,7 @@ async def build_pipeline(
         bus=bus,
         llm=llm,
         memory=memory,
+        token_log=token_log,
     )
     planner.register()
 

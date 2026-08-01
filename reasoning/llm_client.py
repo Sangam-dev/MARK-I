@@ -4,6 +4,8 @@ import json
 import logging
 from typing import Any
 
+from memory.token_log import TokenLog
+
 from reasoning.llm_client_mulapi import (
     ALL_MODELS,
     get_pool,
@@ -23,10 +25,14 @@ class GeminiClient:
         model: str | None = None,
         max_retries: int = 3,
         timeout: float = 12.0,
+        default_hedge_width: int = 1,
+        token_log: TokenLog | None = None,
     ) -> None:
         self.model = model or ALL_MODELS[0]
         self.timeout = timeout
         self.max_retries = max_retries
+        self.default_hedge_width = default_hedge_width
+        self.token_log = token_log
         self.pool = None
 
     async def initialize(self) -> None:
@@ -34,20 +40,38 @@ class GeminiClient:
         self.pool = get_pool()
         logger.info("GeminiClient initialized successfully.")
 
-    async def generate(self, prompt: str, system: str = "") -> str:
-        """Generate a response from the model, optionall injecting system instructions."""
+    async def generate(
+        self,
+        prompt: str,
+        system: str = "",
+        hedge_width: int | None = None,
+        call_site: str = "conversational",
+    ) -> str:
+        """Generate a response from the model, optionally injecting system instructions."""
         full_prompt = prompt
         if system:
             full_prompt = f"System Instruction: {system}\n\nUser Prompt: {prompt}"
+
+        if self.pool is None:
+            raise RuntimeError("GeminiClient is not initialized")
 
         try:
             response = await hedged_generate(
                 pool=self.pool,
                 models=ALL_MODELS,
                 prompt=full_prompt,
-                hedge_width=2,
+                hedge_width=(
+                    hedge_width if hedge_width is not None else self.default_hedge_width
+                ),
                 timeout=self.timeout,
             )
+            if self.token_log is not None:
+                self.token_log.record(
+                    call_site=call_site,
+                    model=self.model,
+                    input_tokens=max(1, len(full_prompt) // 4),
+                    output_tokens=max(1, len(response) // 4),
+                )
             return response
         except Exception as e:
             logger.exception("Failed to generate response: %s", e)
@@ -57,6 +81,8 @@ class GeminiClient:
         self,
         history: list[dict],
         system: str = "",
+        hedge_width: int | None = None,
+        call_site: str = "conversational",
     ) -> str:
         """
         Generate a response using proper Gemini multi-turn conversation format.
@@ -99,22 +125,39 @@ class GeminiClient:
         if system:
             config = types.GenerateContentConfig(system_instruction=system)
 
+        if self.pool is None:
+            raise RuntimeError("GeminiClient is not initialized")
+
         try:
             response = await hedged_generate_conv(
                 pool=self.pool,
                 models=ALL_MODELS,
                 contents=contents,
                 config=config,
-                hedge_width=2,
+                hedge_width=(
+                    hedge_width if hedge_width is not None else self.default_hedge_width
+                ),
                 timeout=self.timeout,
             )
+            if self.token_log is not None:
+                self.token_log.record(
+                    call_site=call_site,
+                    model=self.model,
+                    input_tokens=max(1, len(str(history)) // 4),
+                    output_tokens=max(1, len(response) // 4),
+                )
             return response
         except Exception as e:
             logger.exception("generate_with_history failed: %s", e)
             return "I'm having trouble thinking right now. Could you try again?"
 
     async def generate_json(
-        self, prompt: str, schema_description: str | None = None, system: str = ""
+        self,
+        prompt: str,
+        schema_description: str | None = None,
+        system: str = "",
+        hedge_width: int | None = None,
+        call_site: str = "planner",
     ) -> dict[str, Any]:
         """Generate a JSON response from the model, retrying on decode errors."""
         full_prompt = prompt
@@ -134,15 +177,27 @@ class GeminiClient:
         if system:
             full_prompt = f"System Instruction: {system}\n\nUser Prompt: {full_prompt}"
 
+        if self.pool is None:
+            raise RuntimeError("GeminiClient is not initialized")
+
         for attempt in range(self.max_retries + 1):
             try:
                 response = await hedged_generate(
                     pool=self.pool,
                     models=ALL_MODELS,
                     prompt=full_prompt,
-                    hedge_width=2,
+                    hedge_width=(
+                        hedge_width if hedge_width is not None else self.default_hedge_width
+                    ),
                     timeout=self.timeout,
                 )
+                if self.token_log is not None:
+                    self.token_log.record(
+                        call_site=call_site,
+                        model=self.model,
+                        input_tokens=max(1, len(full_prompt) // 4),
+                        output_tokens=max(1, len(response) // 4),
+                    )
                 cleaned = response.strip()
                 if cleaned.startswith("```"):
                     lines = cleaned.splitlines()

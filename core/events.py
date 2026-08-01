@@ -287,11 +287,22 @@ class PlanCompleted(BaseEvent):
     consumed by: reasoning/coordinator.py (to emit ResponseReady)
 
     status: "completed" | "failed" | "partial" | "cancelled"
+
+    task_results carries the per-task outcome so the coordinator can
+    run the natural-language pass without re-tracking plan state.
+    Each entry is ``{"tool": str, "result": str, "arguments": dict}``
+    where ``result`` is the raw tool output (success text or error
+    text on failure). Empty entries are omitted.
+
+    user_request is the original user input — passed through so the
+    naturalize helper can include it in the LLM paraphrase prompt.
     """
 
     plan_id: str = ""
     status: str = "completed"
     summary: str = ""
+    task_results: list[dict[str, Any]] = field(default_factory=list)
+    user_request: str = ""
 
 
 @dataclass(frozen=True)

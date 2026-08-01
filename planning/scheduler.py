@@ -41,6 +41,43 @@ from planning.models import ExecutionPlan, PlannedTask, PlanStatus, TaskStatus
 logger = logging.getLogger("kancha.planning.scheduler")
 
 
+def _natural_summary(plan: ExecutionPlan) -> str:
+    """Build a user-facing summary of a finished plan.
+
+    The machine-style "0/1 tasks completed, 1 failed" is internal
+    bookkeeping. The user-facing reply should be the actual tool
+    results, concatenated when more than one task ran. This keeps
+    "what's the weather in London?" producing the weather text rather
+    than a status counter.
+    """
+    completed = [t for t in plan.tasks if t.status == TaskStatus.COMPLETED]
+    failed = [t for t in plan.tasks if t.status == TaskStatus.FAILED]
+    skipped = [t for t in plan.tasks if t.status == TaskStatus.SKIPPED]
+
+    parts: list[str] = []
+
+    # 1. Successful task results — the meat of the response.
+    for t in completed:
+        text = (t.result or "").strip()
+        if text:
+            parts.append(text)
+        else:
+            parts.append(f"Done: {t.description}")
+
+    # 2. Failures — short, factual, no decoration.
+    for t in failed:
+        err = (t.error or "").strip() or "unknown error"
+        parts.append(f"Couldn't {t.description}: {err}")
+
+    # 3. Skipped — only mention if any.
+    for t in skipped:
+        parts.append(f"Skipped {t.description} (dependency failed)")
+
+    if not parts:
+        return "Nothing to do."
+    return "\n".join(parts)
+
+
 class PlanScheduler:
     """In-memory async scheduler for :class:`ExecutionPlan`."""
 
@@ -184,7 +221,7 @@ class PlanScheduler:
             self._emit_plan_completed(
                 plan,
                 status="cancelled",
-                summary=plan.summary(),
+                summary=_natural_summary(plan),
             )
             raise
         except Exception as exc:  # noqa: BLE001
@@ -299,24 +336,36 @@ class PlanScheduler:
             self._emit_plan_completed(
                 plan,
                 status="partial",
-                summary=plan.summary(),
+                summary=_natural_summary(plan),
             )
         else:
             plan.status = PlanStatus.COMPLETED
             self._emit_plan_completed(
                 plan,
                 status="completed",
-                summary=plan.summary(),
+                summary=_natural_summary(plan),
             )
 
     def _emit_plan_completed(
         self, plan: ExecutionPlan, status: str, summary: str
     ) -> None:
+        task_results = [
+            {
+                "tool": t.tool,
+                "result": (t.result or t.error or "").strip(),
+                "arguments": dict(t.arguments or {}),
+            }
+            for t in plan.tasks
+            if t.status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.SKIPPED}
+            if (t.result or t.error)
+        ]
         self._bus.emit(
             PlanCompleted(
                 plan_id=plan.id,
                 status=status,
                 summary=summary,
+                task_results=task_results,
+                user_request=plan.user_request,
                 session_id=plan.session_id,
             )
         )

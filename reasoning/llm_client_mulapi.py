@@ -35,7 +35,7 @@ DEFAULT_FALLBACKS = os.getenv(
     "GEMINI_MODEL_FALLBACKS",
     "gemini-3.5-flash,gemini-2.0-flash,gemini-2.0-flash-lite",
 )
-DEFAULT_HEDGE = int(os.getenv("HEDGE", "2"))
+DEFAULT_HEDGE = int(os.getenv("HEDGE", "1"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "12.0"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "1"))
 COOLDOWN_SECS = float(

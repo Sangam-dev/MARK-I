@@ -29,6 +29,7 @@ from core.events import (
     ResponseReady,
 )
 from memory.manager import MemoryManager
+from memory.token_log import TokenLog
 from planning.models import (
     ExecutionPlan,
     PlanStatus,
@@ -58,13 +59,19 @@ _MULTISTEP_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+_VERBS_RE = re.compile(
+    r"\b(?:create|make|delete|remove|set|cancel|list|show|find|search|get|read|write|move|copy|rename|open|launch|start|send|reply|tell|ask|remind)\b",
+    re.IGNORECASE,
+)
+
 
 def _looks_multistep(text: str) -> bool:
     """True if *text* probably contains two or more distinct actions."""
     if not text:
         return False
-    # Two or more distinct verb phrases connected by AND/THEN/etc.
-    if _MULTISTEP_RE.search(text):
+    has_conjunction = _MULTISTEP_RE.search(text) is not None
+    verb_count = len(_VERBS_RE.findall(text))
+    if has_conjunction and verb_count >= 2:
         return True
     # More than one enumerator ("first ... second ...", numbered list).
     if re.search(r"\b(?:first|1\.|1\))\s.*\b(?:second|2\.|2\))\s", text, re.IGNORECASE | re.DOTALL):
@@ -179,11 +186,13 @@ class Planner:
         llm: GeminiClient,
         memory: MemoryManager,
         max_tasks_per_plan: int = 8,
+        token_log: TokenLog | None = None,
     ) -> None:
         self._bus = bus
         self._llm = llm
         self._memory = memory
         self._max_tasks = max_tasks_per_plan
+        self._token_log = token_log
         self._resolver = ReferenceResolver()
 
     # ── registration ──────────────────────────────────────────────
@@ -329,6 +338,8 @@ class Planner:
                     "placeholders)."
                 ),
                 system=prompt,
+                hedge_width=2,
+                call_site="planner",
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Planner LLM call failed: %s", exc)

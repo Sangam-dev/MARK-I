@@ -12,28 +12,18 @@ from tasks.registry import TASK_REGISTRY
 
 
 def _format_tool_catalog() -> str:
-    """Render the registry as a human-readable catalog for the LLM."""
+    """Render the registry as a compact catalog for the LLM."""
     lines = []
     for name, spec in TASK_REGISTRY.items():
-        req = ", ".join(spec.required_params) if spec.required_params else "(none)"
-        opt = (
-            ", ".join(spec.optional_params) if spec.optional_params else "(none)"
-        )
-        types = ", ".join(
-            f"{k}={v.__name__}" for k, v in spec.param_types.items()
-        ) or "(none)"
+        req = ", ".join(spec.required_params) if spec.required_params else "—"
+        opt = ", ".join(spec.optional_params) if spec.optional_params else "—"
         flags = []
         if spec.requires_confirmation:
-            flags.append("requires_confirmation")
+            flags.append("confirm")
         if spec.is_destructive:
             flags.append("destructive")
-        flag_str = f"  [{', '.join(flags)}]" if flags else ""
-        lines.append(
-            f"- {name}: {spec.description}\n"
-            f"    required: {req}\n"
-            f"    optional: {opt}\n"
-            f"    types:    {types}{flag_str}"
-        )
+        flag_str = f" [{', '.join(flags)}]" if flags else ""
+        lines.append(f"- {name}: {spec.description} (req: {req}, opt: {opt}){flag_str}")
     return "\n".join(lines)
 
 

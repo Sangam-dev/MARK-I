@@ -16,7 +16,9 @@ from core.events import (
     TaskCompleted,
 )
 from memory.manager import MemoryManager
+from memory.token_log import TokenLog
 from reasoning.llm_client import GeminiClient
+from reasoning.naturalize import naturalize_plan_response
 from reasoning.prompt_builder import JARVIS_PERSONA
 
 logger = logging.getLogger("kancha.reasoning.coordinator")
@@ -46,10 +48,12 @@ class ReasoningCoordinator:
         bus: EventBus,
         gemini_client: GeminiClient,
         memory_manager: MemoryManager,
+        token_log: TokenLog | None = None,
     ) -> None:
         self.bus = bus
         self.gemini_client = gemini_client
         self.memory_manager = memory_manager
+        self.token_log = token_log
         # Pending task turns keyed by session_id
         self._pending_turns: dict[str, dict[str, Any]] = {}
         self._last_tasks: dict[str, dict[str, Any]] = {}
@@ -205,6 +209,8 @@ class ReasoningCoordinator:
         response_text = await self.gemini_client.generate_with_history(
             history=history,
             system=system,
+            hedge_width=1,
+            call_site="conversational",
         )
 
         # ── Step 5: Add assistant turn to short_term SYNCHRONOUSLY ────────
@@ -239,24 +245,21 @@ class ReasoningCoordinator:
     async def on_plan_completed(self, event: PlanCompleted) -> None:
         """Emit a user-facing response when a plan finishes.
 
-        The Planner/Executor/Scheduler run the tools; this turns the
-        machine outcome into natural language.
+        Single-task plans run through :mod:`reasoning.tool_voice`
+        synchronously (zero LLM cost). Multi-task and failure paths go
+        through :mod:`reasoning.naturalize` which calls the LLM to
+        combine the per-tool results into one JARVIS-style reply.
         """
         session_id = event.session_id
-        status = event.status
-        summary = event.summary or "Plan completed."
+        summary = (event.summary or "").strip()
 
-        # Map plan status to user-friendly phrasing.
-        if status == "completed":
-            response_text = f"All done! {summary}"
-        elif status == "partial":
-            response_text = f"Partially completed: {summary}"
-        elif status == "failed":
-            response_text = f"Plan failed: {summary}"
-        elif status == "cancelled":
-            response_text = f"Plan cancelled: {summary}"
-        else:
-            response_text = f"Plan finished with status '{status}': {summary}"
+        response_text = await naturalize_plan_response(
+            llm=self.gemini_client,
+            user_request=event.user_request or summary,
+            task_results=list(event.task_results or []),
+            status=event.status,
+            token_log=self.token_log,
+        )
 
         self.memory_manager.short_term.add("assistant", response_text)
         self._persist_turn(session_id, "assistant", response_text)

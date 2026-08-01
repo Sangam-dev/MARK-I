@@ -214,7 +214,10 @@ def classify_tool_request(text: str) -> ToolDecision | None:
     if protocol_decision is not None:
         return protocol_decision
 
-    if lowered.startswith(
+    if re.search(
+        r"\b(?:set|create|make|schedule|add)\s+(?:an?\s+)?(?:alarm|reminder|timer)\b",
+        lowered,
+    ) or lowered.startswith(
         (
             "set alarm",
             "set an alarm",
@@ -256,13 +259,19 @@ def classify_tool_request(text: str) -> ToolDecision | None:
             },
         )
 
-    if lowered in {"alarms", "list alarms", "show alarms"}:
+    if lowered in {"alarms", "list alarms", "show alarms"} or re.search(
+        r"\b(?:list|show|what are)\s+(?:my\s+)?(?:alarms?|reminders?|timers?)\b",
+        lowered,
+    ):
         return ToolDecision(task_name="list_alarms", parameters={})
 
     if lowered in {"cancel alarms", "clear alarms", "delete alarms", "stop alarms"}:
         return ToolDecision(task_name="cancel_alarms", parameters={})
 
-    if re.search(r"\b(?:weather|forecast|temperature|rain|raining)\b", lowered):
+    if re.search(
+        r"\b(?:weather|forecast|temperature|temp|rain|raining|sunny|cloudy)\b",
+        lowered,
+    ):
         # Clean query, extract place
         place_match = re.search(r"\b(?:in|at|for)\s+([a-zA-Z\s]+)$", cleaned)
         city = place_match.group(1).strip() if place_match else cleaned
