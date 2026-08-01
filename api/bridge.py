@@ -20,6 +20,7 @@ import logging
 from core.events import (
     AssistantState,
     AssistantStateChanged,
+    PartialResponse,
     ResponseReady,
     SystemError,
     TaskCompleted,
@@ -52,6 +53,16 @@ def attach_bridge(pipeline: Pipeline) -> None:
     async def _on_transcript_ready(event: TranscriptReady) -> None:
         await manager.broadcast(
             "transcript", {"text": event.text, "source": "voice"}, event.session_id
+        )
+
+    async def _on_partial_response(event: PartialResponse) -> None:
+        # Streamed assistant text — the UI appends `text` until `done` is
+        # true, then the authoritative `response` message (from
+        # _on_response_ready) finalizes the bubble.
+        await manager.broadcast(
+            "response_partial",
+            {"text": event.text, "done": event.done},
+            event.session_id,
         )
 
     async def _on_response_ready(event: ResponseReady) -> None:
@@ -95,6 +106,7 @@ def attach_bridge(pipeline: Pipeline) -> None:
     bus.subscribe(AssistantStateChanged, _on_state_changed)
     bus.subscribe(TextInputReceived, _on_text_input)
     bus.subscribe(TranscriptReady, _on_transcript_ready)
+    bus.subscribe(PartialResponse, _on_partial_response)
     bus.subscribe(ResponseReady, _on_response_ready)
     bus.subscribe(TaskCompleted, _on_task_completed)
     bus.subscribe(SystemError, _on_system_error)

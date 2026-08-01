@@ -979,6 +979,22 @@ export default function App() {
                 setLastExchange({ who: "jarvis", text: payload.text });
             },
         );
+        // Streaming assistant text — append chunks to the in-flight bubble
+        // as the backend streams them (see backend PartialResponse event).
+        // `done: true` finalizes; the authoritative `response` message then
+        // overwrites with the exact final text.
+        let streamedText = "";
+        const offPartial = wsClient.on<{ text: string; done: boolean }>(
+            "response_partial",
+            (payload) => {
+                if (payload.done) {
+                    streamedText = "";
+                    return;
+                }
+                streamedText += payload.text;
+                setLastExchange({ who: "jarvis", text: streamedText });
+            },
+        );
         const offError = wsClient.on<{ message: string }>(
             "error",
             (payload) => {
@@ -991,6 +1007,7 @@ export default function App() {
             offClose();
             offState();
             offTranscript();
+            offPartial();
             offResponse();
             offError();
         };

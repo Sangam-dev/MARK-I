@@ -9,6 +9,12 @@ Implements sentence splitting with overlap optimization:
     S3:               [synth]──[play]
 
 While sentence N plays, N+1 is already synthesizing — zero gap between sentences.
+
+The *live* output path is :class:`StreamingSpeaker` + :class:`TTSHandler`, which
+start speaking complete sentences as ``PartialResponse`` events stream in from
+the LLM (audio no longer waits for the full response). The standalone
+``speak()`` helper implements the same pipelining for a complete text block
+and is kept for backwards compatibility.
 """
 
 from __future__ import annotations
@@ -31,7 +37,12 @@ except ImportError:
 import logging
 
 from core.bus import EventBus
-from core.events import AssistantState, AssistantStateChanged, ResponseReady
+from core.events import (
+    AssistantState,
+    AssistantStateChanged,
+    PartialResponse,
+    ResponseReady,
+)
 
 logger = logging.getLogger("kancha.output.tts")
 
@@ -204,40 +215,203 @@ async def speak(text: str) -> None:
         print(f"\n  ✓ Done in {elapsed:.2f}s\n")
 
 
+class StreamingSpeaker:
+    """Pipelined sentence TTS that spans multiple events.
+
+    Sentences are pushed as soon as they complete during streaming. A single
+    player task plays them back-to-back the moment each one's audio becomes
+    ready, so the *first* sentence starts playing as soon as its synthesis
+    finishes — no waiting for the full response or even for a second
+    sentence. Synthesis of later sentences overlaps playback of earlier
+    ones because they are queued ahead of the player.
+    """
+
+    def __init__(self) -> None:
+        # Lazily created on first use (asyncio primitives bind to a loop).
+        self._lock: asyncio.Lock | None = None
+        self._queue: asyncio.Queue[asyncio.Task | None] | None = None
+        self._player: asyncio.Task | None = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    def _ensure_player(self) -> None:
+        if self._player is None or self._player.done():
+            self._queue = asyncio.Queue()
+            self._player = asyncio.create_task(self._player_loop())
+
+    async def _player_loop(self) -> None:
+        """Consume synthesis tasks in order; play each as it becomes ready.
+
+        A single failure (synthesis or playback) is logged and skipped so it
+        can never abort the rest of the stream. The loop only exits on the
+        ``None`` sentinel pushed by :meth:`drain`.
+        """
+        while True:
+            item = await self._queue.get()
+            if item is None:
+                break
+            try:
+                audio = await item
+                if audio is not None:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, _play, *audio)
+            except Exception as exc:
+                logger.warning("TTS sentence failed (skipping): %s", exc)
+                continue
+
+    async def push(self, sentence: str) -> None:
+        """Queue a complete sentence for synthesis+playback (non-blocking)."""
+        if not sentence or not sentence.strip():
+            return
+        async with self._get_lock():
+            self._ensure_player()
+            this = asyncio.create_task(_synthesize(sentence))
+            await self._queue.put(this)
+
+    async def drain(self) -> None:
+        """Stop the player and block until all queued audio has finished."""
+        async with self._get_lock():
+            if self._player is None or self._player.done():
+                # Player only exits via the sentinel, so a done player means
+                # every queued sentence already played — nothing to discard.
+                self._player = None
+                self._queue = None
+                return
+            await self._queue.put(None)
+            await self._player
+            self._player = None
+            self._queue = None
+
+
 class TTSHandler:
-    """Subscribes to ResponseReady events and speaks the response text."""
+    """Speaks assistant responses, starting while they are still streaming.
+
+    Subscribes to ``PartialResponse`` so complete sentences begin playing
+    as soon as they are generated (audio no longer waits for the full LLM
+    response), and to ``ResponseReady`` for the authoritative final text
+    (task responses never stream) plus the IDLE state transition.
+
+    While speaking, the shared AudioState is notified so the microphone
+    pauses and does not transcribe the assistant's own voice.
+    """
 
     def __init__(self, bus: EventBus) -> None:
         self._bus = bus
+        self._speaker = StreamingSpeaker()
+        # Serializes a whole utterance (buffer + state) end to end so a
+        # concurrent response can never clobber an in-flight one. Overlap
+        # is preserved: pushes queue on the speaker's own lock, and each
+        # push still starts the next synthesis before playing the previous.
+        self._utterance_lock: asyncio.Lock | None = None
+        self._buf = ""
+        self._visible = ""
+        self._session_id = "default"
+        self._started = False
 
     def register(self) -> None:
+        self._bus.subscribe(PartialResponse, self.on_partial)
         self._bus.subscribe(ResponseReady, self.on_response_ready)
 
+    def _get_utterance_lock(self) -> asyncio.Lock:
+        if self._utterance_lock is None:
+            self._utterance_lock = asyncio.Lock()
+        return self._utterance_lock
+
+    # ── Streaming ───────────────────────────────────────────────────────────
+
+    async def on_partial(self, event: PartialResponse) -> None:
+        async with self._get_utterance_lock():
+            if event.done:
+                # Stream ended. Do NOT flush the buffered fragment here —
+                # ResponseReady follows immediately with the authoritative
+                # text, and it merges the fragment with the final tail (a
+                # mid-word stream end would otherwise be spoken broken).
+                return
+            if not event.text:
+                return
+            self._session_id = event.session_id
+            self._visible += event.text
+            self._buf += event.text
+            await self._speak_complete_sentences()
+
     async def on_response_ready(self, event: ResponseReady) -> None:
-        """
-        Handle assistant responses by speaking them.
+        async with self._get_utterance_lock():
+            if not event.text or not event.text.strip():
+                # Nothing to say — still close out an in-flight utterance so
+                # the state machine can never get stuck in SPEAKING.
+                if self._started:
+                    await self._finish_utterance(event.session_id)
+                return
 
-        While speaking, notify the shared AudioState so that the
-        microphone pauses and does not transcribe the assistant's own voice.
-        """
-        if not event.text or not event.text.strip():
+            logger.info(
+                "TTS: ResponseReady received (%d chars), speaking...",
+                len(event.text),
+            )
+
+            self._session_id = event.session_id
+            # Authoritative text: speak only what streaming hasn't covered.
+            final = event.text.strip()
+            visible = self._visible.strip()
+            if visible and final.startswith(visible):
+                # The streamed text is a prefix of the final message. The
+                # buffered fragment is the unspoken tail of the stream, which
+                # continues seamlessly into final — merge the two so the last
+                # word is never spoken broken (e.g. "cond sentence!").
+                tail = self._buf + final[len(visible):]
+                self._buf = ""
+            else:
+                # Divergent (rare fallback): speak only the text after the
+                # longest common prefix; drop the stale buffered fragment.
+                common = 0
+                limit = min(len(final), len(visible))
+                while common < limit and final[common] == visible[common]:
+                    common += 1
+                self._buf = ""
+                tail = final[common:]
+            if tail:
+                self._buf = tail
+                await self._speak_complete_sentences()
+            await self._flush_remainder()
+            await self._finish_utterance(event.session_id)
+
+    # ── Internals ────────────────────────────────────────────────────────────
+
+    async def _speak_complete_sentences(self) -> None:
+        sentences, self._buf = _extract_sentences(self._buf)
+        for sentence in sentences:
+            await self._mark_speaking()
+            await self._speaker.push(sentence)
+
+    async def _flush_remainder(self) -> None:
+        remainder = self._buf.strip()
+        self._buf = ""
+        if remainder and len(remainder) > 2:
+            await self._mark_speaking()
+            await self._speaker.push(remainder)
+
+    async def _mark_speaking(self) -> None:
+        if self._started:
             return
-
-        logger.info("TTS: ResponseReady received, speaking...")
-
+        self._started = True
         audio_state.speaking_started()
         self._bus.emit(
             AssistantStateChanged(
-                state=AssistantState.SPEAKING, session_id=event.session_id
+                state=AssistantState.SPEAKING, session_id=self._session_id
             )
         )
 
-        try:
-            await speak(event.text)
-        finally:
+    async def _finish_utterance(self, session_id: str) -> None:
+        await self._speaker.drain()
+        if self._started:
             audio_state.speaking_finished()
             self._bus.emit(
                 AssistantStateChanged(
-                    state=AssistantState.IDLE, session_id=event.session_id
+                    state=AssistantState.IDLE, session_id=session_id
                 )
             )
+        self._buf = ""
+        self._visible = ""
+        self._started = False

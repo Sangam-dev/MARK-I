@@ -151,6 +151,22 @@ class ResponseReady(BaseEvent):
     llm_raw: str = ""
     requires_task: bool = False
 
+@dataclass(frozen=True)
+class PartialResponse(BaseEvent):
+    """
+    Event emitted as a conversational response streams in.
+
+    Carries the latest chunk of the assistant's *message* text (JSON
+    envelope scaffolding already stripped) so the UI can render tokens
+    as they arrive instead of waiting for the full ``ResponseReady``.
+
+    emitted by: ReasoningCoordinator (streaming conversational path)
+    consumed by: api/bridge.py (forwards to WebSocket clients)
+    """
+
+    text: str = ""
+    done: bool = False
+
 
 # -------------- UI / Presentation Events -----------------#
 

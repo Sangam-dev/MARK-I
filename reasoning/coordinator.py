@@ -3,12 +3,13 @@ from __future__ import annotations
 import logging
 import re
 from typing import Any
-
+import asyncio
 from core.bus import EventBus
 from core.events import (
     Intent,
     IntentIdentified,
     MemoryRetrieved,
+    PartialResponse,
     PlanCompleted,
     ReasoningRequested,
     ResponseReady,
@@ -16,7 +17,11 @@ from core.events import (
 )
 from memory.manager import MemoryManager
 from memory.token_log import TokenLog
-from reasoning.llm_client import GeminiClient
+from reasoning.llm_client import (
+    GeminiClient,
+    extract_streamed_message,
+    parse_memory_response,
+)
 from reasoning.naturalize import naturalize_plan_response
 from reasoning.prompt_builder import JARVIS_PERSONA
 
@@ -203,7 +208,7 @@ class ReasoningCoordinator:
             self.bus.emit(retry_intent)
             return
 
-        # ── Step 3: Conversational path — call LLM (JSON envelope) ────────
+        # ── Step 3: Conversational path — stream LLM (JSON envelope) ──────
         memory_event = event.memory_events[0] if event.memory_events else None
         system = self._build_system_prompt(memory_event)
 
@@ -211,18 +216,54 @@ class ReasoningCoordinator:
         history = self._get_history()
 
         logger.debug(
-            "Calling LLM | history_turns=%d | system_len=%d",
+            "Calling LLM (streaming) | history_turns=%d | system_len=%d",
             len(history),
             len(system),
         )
 
-        payload = await self.gemini_client.generate_with_history_json(
-            history=history,
-            system=system,
-            hedge_width=1,
-            call_site="conversational",
-        )
+        # Stream the JSON envelope token-by-token. While it arrives, strip
+        # the scaffolding and forward ONLY the visible `message` text as
+        # PartialResponse events so the UI renders words as they generate.
+        # The full buffer is parsed once at the end for the authoritative
+        # message + sql/rag persistence (see _persist_response_memory).
+        raw_parts: list[str] = []
+        buffer = ""
+        prev_visible = ""
+        try:
+            async for chunk in self.gemini_client.generate_with_history_stream(
+                history=history,
+                system=system,
+                hedge_width=1,
+                call_site="conversational",
+            ):
+                raw_parts.append(chunk)
+                buffer += chunk
+                visible = extract_streamed_message(buffer)
+                if len(visible) > len(prev_visible):
+                    self.bus.emit(
+                        PartialResponse(
+                            text=visible[len(prev_visible) :],
+                            session_id=session_id,
+                        )
+                    )
+                    prev_visible = visible
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Streaming LLM call failed (session=%s): %s", session_id, exc
+            )
+
+        raw_response = "".join(raw_parts)
+        payload = parse_memory_response(raw_response)
         response_text = payload.get("message", "").strip()
+        # Guard against the raw-JSON fallback: if the stream died mid-way,
+        # parse_memory_response returns {"message": <raw partial JSON>}.
+        # Never surface scaffolding — fall back to what was already shown.
+        if (
+            not response_text
+            or response_text == raw_response.strip()
+            or response_text.startswith("{")
+        ):
+            response_text = prev_visible
 
         # ── Step 4: Add assistant turn to short_term SYNCHRONOUSLY ────────
         self.memory_manager.short_term.add("assistant", response_text)
@@ -232,7 +273,8 @@ class ReasoningCoordinator:
         # separate extraction step after the conversation.
         await self._persist_response_memory(payload)
 
-        # ── Step 6: Emit response ─────────────────────────────────────────
+        # ── Step 6: Mark stream done + emit final response ────────────────
+        self.bus.emit(PartialResponse(text="", done=True, session_id=session_id))
         self.bus.emit(ResponseReady(text=response_text, session_id=session_id))
 
     # ── Task completion handler ───────────────────────────────────────────────

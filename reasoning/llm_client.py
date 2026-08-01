@@ -12,6 +12,7 @@ from reasoning.llm_client_mulapi import (
     get_pool,
     hedged_generate,
     hedged_generate_conv,
+    hedged_stream_conv,
 
 )
 
@@ -38,10 +39,68 @@ Rules:
 - Omit "sql" and "rag" entirely when there is nothing to store.
   Never return empty arrays and never return null.
 """
+# JSON string escapes that can appear inside the streamed ``message`` value.
+# Decoding them the same way ``json.loads`` does keeps the streamed display
+# text byte-identical to the authoritative parsed message — which lets the
+# TTS overlap layer dedupe reliably (never re-speaking already-streamed text).
+_ESCAPES = {
+    "n": "\n",
+    "t": "\t",
+    "r": "\r",
+    "b": "\b",
+    "f": "\f",
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+}
+_HEX4_RE = re.compile(r"[0-9a-fA-F]{4}")
 
 
 _MSG_KEY_RE = re.compile(r'"message"\s*:\s*"')
 
+def extract_streamed_message(buffer: str) -> str:
+    """Best-effort extraction of the ``message`` field from a partially
+    streamed JSON envelope.
+
+    The model streams the full envelope (``{"message": ..., "sql"?: [...],
+    "rag"?: [...]}``), but the frontend must only see the *message* text
+    as it arrives. This incremental extractor walks the buffer, finds the
+    ``"message": "`` key, and captures the JSON string value seen so far
+    (handling ``\\`` escapes and stopping at the closing quote).
+
+    Returns ``""`` until the message value has started. This is display-
+    only — the authoritative parse still happens at the end via
+    :func:`parse_memory_response` on the complete response.
+    """
+    if not buffer:
+        return ""
+    match = _MSG_KEY_RE.search(buffer)
+    if not match:
+        return ""
+
+    i = match.end()
+    out: list[str] = []
+    while i < len(buffer):
+        ch = buffer[i]
+        if ch == "\\":
+            if i + 1 >= len(buffer):
+                break  # escape marker only — wait for the next chunk
+            esc = buffer[i + 1]
+            if esc == "u":
+                hex_part = buffer[i + 2 : i + 6]
+                if len(hex_part) < 4 or not _HEX4_RE.fullmatch(hex_part):
+                    break  # \uXXXX incomplete — wait for the rest
+                out.append(chr(int(hex_part, 16)))
+                i += 6
+                continue
+            out.append(_ESCAPES.get(esc, esc))
+            i += 2
+            continue
+        if ch == '"':
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def parse_memory_response(raw: str) -> dict[str, Any]:

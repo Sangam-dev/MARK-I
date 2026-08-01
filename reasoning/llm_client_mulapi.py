@@ -247,15 +247,19 @@ async def _generate_one_conv(
     return await _generate_call(pool, model, timeout, **kwargs)
 
 
-async def _stream_one(
+async def _stream_call(
     pool: KeyPool,
     model: str,
-    prompt: str,
     timeout: float,
+    **call_kwargs: Any,
 ) -> AsyncIterator[str]:
     """
-    Streaming version with key rotation on quota errors.
-    Yields text chunks; raises on unrecoverable errors.
+    Streaming core with key rotation on quota errors.
+
+    Yields text chunks; raises on unrecoverable errors. `call_kwargs` is
+    passed straight through to `generate_content_stream` (e.g.
+    `contents=...` for plain prompts, or `contents=...` + `config=...`
+    for structured conversation requests).
     """
     for attempt in range(MAX_RETRIES + 1):
         entry = await pool.next()
@@ -266,7 +270,7 @@ async def _stream_one(
             try:
                 response = entry.client.models.generate_content_stream(
                     model=model,
-                    contents=prompt,
+                    **call_kwargs,
                 )
                 for chunk in response:
                     text = getattr(chunk, "text", "")
@@ -315,6 +319,38 @@ async def _stream_one(
 
             raise
 
+
+def _stream_one(
+    pool: KeyPool,
+    model: str,
+    prompt: str,
+    timeout: float,
+) -> AsyncIterator[str]:
+    """Stream a plain-text prompt (contents=prompt) with key rotation.
+
+    NOT async — this returns the underlying async generator directly so
+    callers can ``gen = _stream_one(...)`` then ``await gen.__anext__()``
+    without an extra await (same contract as the original generator).
+    """
+    return _stream_call(pool, model, timeout, contents=prompt)
+
+
+def _stream_one_conv(
+    pool: KeyPool,
+    model: str,
+    contents: list,
+    config: Any,
+    timeout: float,
+) -> AsyncIterator[str]:
+    """Stream a structured conversation (contents + GenerateContentConfig).
+
+    NOT async — returns the underlying async generator directly (see
+    :func:`_stream_one`).
+    """
+    kwargs: dict[str, Any] = {"contents": contents}
+    if config is not None:
+        kwargs["config"] = config
+    return _stream_call(pool, model, timeout, **kwargs)
 
 # ── Hedged requests ───────────────────────────────────────────────────────────
 
@@ -386,6 +422,72 @@ async def hedged_generate_conv(
         hedge_width,
         lambda m: _generate_one_conv(pool, m, contents, config, timeout),
     )
+
+
+async def hedged_stream_conv(
+    pool: KeyPool,
+    models: list[str],
+    contents: list,
+    config: Any,
+    hedge_width: int,
+    timeout: float,
+) -> AsyncIterator[str]:
+    """
+    Hedged multi-model streaming for structured conversation requests.
+
+    Races the FIRST chunk across the hedged models (fastest first token
+    wins), then yields every chunk from the winning stream. Falls back
+    sequentially through the tail models if all hedged attempts fail.
+
+    Yields text deltas; raises only if every model + key is exhausted.
+    """
+    if not models:
+        raise ValueError("No models provided")
+
+    hedged = models[:hedge_width]
+    tail = models[hedge_width:]
+    start = time.perf_counter()
+
+    async def _race_first_chunk(model: str):
+        gen = _stream_one_conv(pool, model, contents, config, timeout)
+        first = await gen.__anext__()
+        return model, first, gen
+
+    tasks: dict[asyncio.Task, str] = {
+        asyncio.create_task(_race_first_chunk(m), name=m): m for m in hedged
+    }
+
+    winner_model = winner_first = winner_gen = None
+
+    while tasks and winner_model is None:
+        done, _ = await asyncio.wait(tasks.keys(), return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            model_name = tasks.pop(task)
+            if task.exception() is None:
+                winner_model, winner_first, winner_gen = task.result()
+                for t in tasks:
+                    t.cancel()
+                break
+            else:
+                _log(f"[{model_name}] stream race failed: {task.exception()!r}")
+
+    if winner_model is None:
+        for model in tail:
+            try:
+                gen = _stream_one_conv(pool, model, contents, config, timeout)
+                winner_first = await gen.__anext__()
+                winner_model, winner_gen = model, gen
+                break
+            except Exception as exc:
+                _log(f"[{model}] tail stream failed: {exc!r}")
+
+    if winner_model is None:
+        raise RuntimeError("All models + keys exhausted")
+
+    _log(f"[{winner_model}] streaming | TTFT {time.perf_counter() - start:.2f}s")
+    yield winner_first
+    async for chunk in winner_gen:
+        yield chunk
 
 
 async def hedged_stream(

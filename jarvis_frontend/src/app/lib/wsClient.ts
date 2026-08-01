@@ -5,7 +5,7 @@
  * answers/guide.md):
  *
  *   Client -> Server: { type: "user_text" | "retry_last" | "ping", payload, session_id }
- *   Server -> Client: { type: "state" | "transcript" | "response" | "task_update" | "error" | "pong", payload, session_id }
+ *   Server -> Client: { type: "state" | "transcript" | "response" | "response_partial" | "task_update" | "error" | "pong", payload, session_id }
  *
  * This module is intentionally the ONLY place in the frontend that touches
  * the raw `WebSocket` API — App.tsx and friends subscribe via `wsClient.on(...)`
@@ -19,6 +19,7 @@ export type ServerMessageType =
   | "state"
   | "transcript"
   | "response"
+  | "response_partial"
   | "task_update"
   | "error"
   | "pong"
