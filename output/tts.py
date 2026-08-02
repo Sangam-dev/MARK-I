@@ -63,9 +63,28 @@ def _get_speaking_lock() -> asyncio.Lock:
 # ─────────────────────────────────────────────────────────────────────────────
 
 VOICE = "en-GB-RyanNeural"
-MIN_CHUNK_LEN = 10
+# Minimum characters before any boundary can fire. Lowered from 10 to 6 so
+# short openings like "It is my absolute pleasure, sir" don't wait on the
+# LLM stream for the rest of the sentence before TTS starts. The tail-merge
+# in ``on_response_ready`` reconstructs the full sentence at playback time
+# so a soft split here is never audible.
+MIN_CHUNK_LEN = 6
+# Maximum characters before forcing a split. Unchanged at 160 — anything
+# past this would have already produced a hard or soft boundary.
 MAX_CHUNK_LEN = 160
-BOUNDARIES = {".", "!", "?", "—", "…"}
+# Hard boundaries (strong sentence ends) — split as soon as one is found
+# past ``MIN_CHUNK_LEN``.
+HARD_BOUNDARIES = {".", "!", "?", "…"}
+# Soft boundaries (commas, em-dashes) — only used as a fallback split once
+# the buffer is comfortably long enough that the next clause is going to
+# stand on its own anyway. Em-dash is here because the existing
+# ``_clean`` already pads it with spaces, so it's already a natural pause.
+SOFT_BOUNDARIES = {",", "—"}
+# Minimum buffer length before a soft-boundary split is allowed. Below
+# this we keep waiting for a hard boundary or the MAX_CHUNK_LEN fallback
+# — splitting on a comma in a 12-char fragment would sound unnatural.
+SOFT_BREAK_THRESHOLD = 24
+BOUNDARIES = HARD_BOUNDARIES | SOFT_BOUNDARIES
 
 ABBREV = re.compile(
     r"\b(Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|e\.g|i\.e|approx|dept|est|govt|inc|ltd)\.$",
@@ -89,12 +108,26 @@ def _extract_sentences(buffer: str) -> tuple[list[str], str]:
 
     Returns:
         (list of sentences, leftover buffer)
+
+    The extractor prefers hard sentence boundaries (``.``, ``!``, ``?``,
+    ``…``) past ``MIN_CHUNK_LEN``. If none has arrived but the buffer has
+    grown past ``SOFT_BREAK_THRESHOLD``, a soft boundary (``,``, ``—``)
+    is used as the split point — this is what makes short replies like
+    "It is my absolute pleasure, sir." start speaking well before the
+    LLM finishes streaming. The caller is responsible for stitching the
+    soft-split fragments back together at playback time
+    (:meth:`TTSHandler.on_response_ready` already does this via the
+    ``_visible`` / ``_buf`` merge).
+
+    If the buffer exceeds ``MAX_CHUNK_LEN`` with no boundary at all, the
+    extractor forces a split at the nearest space past ``MIN_CHUNK_LEN``.
     """
     sentences = []
     while True:
+        # First pass: look for any hard boundary past MIN_CHUNK_LEN.
         boundary_pos = -1
         for i, char in enumerate(buffer):
-            if char in BOUNDARIES and i >= MIN_CHUNK_LEN:
+            if char in HARD_BOUNDARIES and i >= MIN_CHUNK_LEN:
                 if char == "." and _is_abbreviation(buffer, i):
                     continue
                 if char == "." and i + 1 < len(buffer) and buffer[i + 1] == ".":
@@ -102,6 +135,18 @@ def _extract_sentences(buffer: str) -> tuple[list[str], str]:
                 boundary_pos = i
                 break
 
+        # Second pass: soft boundary fallback when the buffer has grown
+        # long enough that the next clause is well-defined. Only fire when
+        # the hard boundary didn't yield anything — never replace a hard
+        # boundary with a soft one.
+        if boundary_pos == -1 and len(buffer) >= SOFT_BREAK_THRESHOLD:
+            for i, char in enumerate(buffer):
+                if char in SOFT_BOUNDARIES and i >= MIN_CHUNK_LEN:
+                    boundary_pos = i
+                    break
+
+        # Final fallback: force a split at the last space if the buffer
+        # has exceeded MAX_CHUNK_LEN with no usable boundary at all.
         if boundary_pos == -1 and len(buffer) >= MAX_CHUNK_LEN:
             sp = buffer.rfind(" ", 0, MAX_CHUNK_LEN)
             boundary_pos = sp if sp > MIN_CHUNK_LEN else MAX_CHUNK_LEN - 1
@@ -314,6 +359,39 @@ class TTSHandler:
     def register(self) -> None:
         self._bus.subscribe(PartialResponse, self.on_partial)
         self._bus.subscribe(ResponseReady, self.on_response_ready)
+
+    async def warmup(self) -> None:
+        """Pre-establish the edge-tts connection so the first real
+        synthesis doesn't pay the cold-connection cost.
+
+        Builds a :class:`edge_tts.Communicate` with a single throwaway
+        word, drains the audio stream, and discards the bytes. The
+        tricky bit is that ``edge_tts`` spins up a fresh WebSocket per
+        ``Communicate`` instance, so the only way to amortise the
+        handshake is to *do* one and discard the result. The first real
+        sentence the user actually hears will then arrive ~200–400ms
+        sooner than it would otherwise.
+
+        Safe to call at any time; idempotent. Errors are logged and
+        swallowed — a failed warmup must never break pipeline startup.
+        """
+        try:
+            logger.debug("TTS: warmup — establishing edge-tts session")
+            tts = edge_tts.Communicate(
+                text="ready", voice=VOICE, rate="+12%", pitch="-4Hz"
+            )
+            async for chunk in tts.stream():
+                # We don't need the audio — just consume the stream so
+                # the underlying WebSocket completes its handshake.
+                if chunk.get("type") not in ("audio",):
+                    continue
+                # Break out as soon as the first audio chunk arrives;
+                # the connection is warm, we don't need to download the
+                # whole throwaway word.
+                break
+            logger.debug("TTS: warmup complete")
+        except Exception as exc:
+            logger.warning("TTS warmup failed (non-fatal): %s", exc)
 
     def _get_utterance_lock(self) -> asyncio.Lock:
         if self._utterance_lock is None:

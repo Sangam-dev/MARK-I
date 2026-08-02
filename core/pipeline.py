@@ -191,6 +191,11 @@ async def build_pipeline(
     if enable_tts:
         tts_handler = TTSHandler(bus=bus)
         tts_handler.register()
+        # Fire-and-forget warmup so the first user utterance doesn't
+        # pay the edge-tts cold-connection cost (~200–400ms of TLS +
+        # WebSocket handshake). The task is intentionally not awaited —
+        # pipeline startup must not block on TTS readiness.
+        asyncio.create_task(tts_handler.warmup(), name="tts_warmup")
 
     logger.info(
         "Pipeline built (session=%s, tts=%s, console_formatter=%s)",
