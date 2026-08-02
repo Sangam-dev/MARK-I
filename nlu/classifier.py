@@ -7,6 +7,7 @@ from typing import Any
 
 from core.bus import EventBus
 from core.events import Intent, IntentIdentified, TextInputReceived, TranscriptReady
+from core.audio_state import audio_state
 from nlu.schemas import NLUResult
 from reasoning.llm_client import GeminiClient
 
@@ -399,17 +400,29 @@ class NLUClassifier:
         await self._process_text(event.text, event.session_id)
 
     async def _process_text(self, text: str, session_id: str) -> None:
-        """Perform classification and emit IntentIdentified event."""
-        logger.info("Processing user input text: '%s'", text)
-        result = await self.classify(text, session_id)
+        """Perform classification and emit IntentIdentified event.
 
-        intent_event = IntentIdentified(
-            intent=result.intent,
-            raw_input=text,
-            confidence=result.confidence,
-            session_id=session_id,
-            requires_task=result.requires_task_execution,
-            task_type=result.task_type,
-            task_params=result.task_params,
-        )
-        self.bus.emit(intent_event)
+        The thinking gate is raised here (before any async work) and is
+        released by the ReasoningCoordinator when it finishes — that
+        ensures the microphone cannot reopen mid-classify or mid-stream,
+        which would otherwise let audio leak in as a separate turn.
+        """
+        logger.info("Processing user input text: '%s'", text)
+        audio_state.thinking_started()
+        try:
+            result = await self.classify(text, session_id)
+
+            intent_event = IntentIdentified(
+                intent=result.intent,
+                raw_input=text,
+                confidence=result.confidence,
+                session_id=session_id,
+                requires_task=result.requires_task_execution,
+                task_type=result.task_type,
+                task_params=result.task_params,
+            )
+            self.bus.emit(intent_event)
+        except Exception:
+            # Never leave the gate stuck if classify/emit blew up.
+            audio_state.thinking_finished()
+            raise

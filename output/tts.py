@@ -352,6 +352,15 @@ class TTSHandler:
             )
 
             self._session_id = event.session_id
+            # Proactively claim the audio gate BEFORE the coordinator
+            # releases the thinking gate. There is otherwise a tiny
+            # window between ``ResponseReady`` (which releases the
+            # thinking gate) and ``_mark_speaking`` (which sets the
+            # speaking gate via the first sentence boundary) during
+            # which the mic could slip in. Claiming here closes it.
+            if not self._started:
+                await self._mark_speaking()
+
             # Authoritative text: speak only what streaming hasn't covered.
             final = event.text.strip()
             visible = self._visible.strip()

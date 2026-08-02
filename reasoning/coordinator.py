@@ -5,6 +5,7 @@ import re
 from typing import Any
 import asyncio
 from core.bus import EventBus
+from core.audio_state import audio_state
 from core.events import (
     Intent,
     IntentIdentified,
@@ -63,6 +64,11 @@ class ReasoningCoordinator:
         # Pending task turns keyed by session_id
         self._pending_turns: dict[str, dict[str, Any]] = {}
         self._last_tasks: dict[str, dict[str, Any]] = {}
+        # Sessions whose thinking gate is held and will be released by a
+        # terminal handler (on_task_completed or on_plan_completed)
+        # rather than by on_reasoning_requested itself. The conversational
+        # branch releases inline; the task/retry branches add here.
+        self._gated_session_ids: set[str] = set()
 
     def register(self) -> None:
         self.bus.subscribe(ReasoningRequested, self.on_reasoning_requested)
@@ -145,6 +151,28 @@ class ReasoningCoordinator:
     # ── Main handler ──────────────────────────────────────────────────────────
 
     async def on_reasoning_requested(self, event: ReasoningRequested) -> None:
+        # Defensive: if NLU was bypassed (e.g. direct bus.emit from a
+        # caller that didn't go through _process_text) and the gate is
+        # not yet held, claim it so the mic can't reopen mid-think.
+        gate_held = audio_state.thinking_active.is_set()
+        if not gate_held:
+            audio_state.thinking_started()
+
+        try:
+            return await self._handle_reasoning(event)
+        finally:
+            # The conversational branch emits ResponseReady itself, but
+            # the task/retry branches hand off and the response for
+            # those paths arrives later via on_task_completed /
+            # on_plan_completed. Releasing here would let the mic
+            # reopen during task/plan execution — wrong. Instead we
+            # release on every branch's *terminal* handler. So this
+            # block is intentionally empty unless an exception escaped.
+            if gate_held:
+                # We didn't claim it ourselves; don't release it.
+                pass
+
+    async def _handle_reasoning(self, event: ReasoningRequested) -> None:
         session_id = event.session_id
         intent_event = event.intent_event
         user_input = intent_event.raw_input
@@ -174,6 +202,12 @@ class ReasoningCoordinator:
                     event.memory_events[0] if event.memory_events else None
                 ),
             }
+            # Task path: keep the thinking gate raised until either
+            # on_task_completed or on_plan_completed fires (they release
+            # it). If the planner doesn't pick this up at all, the gate
+            # would otherwise stay held forever — log a warning so the
+            # deadlock is visible.
+            self._gated_session_ids.add(session_id)
             return
 
         # ── Step 3b: Retry path — re-plan from the last user request ─────
@@ -187,6 +221,8 @@ class ReasoningCoordinator:
                 response_text = "I don't have a previous action to retry."
                 self.memory_manager.short_term.add("assistant", response_text)
                 self.bus.emit(ResponseReady(text=response_text, session_id=session_id))
+                # No Planner handoff; release the gate here.
+                audio_state.thinking_finished()
                 return
 
             # Rebuild a synthetic IntentIdentified from the last known
@@ -206,9 +242,21 @@ class ReasoningCoordinator:
                 retry_intent.task_params,
             )
             self.bus.emit(retry_intent)
+            # Same gated-release contract as the task path above.
+            self._gated_session_ids.add(session_id)
             return
 
         # ── Step 3: Conversational path — stream LLM (JSON envelope) ──────
+        try:
+            await self._stream_conversational_reply(event, session_id)
+        finally:
+            # Conversational path emits ResponseReady itself; release here
+            # so the mic can reopen after TTS finishes.
+            audio_state.thinking_finished()
+
+    async def _stream_conversational_reply(
+        self, event: ReasoningRequested, session_id: str
+    ) -> None:
         memory_event = event.memory_events[0] if event.memory_events else None
         system = self._build_system_prompt(memory_event)
 
@@ -283,19 +331,25 @@ class ReasoningCoordinator:
         session_id = event.session_id
         pending = self._pending_turns.pop(session_id, None)
 
-        if not pending:
-            logger.warning(
-                "TaskCompleted for session %s but no pending turn found — ignoring.",
-                session_id,
-            )
-            return
+        try:
+            if not pending:
+                logger.warning(
+                    "TaskCompleted for session %s but no pending turn found — ignoring.",
+                    session_id,
+                )
+                return
 
-        response_text = self._format_task_response(event)
+            response_text = self._format_task_response(event)
 
-        # Add assistant response to short_term.
-        self.memory_manager.short_term.add("assistant", response_text)
+            # Add assistant response to short_term.
+            self.memory_manager.short_term.add("assistant", response_text)
 
-        self.bus.emit(ResponseReady(text=response_text, session_id=session_id))
+            self.bus.emit(ResponseReady(text=response_text, session_id=session_id))
+        finally:
+            # Release the gate if this session was the one holding it
+            # open across a deferred task handoff. Conversational turns
+            # never enter _gated_session_ids, so this is a no-op for them.
+            self._maybe_release_gate(session_id)
 
     async def on_plan_completed(self, event: PlanCompleted) -> None:
         """Emit a user-facing response when a plan finishes.
@@ -308,14 +362,26 @@ class ReasoningCoordinator:
         session_id = event.session_id
         summary = (event.summary or "").strip()
 
-        response_text = await naturalize_plan_response(
-            llm=self.gemini_client,
-            user_request=event.user_request or summary,
-            task_results=list(event.task_results or []),
-            status=event.status,
-            token_log=self.token_log,
-        )
+        try:
+            response_text = await naturalize_plan_response(
+                llm=self.gemini_client,
+                user_request=event.user_request or summary,
+                task_results=list(event.task_results or []),
+                status=event.status,
+                token_log=self.token_log,
+            )
 
-        self.memory_manager.short_term.add("assistant", response_text)
+            self.memory_manager.short_term.add("assistant", response_text)
 
-        self.bus.emit(ResponseReady(text=response_text, session_id=session_id))
+            self.bus.emit(ResponseReady(text=response_text, session_id=session_id))
+        finally:
+            self._maybe_release_gate(session_id)
+
+    def _maybe_release_gate(self, session_id: str) -> None:
+        """Release the thinking gate if this session was holding it open
+        across a deferred task/plan handoff. Idempotent and safe to call
+        from any handler — conversational turns never enter the gated
+        set, so this is a no-op for them."""
+        if session_id in self._gated_session_ids:
+            self._gated_session_ids.discard(session_id)
+            audio_state.thinking_finished()
