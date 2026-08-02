@@ -8,6 +8,7 @@ from typing import Any
 
 from actions.alarms import cancel_alarms, list_alarms, set_alarm
 from actions.apps import open_app
+from actions.desktop_control import desktop_control
 from actions.file_controller import file_controller
 from actions.power import restart, shutdown, sleep
 from actions.system_commands import SystemCommandExecutor
@@ -23,6 +24,22 @@ _FILE_FAILURE_RE = re.compile(
     r"could not|not found|source not found|no destination specified|"
     r"file not found|not a file|search path not found|search error|"
     r"error|unknown action|file controller error|protected directory)",
+    re.IGNORECASE,
+)
+
+# Desktop control results are plain strings; the same failure-prefix
+# regex family covers "Could not", "No open window", "Neither", "Install",
+# "Required tool not found", "Wallpaper query not supported", etc.
+# Desktop_control returns longer multi-line strings for list-style
+# actions (list_windows, list_workspaces, list_desktop, stats) so we
+# only treat short single-line strings as failures.
+_DESKTOP_FAILURE_RE = re.compile(
+    r"^(?:could not|no open window|no action|no app name|neither|"
+    r"required tool not found|please describe|unknown action|"
+    r"unsupported (?:format|image format|operating system)|"
+    r"install|wallpaper query not supported|no image path|no url provided|"
+    r"this action cannot|execution error|desktop control error|"
+    r"task cancelled|image not found)",
     re.IGNORECASE,
 )
 
@@ -145,6 +162,23 @@ class TaskExecutor:
                 not _FILE_FAILURE_RE.match(result_text.strip()),
                 result_text,
             )
+
+        if task_name == "desktop_control":
+            # desktop_control is blocking (subprocess, file IO, possibly
+            # an LLM round-trip for the `task` action) — run on a worker
+            # thread so the event loop stays free.
+            result_text = await asyncio.to_thread(desktop_control, params)
+            stripped = result_text.strip()
+            # Multi-line results are list/listing replies (list_windows,
+            # list_workspaces, list_desktop, stats) — those are always
+            # successes as long as we got output. Single-line strings
+            # that look like error messages are treated as failures so
+            # the naturalize / replanner path can handle them.
+            is_failure = (
+                "\n" not in stripped
+                and bool(_DESKTOP_FAILURE_RE.match(stripped))
+            )
+            return TaskExecutionResult(not is_failure, result_text)
 
         if task_name == "execute_protocol":
             protocol_name = params.get("protocol_name", "")

@@ -107,6 +107,46 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
         optional_params=("original_request",),
         param_types={"protocol_name": str, "original_request": str},
     ),
+    "desktop_control": TaskSpec(
+        name="desktop_control",
+        description=(
+            "Control the Linux desktop: wallpaper (set/get/from-url), window management "
+            "(list_windows/focus/close/minimize/maximize), virtual desktops "
+            "(list_workspaces/switch_workspace/move_to_workspace/window_workspace), "
+            "desktop file management (organize/clean/list/stats), or run an AI-driven "
+            "sandboxed desktop task."
+        ),
+        required_params=(),  # action is optional; falls back to natural-language task
+        optional_params=(
+            "action",
+            "path",
+            "url",
+            "app",
+            "target",
+            "workspace",
+            "mode",
+            "follow",
+            "task",
+            "description",
+            "confirm",
+        ),
+        param_types={
+            "action": str,
+            "path": str,
+            "url": str,
+            "app": str,
+            "target": str,
+            "workspace": str,
+            "mode": str,
+            "follow": bool,
+            "task": str,
+            "description": str,
+            "confirm": bool,
+        },
+        # Wallpaper from URL, AI-driven sandboxed exec, and window actions
+        # could all benefit from a confirmation gate — left as opt-in via
+        # the ``confirm`` param so callers can decide per-request.
+    ),
 }
 
 

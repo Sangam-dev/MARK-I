@@ -182,6 +182,7 @@ TOOL_VOICE: dict[str, ToolVoice] = {
     "shutdown": _passthrough,
     "restart": _passthrough,
     "execute_protocol": _passthrough,
+    "desktop_control": _passthrough,
 }
 
 
@@ -242,4 +243,5 @@ def _already_natural(text: str) -> bool:
         "tell me",
         "no ",
     )
+    
     return any(lowered.startswith(p) for p in prefixes)

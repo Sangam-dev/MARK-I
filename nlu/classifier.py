@@ -192,10 +192,176 @@ def _classify_protocol_request(cleaned: str) -> ToolDecision | None:
     return None
 
 
+def _classify_desktop_control_request(cleaned: str) -> ToolDecision | None:
+    """Detect Linux desktop automation requests.
+
+    Covers wallpaper, window management, virtual desktops, and the
+    high-frequency file-management actions. Long-form natural-language
+    tasks ("click on the Save button", "drag this file there") are NOT
+    matched here — those fall through to the LLM classifier and end up
+    in the ``task`` action of ``desktop_control`` for sandboxed exec.
+    """
+    lowered = cleaned.lower()
+
+    def _dc(action: str, **params) -> ToolDecision:
+        return ToolDecision(task_name="desktop_control", parameters={"action": action, **params})
+
+    # ── Wallpaper ─────────────────────────────────────────────────────────
+    # "set wallpaper to X", "change my wallpaper to X", "use X as wallpaper"
+    m = re.search(
+        r"\b(?:set|change|switch|use)\s+(?:the\s+|my\s+)?wallpaper(?:\s+(?:to|as|of))?\s+(?P<rest>.+)$",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if m:
+        rest = m.group("rest").strip().rstrip(".?!")
+        if rest.lower().startswith("to ") or rest.lower().startswith("as "):
+            rest = rest.split(" ", 1)[1].strip()
+        # Heuristic: looks like a URL?
+        if rest.lower().startswith(("http://", "https://")):
+            return _dc("wallpaper_url", url=rest)
+        return _dc("wallpaper", path=rest)
+
+    # "use <path> as wallpaper" / "use <path> as my wallpaper"
+    m = re.search(
+        r"\buse\s+(?P<path>.+?)\s+as\s+(?:my\s+|the\s+)?wallpaper\s*$",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if m:
+        rest = m.group("path").strip().rstrip(".?!")
+        if rest:
+            if rest.lower().startswith(("http://", "https://")):
+                return _dc("wallpaper_url", url=rest)
+            return _dc("wallpaper", path=rest)
+
+    if re.search(r"\b(?:what(?:'s| is)\s+)?(?:the\s+)?current\s+wallpaper\b", lowered):
+        return _dc("current_wallpaper")
+
+    # ── Window management ────────────────────────────────────────────────
+    if re.search(r"\b(?:list|show)\s+(?:all\s+)?(?:the\s+)?(?:open\s+)?windows\b", lowered):
+        return _dc("list_windows")
+
+    # focus / bring to front — handled earlier in classify_tool_request
+    # so it doesn't get captured by _OPEN_RE (open chrome).
+
+    m_close = re.search(r"\bclose\s+(?:the\s+)?(?P<app>.+?)\s+window\s*$", cleaned, re.IGNORECASE)
+    if not m_close:
+        m_close = re.search(r"\bclose\s+(?:the\s+)?(?P<app>.+?)\s*$", cleaned, re.IGNORECASE)
+    if m_close:
+        app = m_close.group("app").strip().rstrip(".?!")
+        # Strip trailing "window" (when it's a noun, not part of the app name)
+        app = re.sub(r"\s+window\b", "", app, flags=re.IGNORECASE).strip()
+        # Strip trailing "please" / "for me" / "now"
+        app = re.sub(r"\s+(?:please|for\s+me|now)\s*$", "", app, flags=re.IGNORECASE).strip()
+        app = re.sub(r"^the\s+", "", app, flags=re.IGNORECASE).strip()
+        if app:
+            return _dc("close_window", app=app)
+
+    m_min = re.search(r"\bminimize\s+(?:the\s+)?(?P<app>.+?)\s+window\s*$", cleaned, re.IGNORECASE)
+    if not m_min:
+        m_min = re.search(r"\bminimize\s+(?:the\s+)?(?P<app>.+?)\s*$", cleaned, re.IGNORECASE)
+    if m_min:
+        raw = m_min.group("app").strip().rstrip(".?!")
+        raw = re.sub(r"\s+window\b", "", raw, flags=re.IGNORECASE).strip()
+        raw = re.sub(r"\s+(?:please|for\s+me|now)\s*$", "", raw, flags=re.IGNORECASE).strip()
+        raw = re.sub(r"^the\s+", "", raw, flags=re.IGNORECASE).strip()
+        # "minimize all windows" / "minimize everything" — bulk action, no app arg
+        if raw.lower() in {"all", "all windows", "everything", "all of them", ""}:
+            return _dc("minimize", target="all")
+        if raw:
+            return _dc("minimize", app=raw)
+
+    m_max = re.search(r"\b(?:maximize|toggle\s+maximize)\s+(?:the\s+)?(?P<app>.+?)\s+window\s*$", cleaned, re.IGNORECASE)
+    if not m_max:
+        m_max = re.search(r"\b(?:maximize|toggle\s+maximize)\s+(?:the\s+)?(?P<app>.+?)\s*$", cleaned, re.IGNORECASE)
+    if m_max:
+        raw = m_max.group("app").strip().rstrip(".?!")
+        raw = re.sub(r"\s+window\b", "", raw, flags=re.IGNORECASE).strip()
+        raw = re.sub(r"\s+(?:please|for\s+me|now)\s*$", "", raw, flags=re.IGNORECASE).strip()
+        raw = re.sub(r"^the\s+", "", raw, flags=re.IGNORECASE).strip()
+        if raw.lower() in {"all", "all windows", "everything", "all of them", ""}:
+            return _dc("maximize", target="all")
+        if raw:
+            return _dc("maximize", app=raw)
+
+    # ── Virtual desktops (workspaces) ─────────────────────────────────────
+    if re.search(r"\b(?:list|show|what(?:'s| is)|give\s+me)\s+(?:me\s+)?(?:all\s+)?(?:the\s+)?(?:virtual\s+)?(?:desktops|workspaces)\b", lowered):
+        return _dc("list_workspaces")
+
+    m = re.search(
+        r"\b(?:switch\s+to|go\s+to|move\s+to|change\s+to)\s+(?:desktop|workspace)\s+(?P<target>.+)$",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if m:
+        target = m.group("target").strip().rstrip(".?!")
+        return _dc("switch_workspace", target=target)
+
+    # "move X to desktop N" (X is the app/window name)
+    m = re.search(
+        r"\b(?:move|send)\s+(?:the\s+)?(?P<app>(?:the\s+)?[\w+-]+?)\s+(?:window\s+)?to\s+(?:desktop|workspace)\s+(?P<target>.+)$",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if m:
+        app = m.group("app").strip()
+        target = m.group("target").strip().rstrip(".?!")
+        # If "app" is literally "window" or "the", skip the app param
+        if app.lower() in {"window", "the", "the window"}:
+            return _dc("move_to_workspace", target=target, follow=False)
+        return _dc("move_to_workspace", app=app, target=target, follow=False)
+
+    m = re.search(r"\bwhich\s+(?:desktop|workspace)\s+is\s+(?P<app>.+?)\s+on\b", cleaned, re.IGNORECASE)
+    if m:
+        app = m.group("app").strip().rstrip(".?!")
+        return _dc("window_workspace", app=app)
+
+    # ── Desktop file management ───────────────────────────────────────────
+    if re.search(r"\borganize\s+(?:my\s+|the\s+)?desktop\b", lowered):
+        return _dc("organize", mode="by_type")
+
+    if re.search(r"\bclean\s+(?:my\s+|the\s+)?desktop\b", lowered):
+        return _dc("clean")
+
+    if re.search(r"\b(?:list|show|what(?:'s| is)\s+on)\s+(?:my\s+|the\s+)?desktop(?:\s+files)?\b", lowered):
+        return _dc("list")
+
+    if re.search(r"\b(?:desktop\s+stats|stats\s+(?:for\s+)?(?:my\s+|the\s+)?desktop|how\s+big\s+is\s+my\s+desktop)\b", lowered):
+        return _dc("stats")
+
+    return None
+
+
 def classify_tool_request(text: str) -> ToolDecision | None:
     cleaned = " ".join(text.strip().split()).rstrip(".?!")
     if not cleaned:
         return None
+
+    lowered = cleaned.lower()
+
+    # "focus X" / "bring X to the front" — check before _OPEN_RE so it
+    # doesn't get stolen by the open_app path. These always mean an
+    # existing window.
+    focus_app = None
+    m1 = re.match(
+        r"^\s*(?:focus|bring\s+up)\s+(?:the\s+)?(?P<app>.+?)(?:\s+window)?\s*$",
+        cleaned,
+        re.IGNORECASE,
+    )
+    m2 = re.match(
+        r"^\s*bring\s+(?:the\s+)?(?P<app>.+?)\s+(?:to\s+the\s+front|forward)\s*$",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if m1:
+        focus_app = m1.group("app").strip().rstrip(".?!")
+    elif m2:
+        focus_app = m2.group("app").strip().rstrip(".?!")
+    if focus_app:
+        focus_app = re.sub(r"^the\s+", "", focus_app, flags=re.IGNORECASE).strip()
+        if focus_app:
+            return ToolDecision(task_name="desktop_control", parameters={"action": "focus", "app": focus_app})
 
     open_match = _OPEN_RE.match(cleaned)
     if open_match:
@@ -204,11 +370,14 @@ def classify_tool_request(text: str) -> ToolDecision | None:
             parameters={"app_name": open_match.group("app").strip()},
         )
 
-    lowered = cleaned.lower()
-
     file_decision = _classify_file_request(cleaned)
     if file_decision is not None:
         return file_decision
+
+    # Check for desktop automation requests (wallpaper, windows, workspaces, etc.)
+    desktop_decision = _classify_desktop_control_request(cleaned)
+    if desktop_decision is not None:
+        return desktop_decision
 
     # Check for protocol execution requests
     protocol_decision = _classify_protocol_request(cleaned)
@@ -333,6 +502,7 @@ Classify intent into one of:
   * "shutdown" (no params)
   * "restart" (no params)
   * "file_operation" (params: action (required), path, name, content, destination, new_name, extension (optional). Action values: list, create_file, create_folder, delete, move, copy, rename, read, write, find, largest, disk_usage, organize_desktop, info)- "execute_protocol" (params: protocol_name (required), original_request (optional))- "conversational": Casual greetings, chitchat, or social statements (e.g., "hi", "how are you?", "nice to meet you").
+- "desktop_control" (params: action (required), plus action-specific optional params). Action values: wallpaper, wallpaper_url, current_wallpaper, organize, clean, list, stats, list_windows, focus, close_window, minimize, maximize, list_workspaces, switch_workspace, move_to_workspace, window_workspace, task. For action="task" the natural-language description goes in the "task" param. For action="focus"/"close_window"/"minimize"/"maximize" the app name goes in "app". For action="switch_workspace" the desktop/workspace name or number goes in "target". For action="wallpaper" the image path goes in "path"; for "wallpaper_url" the URL goes in "url".
 
 Return ONLY valid JSON matching this schema:
 {
