@@ -147,6 +147,25 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
         # could all benefit from a confirmation gate — left as opt-in via
         # the ``confirm`` param so callers can decide per-request.
     ),
+    "system_monitor": TaskSpec(
+        name="system_monitor",
+        description=(
+            "Inspect or tune the background system monitor: snapshot live "
+            "CPU/RAM/temp/GPU/uptime (action='status'), run a single "
+            "threshold check (action='check_alerts'), change a metric's alert "
+            "threshold (action='set_threshold', needs metric+threshold), or "
+            "toggle the background alert loop (action='enable'/'disable', "
+            "needs enabled=true|false)."
+        ),
+        required_params=("action",),
+        optional_params=("metric", "threshold", "enabled"),
+        param_types={
+            "action": str,
+            "metric": str,
+            "threshold": float,
+            "enabled": bool,
+        },
+    ),
 }
 
 

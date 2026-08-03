@@ -251,6 +251,32 @@ class ShutdownRequested(BaseEvent):
     reason: str = "user requested"
 
 
+
+@dataclass(frozen=True)
+class SystemMonitorAlert(BaseEvent):
+    """
+    Event triggered when the background SystemMonitorLoop detects a metric
+    crossing a configured threshold.
+
+    The ``text`` field carries the same ``[SYSTEM_ALERT] …`` phrasing that
+    ``actions.system_monitor.SystemMonitor.check()`` returns, so the bridge
+    to ``ResponseReady`` (which feeds TTS and the console formatter) is a
+    one-line copy.
+
+    ``metrics`` is optional structured metadata for the WebSocket bridge
+    (``api/bridge.py``) — the voice path ignores it. Use it to render a
+    sparkline or coloured badge on the web front-end.
+
+    emitted by: core/system_monitor_loop.py
+    consumed by: a small handler registered in core/pipeline.py that emits
+                 ``ResponseReady(text=event.text)`` so the existing TTS and
+                 ResponseFormatter subscribers pick it up.
+    """
+
+    text: str = ""
+    metrics: dict[str, Any] = field(default_factory=dict)
+
+
 # -------------- Planning Events -----------------#
 
 

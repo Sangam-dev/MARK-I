@@ -12,6 +12,11 @@ from actions.desktop_control import desktop_control
 from actions.file_controller import file_controller
 from actions.power import restart, shutdown, sleep
 from actions.system_commands import SystemCommandExecutor
+from actions.system_monitor import (
+    SystemMonitor,
+    format_status_text,
+    get_system_status,
+)
 from actions.weather import get_weather
 from core.bus import EventBus
 from core.events import TaskCompleted, TaskExecutionRequested
@@ -42,6 +47,64 @@ _DESKTOP_FAILURE_RE = re.compile(
     r"task cancelled|image not found)",
     re.IGNORECASE,
 )
+
+# system_monitor action surface — kept in one place so on-call triage can
+# audit it without grepping the dispatch body. Failure prefixes for
+# `set_threshold`/`enable`/`disable` mirror the desktop_control style.
+_SYSTEM_MONITOR_FAILURE_RE = re.compile(
+    r"^(?:unknown action|unknown metric|invalid threshold|"
+    r"metric required|threshold required|enabled required|"
+    r"value out of range|could not|system monitor error)",
+    re.IGNORECASE,
+)
+
+_VALID_METRICS = ("cpu", "ram", "temp", "gpu")
+
+# A single, process-wide SystemMonitor instance keeps the cooldown timers
+# alive across turns. The background loop in core/pipeline.py reads from
+# this same instance via ``core.system_monitor_loop.SystemMonitorLoop``.
+_monitor_instance: SystemMonitor | None = None
+
+
+def get_shared_monitor() -> SystemMonitor:
+    """Lazily construct (and cache) the singleton SystemMonitor.
+
+    Cooldown state — ``_last_alert`` and ``_cpu_streak`` — survives
+    across turns and across the on-demand / background dispatch paths
+    so the 300s cooldown isn't reset every time the user asks "any alerts?".
+    """
+    global _monitor_instance
+    if _monitor_instance is None:
+        _monitor_instance = SystemMonitor()
+    return _monitor_instance
+
+
+def reset_shared_monitor() -> None:
+    """Drop the singleton (used by tests)."""
+    global _monitor_instance
+    _monitor_instance = None
+
+
+# The background loop attaches itself here so ``enable``/``disable`` actions
+# can toggle it without the executor importing core.pipeline (which would
+# create a circular import — pipeline imports the executor).
+_attached_monitor_loop = None
+
+
+def _get_attached_monitor_loop():
+    return _attached_monitor_loop
+
+
+def attach_monitor_loop(loop) -> None:
+    """Called by ``core.pipeline.build_pipeline`` after constructing the loop."""
+    global _attached_monitor_loop
+    _attached_monitor_loop = loop
+
+
+def detach_monitor_loop() -> None:
+    """Called by ``core.pipeline.shutdown_pipeline``."""
+    global _attached_monitor_loop
+    _attached_monitor_loop = None
 
 
 @dataclass(slots=True)
@@ -183,29 +246,96 @@ class TaskExecutor:
         if task_name == "execute_protocol":
             protocol_name = params.get("protocol_name", "")
             original_request = params.get("original_request", "")
-            
+
             # Map protocol names to script paths
             protocol_scripts = {
                 "genesis": "tests/scripts.py",
             }
-            
+
             script_path = protocol_scripts.get(protocol_name)
             if not script_path:
                 return TaskExecutionResult(
-                    False, 
+                    False,
                     f"Unknown protocol: {protocol_name}. Available: {list(protocol_scripts.keys())}"
                 )
-            
+
             # Run the protocol script using SystemCommandExecutor
             executor = SystemCommandExecutor()
             # Add "uv" to allowed commands since it's not in the default allowlist
             executor.add_allowed_command("uv")
             command = f"uv run main.py --text --script scripts/{protocol_name}.json"
             result = await executor.execute(command)
-            
+
             if result.success:
                 return TaskExecutionResult(True, f"Protocol '{protocol_name}' executed successfully")
             else:
                 return TaskExecutionResult(False, f"Protocol '{protocol_name}' failed: {result.stderr}")
 
+        if task_name == "system_monitor":
+            return await self._dispatch_system_monitor(params)
+
         return TaskExecutionResult(False, f"No handler found for task: {task_name}")
+
+    # ── system_monitor handler ──────────────────────────────────────────────
+
+    async def _dispatch_system_monitor(
+        self, params: dict[str, Any]
+    ) -> TaskExecutionResult:
+        """Route the ``system_monitor`` task to its action surface.
+
+        All four actions are blocking (psutil + thread + maybe an LLM
+        round-trip would be the worst case — we don't do that here) so
+        each sub-call is wrapped in ``asyncio.to_thread``.
+        """
+        action = (params.get("action") or "").lower().strip()
+
+        def _run_sync() -> str:
+            monitor = get_shared_monitor()
+
+            if action == "status":
+                snapshot = get_system_status()
+                return format_status_text(snapshot)
+
+            if action == "check_alerts":
+                text = monitor.check()
+                return text if text else "No system alerts right now."
+
+            if action == "set_threshold":
+                metric = (params.get("metric") or "").lower().strip()
+                if metric not in _VALID_METRICS:
+                    return (
+                        f"Unknown metric '{metric}'. "
+                        f"Valid: {', '.join(_VALID_METRICS)}."
+                    )
+                raw_threshold = params.get("threshold")
+                if raw_threshold is None:
+                    return (
+                        f"Provide a numeric threshold for '{metric}' "
+                        "(e.g. threshold=75)."
+                    )
+                try:
+                    threshold = float(raw_threshold)
+                except (TypeError, ValueError):
+                    return f"Invalid threshold '{raw_threshold}'. Use a number."
+                if not 0 < threshold < 100:
+                    return "Threshold must be between 1 and 99."
+                monitor.thresholds[metric] = threshold
+                return f"{metric.upper()} threshold set to {threshold:.0f}%."
+
+            if action in {"enable", "disable"}:
+                enabled_flag = bool(params.get("enabled", action == "enable"))
+                monitor_loop = _get_attached_monitor_loop()
+                if monitor_loop is not None:
+                    monitor_loop.set_enabled(enabled_flag)
+                state = "enabled" if enabled_flag else "disabled"
+                return f"System monitoring {state}."
+
+            return (
+                f"Unknown system_monitor action '{action}'. "
+                "Use one of: status, check_alerts, set_threshold, enable, disable."
+            )
+
+        result_text = await asyncio.to_thread(_run_sync)
+        stripped = result_text.strip()
+        is_failure = bool(_SYSTEM_MONITOR_FAILURE_RE.match(stripped))
+        return TaskExecutionResult(not is_failure, result_text)

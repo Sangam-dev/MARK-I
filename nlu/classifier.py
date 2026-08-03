@@ -242,6 +242,20 @@ def _classify_desktop_control_request(cleaned: str) -> ToolDecision | None:
     if re.search(r"\b(?:list|show)\s+(?:all\s+)?(?:the\s+)?(?:open\s+)?windows\b", lowered):
         return _dc("list_windows")
 
+    # "list running apps" / "list running applications" / "what apps are
+    # running" / "what apps are open" / "show running apps" — same target
+    # as list_windows (alias for user convenience). Both word orders
+    # covered: "<verb> running apps" AND "<verb> apps that are running".
+    if re.search(
+        r"\b(?:(?:list|show)\s+(?:all\s+)?(?:the\s+)?(?:my\s+)?"
+        r"(?:[\w]+\s+)?"
+        r"(?:running|open)\s+(?:apps?|applications?|programs?))"
+        r"|(?:what|which)\s+(?:apps?|applications?|programs?)\s+"
+        r"(?:are|is)\s+(?:running|open)\b",
+        lowered,
+    ):
+        return _dc("list_windows")
+
     # focus / bring to front — handled earlier in classify_tool_request
     # so it doesn't get captured by _OPEN_RE (open chrome).
 
@@ -333,6 +347,138 @@ def _classify_desktop_control_request(cleaned: str) -> ToolDecision | None:
     return None
 
 
+# ── System monitor ──────────────────────────────────────────────────────────────
+#
+# Matches the four-action surface exposed by ``system_monitor`` in
+# tasks/registry.py / tasks/executor.py:
+#   status         — one-shot CPU/RAM/temp/GPU snapshot
+#   check_alerts   — run a single threshold check
+#   set_threshold  — change a metric's alert threshold
+#   enable / disable — toggle the background alert loop
+#
+# Order matters: more specific patterns (set_threshold with a number,
+# enable/disable) go BEFORE the general "system status" catch-all so the
+# "set CPU threshold to 50" sentence isn't misread as "system status".
+
+_METRIC_WORDS = r"(?:cpu|ram|memory|temperature|temp|gpu)"
+
+# set / change / raise / lower / adjust <metric> threshold [to / at <value>]
+_SET_THRESHOLD_RE = re.compile(
+    rf"\b(?:set|change|raise|lower|adjust|update)\s+(?:the\s+|my\s+)?"
+    rf"(?P<metric>{_METRIC_WORDS})\s+(?:alert\s+|warning\s+|critical\s+)?"
+    rf"threshold\s*(?:to|at|of)?\s*(?P<val>\d+)?",
+    re.IGNORECASE,
+)
+
+# enable / disable / turn on / turn off / start / stop <system monitor|monitoring|alerts>
+_MONITOR_TOGGLE_RE = re.compile(
+    r"\b(?P<verb>enable|disable|turn\s+on|turn\s+off|start|stop|pause|resume)"
+    r"\s+(?:the\s+|my\s+)?(?P<target>system\s+monitoring|system\s+monitor|"
+    r"system\s+alerts|monitoring|monitor|alerts)\b",
+    re.IGNORECASE,
+)
+
+# "any system alerts?" / "check system health" / "run a system check"
+#
+# IMPORTANT: every alternative here must end with an alert-y word
+# (alerts/issues/health/check/for+alerts). Bare "check the system" is
+# intentionally NOT included — it would steal "check the system status"
+# away from the status branch, since status is checked second.
+_CHECK_ALERTS_RE = re.compile(
+    r"\b(?:any\s+system\s+(?:alerts|issues|problems?)|"
+    r"run\s+(?:a\s+)?system\s+check|"
+    r"check\s+system\s+health|"
+    r"check\s+for\s+(?:system\s+)?(?:alerts|issues|problems?)|"
+    r"system\s+(?:health|issues))\b",
+    re.IGNORECASE,
+)
+
+# "system status" / "system health" / "how's my cpu" / "cpu usage" / "ram level"
+# / "gpu temperature" / "what temperature is my cpu at"
+_STATUS_RE = re.compile(
+    rf"\b(?:system\s+(?:status|health|stats|info|metrics)|"
+    rf"how(?:'s| is)\s+(?:my\s+)?(?:cpu|ram|memory|gpu|temperature|temp|pc|computer|laptop|system)|"
+    rf"(?:cpu|ram|memory|gpu|temperature|temp)\s+"
+    rf"(?:usage|use|level|load|temperature|temp|status)|"
+    rf"what(?:'s| is)\s+(?:my\s+)?(?:cpu|ram|memory|gpu|temperature|temp)\s+(?:at|usage|level))\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_metric(metric: str) -> str:
+    """Map user surface words (``memory``, ``temperature``) to canonical
+    keys (``ram``, ``temp``) used by ``actions.system_monitor.SystemMonitor``.
+    """
+    m = metric.lower().strip()
+    if m in {"memory"}:
+        return "ram"
+    if m in {"temperature"}:
+        return "temp"
+    return m
+
+
+def _classify_system_monitor_request(cleaned: str) -> ToolDecision | None:
+    """Detect system-monitor intents and return a ToolDecision.
+
+    Precedence (most specific → least):
+        1. set_threshold with a value
+        2. enable / disable toggle
+        3. check_alerts
+        4. status (catch-all)
+    """
+    lowered = cleaned.lower()
+
+    # 1. set_threshold — must come before _STATUS_RE because
+    #    "set cpu threshold to 50" contains "cpu" and could plausibly be
+    #    read as a status query by a loose matcher.
+    m = _SET_THRESHOLD_RE.search(cleaned)
+    if m:
+        metric = _normalize_metric(m.group("metric"))
+        val = m.group("val")
+        if val is None:
+            # Ask the user for the value — the executor also returns a
+            # nice message if it gets here without a number.
+            return ToolDecision(
+                task_name="system_monitor",
+                parameters={"action": "set_threshold", "metric": metric},
+            )
+        return ToolDecision(
+            task_name="system_monitor",
+            parameters={
+                "action": "set_threshold",
+                "metric": metric,
+                "threshold": float(val),
+            },
+        )
+
+    # 2. enable / disable
+    m = _MONITOR_TOGGLE_RE.search(cleaned)
+    if m:
+        verb = m.group("verb").lower().strip()
+        on = verb in {"enable", "turn on", "start", "resume"}
+        return ToolDecision(
+            task_name="system_monitor",
+            parameters={"action": "enable" if on else "disable", "enabled": on},
+        )
+
+    # 3. check_alerts
+    if _CHECK_ALERTS_RE.search(lowered):
+        return ToolDecision(
+            task_name="system_monitor",
+            parameters={"action": "check_alerts"},
+        )
+
+    # 4. status (catch-all). The bare word "status" alone is too greedy —
+    #    only match when it sits next to a system/monitor word OR a metric.
+    if _STATUS_RE.search(lowered):
+        return ToolDecision(
+            task_name="system_monitor",
+            parameters={"action": "status"},
+        )
+
+    return None
+
+
 def classify_tool_request(text: str) -> ToolDecision | None:
     cleaned = " ".join(text.strip().split()).rstrip(".?!")
     if not cleaned:
@@ -378,6 +524,12 @@ def classify_tool_request(text: str) -> ToolDecision | None:
     desktop_decision = _classify_desktop_control_request(cleaned)
     if desktop_decision is not None:
         return desktop_decision
+
+    # Check for system-monitor requests (CPU/RAM/temp/GPU snapshots, threshold
+    # changes, enable/disable the background alert loop).
+    monitor_decision = _classify_system_monitor_request(cleaned)
+    if monitor_decision is not None:
+        return monitor_decision
 
     # Check for protocol execution requests
     protocol_decision = _classify_protocol_request(cleaned)
@@ -503,6 +655,7 @@ Classify intent into one of:
   * "restart" (no params)
   * "file_operation" (params: action (required), path, name, content, destination, new_name, extension (optional). Action values: list, create_file, create_folder, delete, move, copy, rename, read, write, find, largest, disk_usage, organize_desktop, info)- "execute_protocol" (params: protocol_name (required), original_request (optional))- "conversational": Casual greetings, chitchat, or social statements (e.g., "hi", "how are you?", "nice to meet you").
 - "desktop_control" (params: action (required), plus action-specific optional params). Action values: wallpaper, wallpaper_url, current_wallpaper, organize, clean, list, stats, list_windows, focus, close_window, minimize, maximize, list_workspaces, switch_workspace, move_to_workspace, window_workspace, task. For action="task" the natural-language description goes in the "task" param. For action="focus"/"close_window"/"minimize"/"maximize" the app name goes in "app". For action="switch_workspace" the desktop/workspace name or number goes in "target". For action="wallpaper" the image path goes in "path"; for "wallpaper_url" the URL goes in "url".
+- "system_monitor" (params: action (required); optional: metric, threshold, enabled). Action values: status (one-shot CPU/RAM/temp/GPU/uptime snapshot), check_alerts (run a single threshold check), set_threshold (needs metric ∈ {cpu,ram,temp,gpu} and threshold ∈ 1..99), enable/disable (toggle the background alert loop using enabled=true|false).
 
 Return ONLY valid JSON matching this schema:
 {

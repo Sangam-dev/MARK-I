@@ -26,6 +26,7 @@ go straight to the user through this registry.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable
 
 # ---------------------------------------------------------------------------
@@ -42,6 +43,142 @@ def _passthrough(message: str, _args: dict[str, Any]) -> str:
     if not message:
         return "Done, sir."
     return message
+
+
+def _summarise_windows(text: str) -> str:
+    """Turn the multi-line ``list_windows`` output into one spoken sentence.
+
+    Raw output looks like::
+
+        Open windows (6):
+          [0] power.py - kancha - Visual Studio Code  (id=0x02400004)
+          [0] Sakshyam messaged you - Brave  (id=0x02600004)
+          ...
+
+    Strip the ``[N]`` desktop tag and the trailing ``(id=0x...)`` so the
+    voice reply reads as a clean list of window titles. Cap at 5 titles
+    and append a tail summary when there are more, so a busy desktop
+    doesn't produce a 30-second speech.
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return "I couldn't read the window list, sir."
+
+    # First line is the header "Open windows (N):" — extract the count.
+    count = 0
+    titles: list[str] = []
+    for ln in lines:
+        if ln.lower().startswith("open windows"):
+            m = re.search(r"\((\d+)\)", ln)
+            if m:
+                count = int(m.group(1))
+            continue
+        # Each line looks like: "  [0] title  (id=0x...)"
+        # Drop leading "[N] " desktop tag and trailing "(id=...)".
+        title = re.sub(r"^\s*\[\d+\]\s*", "", ln)
+        title = re.sub(r"\s*\(id=[^)]+\)\s*$", "", title).strip()
+        if title:
+            titles.append(title)
+
+    if not titles:
+        return "I couldn't read the window list, sir."
+    if count == 0:
+        count = len(titles)
+
+    shown = titles[:5]
+    extra = count - len(shown)
+
+    # Grammar: when extras exist, use ", plus N more" instead of cramming
+    # another "and" into the human-joined list. Avoids "..., and App 4,
+    # and 3 more" which reads as two consecutive "and"s.
+    if extra > 0 and shown:
+        listed = _human_join(shown) + f", plus {extra} more"
+    elif extra > 0:
+        listed = f"{extra} more"
+    else:
+        listed = _human_join(shown)
+
+    if count == 1:
+        return f"One window open, sir — {listed}."
+    return f"{count} windows open, sir — {listed}."
+
+
+def _summarise_workspaces(text: str) -> str:
+    """Turn ``list_workspaces`` output into one spoken sentence."""
+    # Skip the leading "Virtual desktops:" header line — it's raw label
+    # text that shouldn't be in the spoken reply.
+    raw_lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not raw_lines:
+        return "I couldn't read the workspace list, sir."
+
+    desktops: list[tuple[str, bool]] = []  # (label, is_current)
+    for ln in raw_lines:
+        # Drop the header line(s) — anything that starts with "virtual desktops".
+        if ln.lower().startswith("virtual desktop"):
+            continue
+        is_current = "◀ current" in ln
+        label = ln.replace("◀ current", "").strip()
+        if label:
+            desktops.append((label, is_current))
+
+    if not desktops:
+        return text  # fallback to raw if we couldn't parse anything.
+
+    count = len(desktops)
+    current_label = next((lbl for lbl, cur in desktops if cur), None)
+    listed = _human_join([lbl for lbl, _ in desktops])
+    if count == 1:
+        return f"One virtual desktop, sir — {listed}."
+    if current_label:
+        return f"{count} virtual desktops, sir. Current: {current_label}."
+    return f"{count} virtual desktops, sir — {listed}."
+
+
+def _human_join(items: list[str]) -> str:
+    """Join a short list the way JARVIS speaks it: A, B, and C."""
+    items = [i for i in items if i]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + ", and " + items[-1]
+
+
+def _voice_desktop_control(message: str, args: dict[str, Any]) -> str:
+    """Voice for desktop_control.
+
+    Listing-style actions (list_windows, list_workspaces, list, stats)
+    return multi-line machine text that the user shouldn't hear raw —
+    summarise them into one spoken sentence. Pass through everything
+    else (focus / close / wallpaper / etc.) unchanged so we don't
+    accidentally paraphrase a confirmation message.
+    """
+    text = (message or "").strip()
+    if not text:
+        return "Done, sir."
+
+    action = (args.get("action") or "").lower().strip()
+    if action == "list_windows":
+        # Only summarise if the raw text is multi-line — single-line
+        # failure strings should still pass through.
+        if "\n" in text:
+            return _summarise_windows(text)
+        return text
+    if action == "list_workspaces":
+        if "\n" in text:
+            return _summarise_workspaces(text)
+        return text
+    if action == "list":
+        # "list" returns the desktop file listing — multi-line, but the
+        # user explicitly asked to see files, so pass through.
+        return text
+    if action == "stats":
+        # Single-line; pass through.
+        return text
+    # window_workspace / focus / close / wallpaper / etc. — pass through.
+    return text
 
 
 def _default_voice(message: str, _args: dict[str, Any]) -> str:
@@ -182,7 +319,8 @@ TOOL_VOICE: dict[str, ToolVoice] = {
     "shutdown": _passthrough,
     "restart": _passthrough,
     "execute_protocol": _passthrough,
-    "desktop_control": _passthrough,
+    "desktop_control": _voice_desktop_control,
+    "system_monitor": _passthrough,
 }
 
 

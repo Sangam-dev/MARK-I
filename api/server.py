@@ -52,6 +52,22 @@ def _tts_enabled_from_env() -> bool:
     }
 
 
+def _monitor_enabled_from_env() -> bool:
+    """Background system monitor is on by default in the API server.
+
+    On a desktop session the loop is cheap (~30s psutil polls against a
+    300s alert cooldown) and the alerts surface through the same
+    WebSocket that already pipes ``ResponseReady`` events to the front-end,
+    so we don't expect this to be a noise concern. Set
+    ``KANCHA_MONITOR_ENABLED=0`` to opt out for debugging.
+    """
+    return os.getenv("KANCHA_MONITOR_ENABLED", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
+
+
 def _voice_input_enabled_from_env() -> bool:
     return os.getenv("KANCHA_VOICE_ENABLED", "true").strip().lower() not in {
         "0",
@@ -112,6 +128,7 @@ async def lifespan(app: FastAPI):
         data_dir=DATA_DIR,
         enable_tts=_tts_enabled_from_env(),
         enable_console_formatter=True,
+        enable_system_monitor=_monitor_enabled_from_env(),
     )
     attach_bridge(pipeline)
 

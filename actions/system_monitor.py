@@ -1,159 +1,249 @@
 """
-BackgroundMonitor — user-configured topic watching.
-Checks DDG news once per day per topic; alerts JARVIS when a new headline appears.
-No crypto, no finance, no uninvited tracking.
+System Monitor — background metric checks with voice alert support.
+Zero subprocess calls on all platforms — uses ctypes/pynvml/psutil/wmi only.
 """
-import hashlib
-import json
-import re
-from datetime import datetime
-from pathlib import Path
+import ctypes
+import platform
+import time
 
+import psutil
 
-# ── Blocked categories (never monitor regardless of what user says) ────────────
+_OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
-_BLOCKED = {
-    # Marka / varlık adları — her dilde aynı yazılır
-    "bitcoin", "ethereum", "dogecoin", "solana", "binance",
-    "nft", "blockchain", "defi", "altcoin", "memecoin", "coin", "token",
-    # "kripto" kökünün farklı dillerdeki yazılışları
-    "crypto", "kripto", "cripto", "krypto", "крипто", "仮想通貨", "暗号資産",
-    "cryptocurrency",
+DEFAULT_THRESHOLDS = {
+    "cpu":  90.0,
+    "ram":  90.0,
+    "temp": 85.0,
+    "gpu":  95.0,
 }
 
-def _is_blocked(topic: str) -> bool:
-    t = topic.lower()
-    return any(word in t for word in _BLOCKED)
+_COOLDOWN   = 300
+_CPU_STREAK = 3
+
+# ── NVML DLL cache (Windows: nvml.dll, Linux: libnvidia-ml.so.1) ─────────────
+_nvml_lib: object = None
+_nvml_ok:  object = None   # None=untested  True=works  False=unavailable
 
 
-# ── Slug / hash helpers ────────────────────────────────────────────────────────
+def _nvml_gpu() -> float:
+    """GPU utilisation via NVML — zero subprocess on all platforms."""
+    global _nvml_lib, _nvml_ok
+    if _nvml_ok is False:
+        return -1.0
+    try:
+        class _Util(ctypes.Structure):
+            _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
 
-def _slug(topic: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", topic.lower().strip())[:40].strip("_")
+        if _nvml_lib is None:
+            if _OS == "Windows":
+                candidates = ("nvml", r"C:\Windows\System32\nvml.dll")
+                _load = ctypes.WinDLL
+            else:
+                candidates = (
+                    "libnvidia-ml.so.1",
+                    "libnvidia-ml.so",
+                    "libnvidia-ml.dylib",
+                )
+                _load = ctypes.CDLL
+            for name in candidates:
+                try:
+                    lib = _load(name)
+                    lib.nvmlInit_v2()
+                    _nvml_lib = lib
+                    break
+                except Exception:
+                    continue
 
-def _title_hash(title: str) -> str:
-    return hashlib.md5(title.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        if _nvml_lib is None:
+            _nvml_ok = False
+            return -1.0
 
-
-# ── Memory I/O ─────────────────────────────────────────────────────────────────
-
-def _load() -> dict:
-    from memory.memory_manager import load_memory
-    data = load_memory().get("monitors", {})
-    return data if isinstance(data, dict) else {}
-
-def _save(monitors: dict) -> None:
-    from memory.memory_manager import load_memory, MEMORY_PATH, _lock
-    memory = load_memory()
-    memory["monitors"] = monitors
-    with _lock:
-        MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        MEMORY_PATH.write_text(
-            json.dumps(memory, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-
-
-# ── Public API ─────────────────────────────────────────────────────────────────
-
-def add_monitor(topic: str) -> str:
-    topic = topic.strip()
-    if not topic:
-        return "Please specify a topic to monitor."
-    if _is_blocked(topic):
-        return "I don't monitor crypto or financial topics."
-    monitors = _load()
-    slug = _slug(topic)
-    if slug in monitors:
-        return f"Already monitoring: {monitors[slug]['topic']}"
-    monitors[slug] = {
-        "topic":      topic,
-        "added":      datetime.now().strftime("%Y-%m-%d"),
-        "last_check": "",
-        "last_hash":  "",
-    }
-    _save(monitors)
-    print(f"[Monitor] ➕ Added: {topic}")
-    return f"Now monitoring: {topic}"
+        dev = ctypes.c_void_p()
+        _nvml_lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(dev))
+        u = _Util()
+        _nvml_lib.nvmlDeviceGetUtilizationRates(dev, ctypes.byref(u))
+        _nvml_ok = True
+        return float(u.gpu)
+    except Exception:
+        _nvml_ok = False
+        return -1.0
 
 
-def remove_monitor(topic: str) -> str:
-    topic = topic.strip().lower()
-    monitors = _load()
-    # exact slug match first
-    slug = _slug(topic)
-    if slug in monitors:
-        label = monitors.pop(slug)["topic"]
-        _save(monitors)
-        return f"Stopped monitoring: {label}"
-    # partial match fallback
-    for key, val in list(monitors.items()):
-        if topic in val.get("topic", "").lower():
-            label = monitors.pop(key)["topic"]
-            _save(monitors)
-            return f"Stopped monitoring: {label}"
-    return f"Not found in monitored topics: {topic}"
+def _get_gpu_usage() -> float:
+    # pynvml — subprocess-free, works everywhere if installed
+    try:
+        import pynvml  # type: ignore
+        pynvml.nvmlInit()
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        return float(pynvml.nvmlDeviceGetUtilizationRates(h).gpu)
+    except Exception:
+        pass
+
+    return _nvml_gpu()
 
 
-def list_monitors() -> list[str]:
-    return [v.get("topic", k) for k, v in _load().items()]
+def _get_cpu_temp() -> float:
+    # psutil — works on Linux; occasionally Windows with proper drivers
+    try:
+        temps = psutil.sensors_temperatures()
+        for name in ["coretemp", "k10temp", "cpu_thermal", "acpitz",
+                     "cpu-thermal", "zenpower", "it8688"]:
+            if name in temps and temps[name]:
+                return temps[name][0].current
+        for entries in temps.values():
+            if entries:
+                return entries[0].current
+    except Exception:
+        pass
 
-
-def check_all() -> list[str]:
-    """
-    Run all pending topic checks (once per day per topic).
-    Returns a list of [MONITOR_ALERT] strings — empty if nothing new.
-    """
-    from actions.web_search import _ddg_news
-
-    monitors = _load()
-    if not monitors:
-        return []
-
-    today   = datetime.now().strftime("%Y-%m-%d")
-    alerts  = []
-    changed = False
-
-    for slug, data in monitors.items():
-        if data.get("last_check") == today:
-            continue                     # already checked today
-
-        topic = data.get("topic", slug)
+    # Windows: wmi module (pure Python COM, zero subprocess)
+    if _OS == "Windows":
         try:
-            results = _ddg_news(topic, max_results=5)
-            if not results:
-                monitors[slug]["last_check"] = today
-                changed = True
-                continue
+            import wmi  # type: ignore
+            w = wmi.WMI(namespace="root/wmi")
+            tz = w.MSAcpi_ThermalZoneTemperature()
+            if tz:
+                return (tz[0].CurrentTemperature / 10.0) - 273.15
+        except Exception:
+            pass
 
-            top   = results[0]
-            title = top.get("title", "").strip()
-            if not title:
-                continue
+    return -1.0
 
-            h = _title_hash(title)
-            monitors[slug]["last_check"] = today
-            changed = True
 
-            if h == data.get("last_hash"):
-                continue                 # same headline as last check — no alert
+def get_system_status() -> dict:
+    """Snapshot of current system metrics for the system_status tool."""
+    cpu  = psutil.cpu_percent(interval=0.2)
+    ram  = psutil.virtual_memory()
+    temp = _get_cpu_temp()
+    gpu  = _get_gpu_usage()
 
-            monitors[slug]["last_hash"] = h
+    boot_time   = psutil.boot_time()
+    uptime_secs = time.time() - boot_time
+    uptime_h    = int(uptime_secs // 3600)
+    uptime_m    = int((uptime_secs % 3600) // 60)
 
-            snippet = top.get("snippet", "")[:150]
-            source  = top.get("source", "")
-            parts   = [f"[MONITOR_ALERT] {topic}", f"Headline: {title}"]
-            if snippet:
-                parts.append(snippet)
-            if source:
-                parts.append(f"Source: {source}")
-            alerts.append("\n".join(parts))
-            print(f"[Monitor] 🔔 New headline for '{topic}': {title[:60]}")
+    return {
+        "cpu_percent":   round(cpu, 1),
+        "ram_percent":   round(ram.percent, 1),
+        "ram_used_gb":   round(ram.used   / 1024 ** 3, 1),
+        "ram_total_gb":  round(ram.total  / 1024 ** 3, 1),
+        "cpu_temp_c":    round(temp, 1) if temp > 0 else None,
+        "gpu_percent":   round(gpu,  1) if gpu  >= 0 else None,
+        "uptime":        f"{uptime_h}h {uptime_m}m",
+        "process_count": len(psutil.pids()),
+    }
 
-        except Exception as e:
-            print(f"[Monitor] ⚠️ Check failed for '{topic}': {e}")
 
-    if changed:
-        _save(monitors)
+class SystemMonitor:
+    """
+    Stateful monitor — cooldown state persists across session reconnections.
+    Call check() periodically; returns a [SYSTEM_ALERT] string or None.
+    """
 
-    return alerts
+    def __init__(self, thresholds: dict | None = None):
+        self.thresholds   = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
+        self._last_alert: dict[str, float] = {}
+        self._cpu_streak  = 0
+
+    def _can_alert(self, key: str) -> bool:
+        return (time.monotonic() - self._last_alert.get(key, 0)) > _COOLDOWN
+
+    def _record(self, key: str):
+        self._last_alert[key] = time.monotonic()
+
+    def check(self) -> str | None:
+        try:
+            cpu  = psutil.cpu_percent(interval=None)
+            ram  = psutil.virtual_memory().percent
+            temp = _get_cpu_temp()
+            gpu  = _get_gpu_usage()
+        except Exception:
+            return None
+
+        alerts: list[str] = []
+
+        if cpu >= self.thresholds["cpu"]:
+            self._cpu_streak += 1
+            if self._cpu_streak >= _CPU_STREAK and self._can_alert("cpu"):
+                alerts.append(
+                    f"[SYSTEM_ALERT] CPU usage has been critically high ({cpu:.0f}%) "
+                    "for several seconds. Warn the user in their language and suggest "
+                    "closing heavy applications."
+                )
+                self._record("cpu")
+                self._cpu_streak = 0
+        else:
+            self._cpu_streak = 0
+
+        if ram >= self.thresholds["ram"] and self._can_alert("ram"):
+            alerts.append(
+                f"[SYSTEM_ALERT] RAM is at {ram:.0f}% — nearly exhausted. "
+                "Warn the user in their language and suggest freeing memory."
+            )
+            self._record("ram")
+
+        if temp > 0 and temp >= self.thresholds["temp"] and self._can_alert("temp"):
+            alerts.append(
+                f"[SYSTEM_ALERT] CPU temperature is {temp:.0f}°C — above the safe limit. "
+                "Warn the user in their language and advise reducing system load "
+                "or checking cooling."
+            )
+            self._record("temp")
+
+        if gpu >= 0 and gpu >= self.thresholds["gpu"] and self._can_alert("gpu"):
+            alerts.append(
+                f"[SYSTEM_ALERT] GPU load is at {gpu:.0f}%. "
+                "Briefly inform the user in their language."
+            )
+            self._record("gpu")
+
+        return " ".join(alerts) if alerts else None
+
+
+# ── Voice formatter ────────────────────────────────────────────────────────────
+
+def format_status_text(snapshot: dict) -> str:
+    """Render ``get_system_status()`` into a single voice-friendly line.
+
+    Used by both the on-demand ``system_monitor`` task (``action=``"status"``)
+    and the background ``SystemMonitorLoop`` so users hear one consistent
+    phrasing no matter which path served the data. Missing metrics are
+    silently dropped (e.g. a desktop with no NVML just won't mention GPU).
+
+    Example output::
+
+        "CPU at 42%, RAM 11.6 of 32 GB (36%), GPU 12%, temp 58°C,
+         up 3 hours 21 minutes, 287 processes."
+    """
+    parts: list[str] = []
+    cpu = snapshot.get("cpu_percent")
+    if cpu is not None:
+        parts.append(f"CPU at {cpu:.0f}%")
+
+    ram_pct = snapshot.get("ram_percent")
+    ram_used = snapshot.get("ram_used_gb")
+    ram_total = snapshot.get("ram_total_gb")
+    if ram_pct is not None and ram_used is not None and ram_total is not None:
+        parts.append(
+            f"RAM {ram_used:.1f} of {ram_total:.0f} GB ({ram_pct:.0f}%)"
+        )
+    elif ram_pct is not None:
+        parts.append(f"RAM at {ram_pct:.0f}%")
+
+    temp = snapshot.get("cpu_temp_c")
+    if temp is not None:
+        parts.append(f"temp {temp:.0f}°C")
+
+    gpu = snapshot.get("gpu_percent")
+    if gpu is not None:
+        parts.append(f"GPU {gpu:.0f}%")
+
+    uptime = snapshot.get("uptime")
+    if uptime:
+        parts.append(f"up {uptime}")
+
+    procs = snapshot.get("process_count")
+    if procs is not None:
+        parts.append(f"{procs} processes")
+
+    return ", ".join(parts) + "." if parts else "System status unavailable."
