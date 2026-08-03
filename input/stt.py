@@ -508,3 +508,10 @@ class MicrophoneListener:
         """Request the listener to stop."""
         self._running = False
         self._wake_event.set()
+
+    def unregister(self) -> None:
+        """Remove all bus subscriptions added by register(). Call after stop()."""
+        if self._wake_word_gated:
+            self._bus.unsubscribe(WakeWordDetected, self._on_wake_word)
+        self._bus.unsubscribe(ShutdownRequested, self._on_shutdown)
+        self._bus.unsubscribe(AssistantStateChanged, self._on_state_changed)

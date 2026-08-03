@@ -19,7 +19,7 @@ declare global {
     }
 }
 
-type AState = "idle" | "listening" | "thinking" | "speaking";
+type AState = "sleeping" | "idle" | "listening" | "thinking" | "speaking";
 type PanelId =
     | "settings"
     | "history"
@@ -86,6 +86,7 @@ const MENUS: { id: PanelId; label: string; angle: number }[] = [
 ];
 
 const STATE_LBL: Record<AState, string> = {
+    sleeping: "SAY HEY JARVIS",
     idle: "IDLE",
     listening: "LISTENING...",
     thinking: "THINKING...",
@@ -886,7 +887,9 @@ function CompactCube({ active }: { active: boolean }) {
 
 // ── App ───────────────────────────────────────────────────────────────────────
 export default function App() {
-    const [astate, setAstate] = useState<AState>("idle");
+    // Start in sleeping state — backend will emit SLEEPING via WakeWordGatedSession
+    // the moment it boots, before the first wake word fires.
+    const [astate, setAstate] = useState<AState>("sleeping");
     const [panel, setPanel] = useState<PanelId | null>(null);
     const [hovering, setHovering] = useState<PanelId | null>(null);
     const [clock, setClock] = useState("");
@@ -959,12 +962,13 @@ export default function App() {
 
         const offState = wsClient.on<{ state: string }>("state", (payload) => {
             if (
+                payload.state === "sleeping" ||
                 payload.state === "idle" ||
                 payload.state === "listening" ||
                 payload.state === "thinking" ||
                 payload.state === "speaking"
             ) {
-                setAstate(payload.state);
+                setAstate(payload.state as AState);
             }
         });
         const offTranscript = wsClient.on<{ text: string; source: string }>(
@@ -1265,8 +1269,14 @@ export default function App() {
         return () => cancelAnimationFrame(rafRef.current);
     }, []);
 
-    const speedMul =
-        astate === "thinking" ? 0.35 : astate === "listening" ? 0.65 : 1;
+    const isAsleep = astate === "sleeping";
+    const speedMul = isAsleep
+        ? 0.08 // rings almost frozen while sleeping
+        : astate === "thinking"
+          ? 0.35
+          : astate === "listening"
+            ? 0.65
+            : 1;
 
     const ticks = Array.from({ length: 72 }, (_, i) => {
         const long = i % 3 === 0;
@@ -1303,6 +1313,7 @@ export default function App() {
         @keyframes spin    { to { transform: rotate( 360deg); } }
         @keyframes unspin  { to { transform: rotate(-360deg); } }
         @keyframes breathe { 0%,100%{opacity:.5} 50%{opacity:1} }
+        @keyframes breatheSlow { 0%,100%{opacity:.15} 50%{opacity:.55} }
         @keyframes flicker { 0%,95%,100%{opacity:1} 96%{opacity:.65} 97%{opacity:.9} 98%{opacity:.55} }
 
         @keyframes compFloat {
@@ -1442,7 +1453,16 @@ export default function App() {
                     width="100%"
                     height="100%"
                     className="no-drag"
-                    style={{ display: "block", position: "absolute", inset: 0 }}
+                    style={{
+                        display: "block",
+                        position: "absolute",
+                        inset: 0,
+                        // Smoothly dim everything when sleeping; orb looks powered down.
+                        filter: isAsleep
+                            ? "brightness(0.22) saturate(0.4)"
+                            : undefined,
+                        transition: "filter 2s ease",
+                    }}
                 >
                     <defs>
                         <radialGradient id="core-g" cx="50%" cy="50%" r="50%">
@@ -1724,11 +1744,15 @@ export default function App() {
                         x={CX}
                         y={CY + 20}
                         textAnchor="middle"
-                        fill={CYN}
-                        fontSize="8.5"
+                        fill={isAsleep ? "rgba(0,229,255,.55)" : CYN}
+                        fontSize={isAsleep ? "6.5" : "8.5"}
                         fontFamily="'Share Tech Mono',monospace"
-                        letterSpacing="2"
-                        style={{ animation: "breathe 2s ease-in-out infinite" }}
+                        letterSpacing={isAsleep ? "1.5" : "2"}
+                        style={{
+                            animation: isAsleep
+                                ? "breatheSlow 5s ease-in-out infinite"
+                                : "breathe 2s ease-in-out infinite",
+                        }}
                     >
                         {STATE_LBL[astate]}
                     </text>
@@ -1881,15 +1905,9 @@ export default function App() {
                                         ? "rgba(0,255,136,.16)"
                                         : "rgba(0,229,255,.03)"
                                 }
-                                stroke={
-                                    chatOpen
-                                        ? GRN
-                                        : "rgba(0,229,255,.14)"
-                                }
+                                stroke={chatOpen ? GRN : "rgba(0,229,255,.14)"}
                                 strokeWidth={chatOpen ? 1.1 : 0.4}
-                                filter={
-                                    chatOpen ? "url(#glow3)" : undefined
-                                }
+                                filter={chatOpen ? "url(#glow3)" : undefined}
                             />
                             <circle
                                 cx={8}
@@ -1901,11 +1919,7 @@ export default function App() {
                                 x={40}
                                 y={12}
                                 textAnchor="middle"
-                                fill={
-                                    chatOpen
-                                        ? GRN
-                                        : "rgba(0,229,255,.26)"
-                                }
+                                fill={chatOpen ? GRN : "rgba(0,229,255,.26)"}
                                 fontSize="6"
                                 fontFamily="'Share Tech Mono',monospace"
                                 letterSpacing="0.5"

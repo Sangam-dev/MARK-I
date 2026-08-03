@@ -32,4 +32,5 @@ dependencies = [
     "tensorflow>=2.21.0",
     "uvicorn[standard]>=0.51.0",
     "websockets>=16.0",
+    "argparse>=1.4.0",
 ]

@@ -151,6 +151,7 @@ class ResponseReady(BaseEvent):
     llm_raw: str = ""
     requires_task: bool = False
 
+
 @dataclass(frozen=True)
 class PartialResponse(BaseEvent):
     """
@@ -172,6 +173,7 @@ class PartialResponse(BaseEvent):
 
 
 class AssistantState(str, Enum):
+    SLEEPING = "sleeping"  # wake word required to re-activate
     IDLE = "idle"
     LISTENING = "listening"
     THINKING = "thinking"
@@ -249,7 +251,6 @@ class ShutdownRequested(BaseEvent):
     """
 
     reason: str = "user requested"
-
 
 
 @dataclass(frozen=True)

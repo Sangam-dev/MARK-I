@@ -76,15 +76,13 @@ def _voice_input_enabled_from_env() -> bool:
     }
 
 
-def _start_voice_input(pipeline: Pipeline) -> asyncio.Task | None:
-    """Start continuous microphone listening automatically, if possible.
+def _start_gated_voice_session(pipeline: Pipeline) -> asyncio.Task | None:
+    """Start the wake-word gated voice session.
 
-    Mirrors `main.py --voice` (continuous, no wake word) exactly — same
-    MicrophoneListener class, same event flow — so "talk to jarvis" works
-    the moment the backend (and therefore the Electron app) starts, with no
-    manual toggle. Requires the `groq` package and a GROQ_API_KEY; if either
-    is missing this logs a warning and the server keeps running fine with
-    text-only chat.
+    The session begins in SLEEPING state. Saying "hey jarvis" wakes it up
+    (continuous mic listening for 2 minutes of activity), then it locks
+    again automatically. Requires GROQ_API_KEY (for STT transcription) —
+    TFLite wake word detection itself needs no API key.
     """
     if not _voice_input_enabled_from_env():
         logger.info("Voice input disabled via KANCHA_VOICE_ENABLED=0")
@@ -92,30 +90,29 @@ def _start_voice_input(pipeline: Pipeline) -> asyncio.Task | None:
 
     if not os.getenv("GROQ_API_KEY"):
         logger.warning(
-            "GROQ_API_KEY not set — voice input disabled; text chat still works. "
-            "Set GROQ_API_KEY in kancha/.env to enable talking to JARVIS."
+            "GROQ_API_KEY not set — voice input disabled; text chat via the "
+            "CHAT button still works. Add GROQ_API_KEY to kancha/.env."
         )
         return None
 
     try:
-        from input.stt import MicrophoneListener
+        from input.gated_session import WakeWordGatedSession
     except ImportError as exc:
         logger.warning(
-            "Voice input unavailable (groq package not installed): %s. "
-            "Text chat still works. Install with: uv add groq",
+            "Gated voice session unavailable — missing dependency: %s. "
+            "Install with: uv add openwakeword tensorflow pyaudio groq",
             exc,
         )
         return None
 
-    mic = MicrophoneListener(
+    session = WakeWordGatedSession(
         bus=pipeline.bus,
         session_id=pipeline.session_id,
-        wake_word_gated=False,  # continuous listening, no wake word required
     )
-    mic.register()
-    task = asyncio.create_task(mic.run(), name="microphone")
+    task = asyncio.create_task(session.run(), name="wake_word_gated_session")
     logger.info(
-        "Continuous microphone listening started automatically (session=%s)",
+        "Wake-word gated session started — say 'hey jarvis' to activate "
+        "(session=%s, idle_timeout=2min)",
         pipeline.session_id,
     )
     return task
@@ -132,7 +129,7 @@ async def lifespan(app: FastAPI):
     )
     attach_bridge(pipeline)
 
-    mic_task = _start_voice_input(pipeline)
+    mic_task = _start_gated_voice_session(pipeline)
 
     app.state.pipeline = pipeline
     app.state.voice_available = mic_task is not None
