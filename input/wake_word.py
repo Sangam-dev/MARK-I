@@ -33,7 +33,7 @@ logger = logging.getLogger("kancha.input.wake_word")
 
 _CHUNK_SIZE = 1280  # 80 ms at 16 kHz (openwakeword default)
 _SAMPLE_RATE = 16000
-_DEFAULT_THRESHOLD = 0.5  # score above this → wake word triggered
+_DEFAULT_THRESHOLD = 0.3  # score above this → wake word triggered
 # override via KANCHA_WAKEWORD_THRESHOLD in .env
 
 

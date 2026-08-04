@@ -147,6 +147,13 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
         # could all benefit from a confirmation gate — left as opt-in via
         # the ``confirm`` param so callers can decide per-request.
     ),
+    "web_search": TaskSpec(
+        name="web_search",
+        description="Search the web for current information: news, prices, scores, events, documentation, research, and anything that requires live data.",
+        required_params=("query",),
+        optional_params=(),
+        param_types={"query": str},
+    ),
     "system_monitor": TaskSpec(
         name="system_monitor",
         description=(

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import Any
-import asyncio
-from core.bus import EventBus
+
 from core.audio_state import audio_state
+from core.bus import EventBus
 from core.events import (
     Intent,
     IntentIdentified,
@@ -277,6 +278,7 @@ class ReasoningCoordinator:
         raw_parts: list[str] = []
         buffer = ""
         prev_visible = ""
+        stream_failed = False
         try:
             async for chunk in self.gemini_client.generate_with_history_stream(
                 history=history,
@@ -296,6 +298,7 @@ class ReasoningCoordinator:
                     )
                     prev_visible = visible
         except Exception as exc:  # noqa: BLE001
+            stream_failed = True
             logger.warning(
                 "Streaming LLM call failed (session=%s): %s", session_id, exc
             )
@@ -303,15 +306,101 @@ class ReasoningCoordinator:
         raw_response = "".join(raw_parts)
         payload = parse_memory_response(raw_response)
         response_text = payload.get("message", "").strip()
-        # Guard against the raw-JSON fallback: if the stream died mid-way,
-        # parse_memory_response returns {"message": <raw partial JSON>}.
-        # Never surface scaffolding — fall back to what was already shown.
-        if (
-            not response_text
-            or response_text == raw_response.strip()
-            or response_text.startswith("{")
-        ):
+
+        # Decide if the parsed message is *actually* the message or a
+        # raw-text fallback that ``parse_memory_response`` substitutes
+        # when the JSON envelope is missing or broken. We treat the
+        # message as suspicious only if:
+        #   - it is empty
+        #   - OR it equals the raw text AND the raw text looks like a
+        #     partial/whole JSON envelope (``{...}`` shape), which means
+        #     parse_memory_response gave us back the literal JSON it
+        #     couldn't decode.
+        # We deliberately do NOT fall back when the raw text is plain
+        # English (e.g. the streaming LLM client yielded a single fallback
+        # chunk like "I'm having trouble thinking right now. Could you
+        # try again?" on an upstream exception). Before this guard,
+        # every such fallback was silently discarded because
+        # ``response_text == raw_response`` was treated as a failure signal
+        # even when the raw text was perfectly good conversational copy.
+        raw_stripped = raw_response.strip()
+        looks_like_json = raw_stripped.startswith("{") and raw_stripped.endswith("}")
+        raw_text_fallback = response_text == raw_stripped and looks_like_json
+        # The third condition (`response_text.startswith("{")`) catches the
+        # case where the parse succeeded but returned a dict-as-message
+        # (which shouldn't happen but historically did on schema drift).
+        if not response_text or raw_text_fallback or response_text.startswith("{"):
             response_text = prev_visible
+
+        # If the stream returned nothing usable — first chunk won the race
+        # but no real text followed (Gemini occasionally streams just the
+        # opening JSON and then stalls), or the call raised before any
+        # chunk arrived — retry once before giving up. Without this, the
+        # mic opens into dead silence and the user sees the assistant
+        # "ignore" their question.
+        if not response_text:
+            if stream_failed or raw_parts:
+                logger.info(
+                    "Empty LLM stream (session=%s, raw=%d chars, prev_visible=%d chars); retrying once",
+                    session_id,
+                    len(raw_response),
+                    len(prev_visible),
+                )
+                try:
+                    raw_parts.clear()
+                    prev_visible = ""
+                    async for chunk in self.gemini_client.generate_with_history_stream(
+                        history=history,
+                        system=system,
+                        hedge_width=1,
+                        call_site="conversational-retry",
+                    ):
+                        raw_parts.append(chunk)
+                        buffer = "".join(raw_parts)
+                        visible = extract_streamed_message(buffer)
+                        if len(visible) > len(prev_visible):
+                            self.bus.emit(
+                                PartialResponse(
+                                    text=visible[len(prev_visible) :],
+                                    session_id=session_id,
+                                )
+                            )
+                            prev_visible = visible
+                    raw_response = "".join(raw_parts)
+                    payload = parse_memory_response(raw_response)
+                    response_text = payload.get("message", "").strip()
+                    raw_stripped = raw_response.strip()
+                    looks_like_json = raw_stripped.startswith(
+                        "{"
+                    ) and raw_stripped.endswith("}")
+                    raw_text_fallback = (
+                        response_text == raw_stripped and looks_like_json
+                    )
+                    if (
+                        not response_text
+                        or raw_text_fallback
+                        or response_text.startswith("{")
+                    ):
+                        response_text = prev_visible
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Retry of streaming LLM call failed (session=%s): %s",
+                        session_id,
+                        exc,
+                    )
+
+        # Last resort: surface a user-visible fallback so the mic doesn't
+        # open into dead silence. TTS will speak this short apology and
+        # the mic reopens for the user's next attempt.
+        if not response_text:
+            logger.error(
+                "LLM produced no usable text after retry (session=%s, user_input=%r); surfacing fallback",
+                session_id,
+                event.intent_event.raw_input if event.intent_event else None,
+            )
+            response_text = (
+                "Sorry, sir — my response came back blank. Could you say that again?"
+            )
 
         # ── Step 4: Add assistant turn to short_term SYNCHRONOUSLY ────────
         self.memory_manager.short_term.add("assistant", response_text)

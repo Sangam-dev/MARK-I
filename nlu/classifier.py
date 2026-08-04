@@ -5,9 +5,9 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from core.audio_state import audio_state
 from core.bus import EventBus
 from core.events import Intent, IntentIdentified, TextInputReceived, TranscriptReady
-from core.audio_state import audio_state
 from nlu.schemas import NLUResult
 from reasoning.llm_client import GeminiClient
 
@@ -20,13 +20,70 @@ class ToolDecision:
     parameters: dict[str, Any]
 
 
+# Matches single-app open commands only. The negative-lookahead (?!.*\band\b)
+# prevents "open firefox and file explorer" from being captured as one app
+# ("firefox and file explorer") — those must fall through to the NLU LLM
+# so the planner can decompose them into two separate open_app tasks.
 _OPEN_RE = re.compile(
-    r"^\s*(?:open|launch|start|run)\s+(?:the\s+)?(?P<app>[\w .+-]+?)\s*$",
+    r"^\s*(?:open|launch|start|run)\s+(?:the\s+)?(?P<app>(?!.*\band\b)[\w .+-]+?)\s*$",
     re.IGNORECASE,
 )
 
 _FILE_LOCATION_RE = re.compile(
     r"\b(?:in|from|inside|on)\s+(?P<path>desktop|downloads|documents|pictures|music|videos|home)\b",
+    re.IGNORECASE,
+)
+
+# ── Web search patterns ───────────────────────────────────────────────────────
+
+# Explicit search commands: "search for X", "look up X", "google X", etc.
+# Capture group <query> is the normalised search query passed to the action.
+# Each alternative must NOT consume its own trailing whitespace — the outer
+# \s+ separator handles that so the query group always starts cleanly.
+_SEARCH_CMD_RE = re.compile(
+    r"^\s*(?:"
+    r"search(?:\s+the\s+(?:web|internet|net|online))?\s+for|search|look\s+up|google|bing|"
+    r"find\s+out(?:\s+about)?"
+    r")\s+(?P<query>.+?)\s*$",
+    re.IGNORECASE,
+)
+
+# Current / live information patterns: "what's the latest on X",
+# "current price of bitcoin", "what's happening with X", etc.
+# Weather/alarm/system keywords are intentionally absent — those patterns
+# are checked earlier in classify_tool_request and take priority.
+_LIVE_INFO_RE = re.compile(
+    r"^\s*(?:"
+    r"what(?:'s|\s+is|\s+are)?\s+(?:the\s+)?(?:latest|current|live|today'?s?|recent)\s+.+|"
+    r"(?:latest|current|live|recent)\s+(?:news|prices?|scores?|updates?|results?|rankings?|info(?:rmation)?)\s+(?:on|about|of|for)\s+.+|"
+    r"what(?:'s|\s+is|\s+was)?\s+(?:happening|going\s+on)\s+(?:in|with|to|at)\s+.+"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+# Factual web questions — things the LLM can't answer reliably from training
+# data alone because the answer is person/event/price specific or time-sensitive.
+#
+# "who is/was/are/were X" — public figures, office holders, etc.
+# Negative lookahead drops self-referential questions ("who are you",
+# "who is jarvis") which belong in the conversational path.
+#
+# "what is/was happening/going on in/with X" — catches the "what is"
+# form that _LIVE_INFO_RE misses (it uses 'what'?s?' not 'what\s+is').
+#
+# "what is X right now / currently / at the moment" — live prices,
+# scores, status queries with an explicit currency marker.
+_FACTUAL_WEB_RE = re.compile(
+    r"^\s*(?:"
+    # "who is/was/are/were X" — public figures, role holders, etc.
+    r"who\s+(?:is|are|was|were)\s+(?!(?:you|your|jarvis|kancha|the\s+assistant)\b).+|"
+    # "what is/was happening/going on in/with X"
+    r"what(?:'s|\s+is|\s+was)?\s+(?:happening|going\s+on)\s+(?:in|with|to|at)\s+.+|"
+    # "what's the situation/status/news/update in/about/of X"
+    r"what(?:'s|\s+is|\s+are)?\s+(?:the\s+)?(?:situation|status|news|update|latest)\s+(?:in|with|about|on|for|of)\s+.+|"
+    # "what is X right now / currently / at the moment / these days"
+    r"what(?:'s|\s+is|\s+are)?\s+\S.+\s+(?:right\s+now|currently|at\s+the\s+moment|these\s+days)\s*"
+    r")\s*$",
     re.IGNORECASE,
 )
 
@@ -43,7 +100,9 @@ def _strip_file_location(text: str) -> str:
 def _classify_file_request(cleaned: str) -> ToolDecision | None:
     lowered = cleaned.lower()
 
-    if re.search(r"\b(?:list|show)\s+(?:my\s+)?(?:files|folders|directory|contents)\b", lowered):
+    if re.search(
+        r"\b(?:list|show)\s+(?:my\s+)?(?:files|folders|directory|contents)\b", lowered
+    ):
         return ToolDecision(
             task_name="file_operation",
             parameters={"action": "list", "path": _extract_file_location(cleaned)},
@@ -58,7 +117,10 @@ def _classify_file_request(cleaned: str) -> ToolDecision | None:
     if re.search(r"\b(?:disk usage|storage usage|free space)\b", lowered):
         return ToolDecision(
             task_name="file_operation",
-            parameters={"action": "disk_usage", "path": _extract_file_location(cleaned, "home")},
+            parameters={
+                "action": "disk_usage",
+                "path": _extract_file_location(cleaned, "home"),
+            },
         )
 
     match = re.search(
@@ -159,7 +221,9 @@ def _classify_protocol_request(cleaned: str) -> ToolDecision | None:
             "core": "jarvis",
             "core protocol": "jarvis",
         }
-        normalized_protocol = protocol_map.get(protocol_name, protocol_name.replace(" ", "_"))
+        normalized_protocol = protocol_map.get(
+            protocol_name, protocol_name.replace(" ", "_")
+        )
 
         return ToolDecision(
             task_name="execute_protocol",
@@ -204,7 +268,9 @@ def _classify_desktop_control_request(cleaned: str) -> ToolDecision | None:
     lowered = cleaned.lower()
 
     def _dc(action: str, **params) -> ToolDecision:
-        return ToolDecision(task_name="desktop_control", parameters={"action": action, **params})
+        return ToolDecision(
+            task_name="desktop_control", parameters={"action": action, **params}
+        )
 
     # ── Wallpaper ─────────────────────────────────────────────────────────
     # "set wallpaper to X", "change my wallpaper to X", "use X as wallpaper"
@@ -239,7 +305,9 @@ def _classify_desktop_control_request(cleaned: str) -> ToolDecision | None:
         return _dc("current_wallpaper")
 
     # ── Window management ────────────────────────────────────────────────
-    if re.search(r"\b(?:list|show)\s+(?:all\s+)?(?:the\s+)?(?:open\s+)?windows\b", lowered):
+    if re.search(
+        r"\b(?:list|show)\s+(?:all\s+)?(?:the\s+)?(?:open\s+)?windows\b", lowered
+    ):
         return _dc("list_windows")
 
     # "list running apps" / "list running applications" / "what apps are
@@ -259,26 +327,38 @@ def _classify_desktop_control_request(cleaned: str) -> ToolDecision | None:
     # focus / bring to front — handled earlier in classify_tool_request
     # so it doesn't get captured by _OPEN_RE (open chrome).
 
-    m_close = re.search(r"\bclose\s+(?:the\s+)?(?P<app>.+?)\s+window\s*$", cleaned, re.IGNORECASE)
+    m_close = re.search(
+        r"\bclose\s+(?:the\s+)?(?P<app>.+?)\s+window\s*$", cleaned, re.IGNORECASE
+    )
     if not m_close:
-        m_close = re.search(r"\bclose\s+(?:the\s+)?(?P<app>.+?)\s*$", cleaned, re.IGNORECASE)
+        m_close = re.search(
+            r"\bclose\s+(?:the\s+)?(?P<app>.+?)\s*$", cleaned, re.IGNORECASE
+        )
     if m_close:
         app = m_close.group("app").strip().rstrip(".?!")
         # Strip trailing "window" (when it's a noun, not part of the app name)
         app = re.sub(r"\s+window\b", "", app, flags=re.IGNORECASE).strip()
         # Strip trailing "please" / "for me" / "now"
-        app = re.sub(r"\s+(?:please|for\s+me|now)\s*$", "", app, flags=re.IGNORECASE).strip()
+        app = re.sub(
+            r"\s+(?:please|for\s+me|now)\s*$", "", app, flags=re.IGNORECASE
+        ).strip()
         app = re.sub(r"^the\s+", "", app, flags=re.IGNORECASE).strip()
         if app:
             return _dc("close_window", app=app)
 
-    m_min = re.search(r"\bminimize\s+(?:the\s+)?(?P<app>.+?)\s+window\s*$", cleaned, re.IGNORECASE)
+    m_min = re.search(
+        r"\bminimize\s+(?:the\s+)?(?P<app>.+?)\s+window\s*$", cleaned, re.IGNORECASE
+    )
     if not m_min:
-        m_min = re.search(r"\bminimize\s+(?:the\s+)?(?P<app>.+?)\s*$", cleaned, re.IGNORECASE)
+        m_min = re.search(
+            r"\bminimize\s+(?:the\s+)?(?P<app>.+?)\s*$", cleaned, re.IGNORECASE
+        )
     if m_min:
         raw = m_min.group("app").strip().rstrip(".?!")
         raw = re.sub(r"\s+window\b", "", raw, flags=re.IGNORECASE).strip()
-        raw = re.sub(r"\s+(?:please|for\s+me|now)\s*$", "", raw, flags=re.IGNORECASE).strip()
+        raw = re.sub(
+            r"\s+(?:please|for\s+me|now)\s*$", "", raw, flags=re.IGNORECASE
+        ).strip()
         raw = re.sub(r"^the\s+", "", raw, flags=re.IGNORECASE).strip()
         # "minimize all windows" / "minimize everything" — bulk action, no app arg
         if raw.lower() in {"all", "all windows", "everything", "all of them", ""}:
@@ -286,13 +366,23 @@ def _classify_desktop_control_request(cleaned: str) -> ToolDecision | None:
         if raw:
             return _dc("minimize", app=raw)
 
-    m_max = re.search(r"\b(?:maximize|toggle\s+maximize)\s+(?:the\s+)?(?P<app>.+?)\s+window\s*$", cleaned, re.IGNORECASE)
+    m_max = re.search(
+        r"\b(?:maximize|toggle\s+maximize)\s+(?:the\s+)?(?P<app>.+?)\s+window\s*$",
+        cleaned,
+        re.IGNORECASE,
+    )
     if not m_max:
-        m_max = re.search(r"\b(?:maximize|toggle\s+maximize)\s+(?:the\s+)?(?P<app>.+?)\s*$", cleaned, re.IGNORECASE)
+        m_max = re.search(
+            r"\b(?:maximize|toggle\s+maximize)\s+(?:the\s+)?(?P<app>.+?)\s*$",
+            cleaned,
+            re.IGNORECASE,
+        )
     if m_max:
         raw = m_max.group("app").strip().rstrip(".?!")
         raw = re.sub(r"\s+window\b", "", raw, flags=re.IGNORECASE).strip()
-        raw = re.sub(r"\s+(?:please|for\s+me|now)\s*$", "", raw, flags=re.IGNORECASE).strip()
+        raw = re.sub(
+            r"\s+(?:please|for\s+me|now)\s*$", "", raw, flags=re.IGNORECASE
+        ).strip()
         raw = re.sub(r"^the\s+", "", raw, flags=re.IGNORECASE).strip()
         if raw.lower() in {"all", "all windows", "everything", "all of them", ""}:
             return _dc("maximize", target="all")
@@ -300,7 +390,10 @@ def _classify_desktop_control_request(cleaned: str) -> ToolDecision | None:
             return _dc("maximize", app=raw)
 
     # ── Virtual desktops (workspaces) ─────────────────────────────────────
-    if re.search(r"\b(?:list|show|what(?:'s| is)|give\s+me)\s+(?:me\s+)?(?:all\s+)?(?:the\s+)?(?:virtual\s+)?(?:desktops|workspaces)\b", lowered):
+    if re.search(
+        r"\b(?:list|show|what(?:'s| is)|give\s+me)\s+(?:me\s+)?(?:all\s+)?(?:the\s+)?(?:virtual\s+)?(?:desktops|workspaces)\b",
+        lowered,
+    ):
         return _dc("list_workspaces")
 
     m = re.search(
@@ -326,7 +419,11 @@ def _classify_desktop_control_request(cleaned: str) -> ToolDecision | None:
             return _dc("move_to_workspace", target=target, follow=False)
         return _dc("move_to_workspace", app=app, target=target, follow=False)
 
-    m = re.search(r"\bwhich\s+(?:desktop|workspace)\s+is\s+(?P<app>.+?)\s+on\b", cleaned, re.IGNORECASE)
+    m = re.search(
+        r"\bwhich\s+(?:desktop|workspace)\s+is\s+(?P<app>.+?)\s+on\b",
+        cleaned,
+        re.IGNORECASE,
+    )
     if m:
         app = m.group("app").strip().rstrip(".?!")
         return _dc("window_workspace", app=app)
@@ -338,10 +435,16 @@ def _classify_desktop_control_request(cleaned: str) -> ToolDecision | None:
     if re.search(r"\bclean\s+(?:my\s+|the\s+)?desktop\b", lowered):
         return _dc("clean")
 
-    if re.search(r"\b(?:list|show|what(?:'s| is)\s+on)\s+(?:my\s+|the\s+)?desktop(?:\s+files)?\b", lowered):
+    if re.search(
+        r"\b(?:list|show|what(?:'s| is)\s+on)\s+(?:my\s+|the\s+)?desktop(?:\s+files)?\b",
+        lowered,
+    ):
         return _dc("list")
 
-    if re.search(r"\b(?:desktop\s+stats|stats\s+(?:for\s+)?(?:my\s+|the\s+)?desktop|how\s+big\s+is\s+my\s+desktop)\b", lowered):
+    if re.search(
+        r"\b(?:desktop\s+stats|stats\s+(?:for\s+)?(?:my\s+|the\s+)?desktop|how\s+big\s+is\s+my\s+desktop)\b",
+        lowered,
+    ):
         return _dc("stats")
 
     return None
@@ -479,6 +582,29 @@ def _classify_system_monitor_request(cleaned: str) -> ToolDecision | None:
     return None
 
 
+def _classify_web_search_request(cleaned: str) -> ToolDecision | None:
+    """Detect explicit search commands and live-info queries.
+
+    Called last in :func:`classify_tool_request` so every more-specific
+    pattern (weather, alarms, desktop control, etc.) takes priority.
+    """
+    # Explicit command: "search for X", "look up X", "google X", ...
+    m = _SEARCH_CMD_RE.match(cleaned)
+    if m:
+        return ToolDecision(
+            task_name="web_search",
+            parameters={"query": m.group("query").strip()},
+        )
+    # Live/current-information or factual web question — use the full
+    # cleaned text as the query so the search engine sees the whole intent.
+    if _LIVE_INFO_RE.match(cleaned) or _FACTUAL_WEB_RE.match(cleaned):
+        return ToolDecision(
+            task_name="web_search",
+            parameters={"query": cleaned},
+        )
+    return None
+
+
 def classify_tool_request(text: str) -> ToolDecision | None:
     cleaned = " ".join(text.strip().split()).rstrip(".?!")
     if not cleaned:
@@ -507,7 +633,10 @@ def classify_tool_request(text: str) -> ToolDecision | None:
     if focus_app:
         focus_app = re.sub(r"^the\s+", "", focus_app, flags=re.IGNORECASE).strip()
         if focus_app:
-            return ToolDecision(task_name="desktop_control", parameters={"action": "focus", "app": focus_app})
+            return ToolDecision(
+                task_name="desktop_control",
+                parameters={"action": "focus", "app": focus_app},
+            )
 
     open_match = _OPEN_RE.match(cleaned)
     if open_match:
@@ -636,6 +765,11 @@ def classify_tool_request(text: str) -> ToolDecision | None:
     }:
         return ToolDecision(task_name="restart", parameters={})
 
+    # Web search — checked last so every specific tool pattern takes priority.
+    web_decision = _classify_web_search_request(cleaned)
+    if web_decision is not None:
+        return web_decision
+
     return None
 
 
@@ -656,6 +790,7 @@ Classify intent into one of:
   * "file_operation" (params: action (required), path, name, content, destination, new_name, extension (optional). Action values: list, create_file, create_folder, delete, move, copy, rename, read, write, find, largest, disk_usage, organize_desktop, info)- "execute_protocol" (params: protocol_name (required), original_request (optional))- "conversational": Casual greetings, chitchat, or social statements (e.g., "hi", "how are you?", "nice to meet you").
 - "desktop_control" (params: action (required), plus action-specific optional params). Action values: wallpaper, wallpaper_url, current_wallpaper, organize, clean, list, stats, list_windows, focus, close_window, minimize, maximize, list_workspaces, switch_workspace, move_to_workspace, window_workspace, task. For action="task" the natural-language description goes in the "task" param. For action="focus"/"close_window"/"minimize"/"maximize" the app name goes in "app". For action="switch_workspace" the desktop/workspace name or number goes in "target". For action="wallpaper" the image path goes in "path"; for "wallpaper_url" the URL goes in "url".
 - "system_monitor" (params: action (required); optional: metric, threshold, enabled). Action values: status (one-shot CPU/RAM/temp/GPU/uptime snapshot), check_alerts (run a single threshold check), set_threshold (needs metric ∈ {cpu,ram,temp,gpu} and threshold ∈ 1..99), enable/disable (toggle the background alert loop using enabled=true|false).
+- "web_search" (params: query (required)). Use for any request that needs live or current information from the web: news, prices, scores, events, documentation, research, public figures, recent announcements, etc. The query should be the user's question or search phrase as-is.
 
 Return ONLY valid JSON matching this schema:
 {

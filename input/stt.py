@@ -47,6 +47,17 @@ ONSET_TOLERANCE_CHUNKS = 3  # ~90ms of tolerated dips during onset
 CALIBRATION_SECS = 0.3
 CALIBRATION_MULTIPLIER = 3.5
 
+# FIXME: cap the calibrated threshold so a noisy moment (the user starts
+# talking *during* the 0.3s calibration sample, a fan kicks on, a
+# notification chime, etc.) can't produce a threshold above normal speech
+# RMS. Quiet speech in float32 normalized audio sits at 0.05–0.20; loud
+# speech peaks at 0.3–0.5. Anything above 0.20 essentially deafens the
+# mic against conversational volume. Previously the threshold in the
+# user log spiked to 0.56655 (noise floor 0.16 × 3.5) and the assistant
+# made three consecutive "No audio recorded" cycles.
+_THRESHOLD_MAX = 0.20
+_THRESHOLD_MIN = 0.005  # refuse to go below this — would trigger on every breath
+
 SILENCE_HALLUCINATIONS = {
     "thank you",
     "thank you.",
@@ -110,6 +121,14 @@ async def _calibrate_noise_floor(
     Sample a short burst of ambient audio and derive a silence threshold
     relative to the actual noise floor, instead of relying on a hardcoded
     constant that only makes sense for one specific mic/gain/room.
+
+    The returned threshold is clamped to :data:`_THRESHOLD_MAX` (≈ the
+    RMS of normal conversational speech) and :data:`_THRESHOLD_MIN`.
+    If the calibration sample is implausibly loud — e.g. the user started
+    talking during the 0.3 s sample, a notification chime fired, or a fan
+    kicked on — the raw value would have made the mic deaf to real
+    speech. Capping catches that case without throwing away the
+    calibration signal entirely.
     """
     try:
         frames = int(sample_rate * calibration_secs)
@@ -123,7 +142,16 @@ async def _calibrate_noise_floor(
         sd.wait()
         noise_rms = _audio_rms(rec.flatten())
 
-        threshold = max(noise_rms * multiplier, fallback * 0.5)
+        raw_threshold = noise_rms * multiplier
+        threshold = min(max(raw_threshold, _THRESHOLD_MIN), _THRESHOLD_MAX)
+
+        if raw_threshold > _THRESHOLD_MAX:
+            print(
+                f"⚠ Calibration noise floor {noise_rms:.5f} too high; "
+                f"clamping threshold {_THRESHOLD_MAX:.5f} (was {raw_threshold:.5f}). "
+                "Try speaking louder or moving the mic closer."
+            )
+
         print(f"🎚 Calibrated noise floor: {noise_rms:.5f} -> threshold {threshold:.5f}")
         return threshold
     except Exception as exc:

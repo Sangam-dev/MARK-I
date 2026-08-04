@@ -102,6 +102,19 @@ def _is_abbreviation(text: str, pos: int) -> bool:
     return bool(ABBREV.search(text[: pos + 1]))
 
 
+# When the buffer has grown past this length, prefer splitting on the
+# nearest soft boundary (comma, em-dash) over waiting for a hard
+# sentence-final punctuation mark. Without this, a 250-character response
+# that ends with a single period waits the entire duration of the LLM
+# stream before any TTS fires — the user sees the full text on screen for
+# several seconds and then hears the first word. With this, the comma at
+# position 60 (long after the first clause) splits the buffer cleanly
+# into a 60-char speakable fragment, TTS starts immediately on that
+# fragment, and the rest of the response continues streaming into the
+# next split.
+SOFT_PREFERRED_THRESHOLD = 60
+
+
 def _extract_sentences(buffer: str) -> tuple[list[str], str]:
     """
     Extract complete, speakable sentences from buffer.
@@ -110,21 +123,26 @@ def _extract_sentences(buffer: str) -> tuple[list[str], str]:
         (list of sentences, leftover buffer)
 
     The extractor prefers hard sentence boundaries (``.``, ``!``, ``?``,
-    ``…``) past ``MIN_CHUNK_LEN``. If none has arrived but the buffer has
-    grown past ``SOFT_BREAK_THRESHOLD``, a soft boundary (``,``, ``—``)
-    is used as the split point — this is what makes short replies like
-    "It is my absolute pleasure, sir." start speaking well before the
-    LLM finishes streaming. The caller is responsible for stitching the
-    soft-split fragments back together at playback time
+    ``…``) past :data:`MIN_CHUNK_LEN` — but only as long as the next hard
+    boundary is "close enough". Once the buffer has grown past
+    :data:`SOFT_PREFERRED_THRESHOLD` characters we instead prefer the
+    nearest soft boundary (``,``, ``—``) past :data:`MIN_CHUNK_LEN`. This
+    is what makes long single-sentence responses — the kind Gemini likes
+    to emit — start speaking at the first comma instead of waiting 4-6
+    seconds for the final period. The caller is responsible for stitching
+    the soft-split fragments back together at playback time
     (:meth:`TTSHandler.on_response_ready` already does this via the
     ``_visible`` / ``_buf`` merge).
 
-    If the buffer exceeds ``MAX_CHUNK_LEN`` with no boundary at all, the
+    If the buffer exceeds :data:`MAX_CHUNK_LEN` with no boundary at all, the
     extractor forces a split at the nearest space past ``MIN_CHUNK_LEN``.
     """
     sentences = []
     while True:
-        # First pass: look for any hard boundary past MIN_CHUNK_LEN.
+        # First pass: hard boundary — but only if it isn't too far away.
+        # If the buffer is past SOFT_PREFERRED_THRESHOLD, a hard boundary
+        # 200 chars away means the user will wait 4+ seconds; prefer a
+        # soft split at 60 chars instead.
         boundary_pos = -1
         for i, char in enumerate(buffer):
             if char in HARD_BOUNDARIES and i >= MIN_CHUNK_LEN:
@@ -132,13 +150,23 @@ def _extract_sentences(buffer: str) -> tuple[list[str], str]:
                     continue
                 if char == "." and i + 1 < len(buffer) and buffer[i + 1] == ".":
                     continue
+                # Mid-token period: decimal numbers (10.7), URLs (www.facebook.com),
+                # version numbers (v1.2.3), domain names (python.org).
+                # A sentence-ending period is always followed by whitespace or
+                # end-of-buffer — anything else is not a sentence boundary.
+                if char == "." and i + 1 < len(buffer) and not buffer[i + 1].isspace():
+                    continue
+                if (
+                    len(buffer) >= SOFT_PREFERRED_THRESHOLD
+                    and i > SOFT_PREFERRED_THRESHOLD
+                ):
+                    break
                 boundary_pos = i
                 break
 
-        # Second pass: soft boundary fallback when the buffer has grown
-        # long enough that the next clause is well-defined. Only fire when
-        # the hard boundary didn't yield anything — never replace a hard
-        # boundary with a soft one.
+        # Second pass: soft boundary fallback. Fires when no hard boundary
+        # was found AND when we deferred a far-off hard boundary in favour
+        # of an earlier soft one.
         if boundary_pos == -1 and len(buffer) >= SOFT_BREAK_THRESHOLD:
             for i, char in enumerate(buffer):
                 if char in SOFT_BOUNDARIES and i >= MIN_CHUNK_LEN:
@@ -447,7 +475,7 @@ class TTSHandler:
                 # buffered fragment is the unspoken tail of the stream, which
                 # continues seamlessly into final — merge the two so the last
                 # word is never spoken broken (e.g. "cond sentence!").
-                tail = self._buf + final[len(visible):]
+                tail = self._buf + final[len(visible) :]
                 self._buf = ""
             else:
                 # Divergent (rare fallback): speak only the text after the
@@ -495,9 +523,7 @@ class TTSHandler:
         if self._started:
             audio_state.speaking_finished()
             self._bus.emit(
-                AssistantStateChanged(
-                    state=AssistantState.IDLE, session_id=session_id
-                )
+                AssistantStateChanged(state=AssistantState.IDLE, session_id=session_id)
             )
         self._buf = ""
         self._visible = ""

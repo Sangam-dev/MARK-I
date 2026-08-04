@@ -18,6 +18,7 @@ from actions.system_monitor import (
     get_system_status,
 )
 from actions.weather import get_weather
+from actions.web_search import web_search
 from core.bus import EventBus
 from core.events import TaskCompleted, TaskExecutionRequested
 from tasks.registry import TASK_REGISTRY, validate_task
@@ -237,9 +238,8 @@ class TaskExecutor:
             # successes as long as we got output. Single-line strings
             # that look like error messages are treated as failures so
             # the naturalize / replanner path can handle them.
-            is_failure = (
-                "\n" not in stripped
-                and bool(_DESKTOP_FAILURE_RE.match(stripped))
+            is_failure = "\n" not in stripped and bool(
+                _DESKTOP_FAILURE_RE.match(stripped)
             )
             return TaskExecutionResult(not is_failure, result_text)
 
@@ -256,7 +256,7 @@ class TaskExecutor:
             if not script_path:
                 return TaskExecutionResult(
                     False,
-                    f"Unknown protocol: {protocol_name}. Available: {list(protocol_scripts.keys())}"
+                    f"Unknown protocol: {protocol_name}. Available: {list(protocol_scripts.keys())}",
                 )
 
             # Run the protocol script using SystemCommandExecutor
@@ -267,9 +267,18 @@ class TaskExecutor:
             result = await executor.execute(command)
 
             if result.success:
-                return TaskExecutionResult(True, f"Protocol '{protocol_name}' executed successfully")
+                return TaskExecutionResult(
+                    True, f"Protocol '{protocol_name}' executed successfully"
+                )
             else:
-                return TaskExecutionResult(False, f"Protocol '{protocol_name}' failed: {result.stderr}")
+                return TaskExecutionResult(
+                    False, f"Protocol '{protocol_name}' failed: {result.stderr}"
+                )
+
+        if task_name == "web_search":
+            query = params.get("query", "")
+            result = await asyncio.to_thread(web_search, query)
+            return TaskExecutionResult(result.success, result.message)
 
         if task_name == "system_monitor":
             return await self._dispatch_system_monitor(params)

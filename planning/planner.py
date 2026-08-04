@@ -18,7 +18,6 @@ import json
 import logging
 import re
 import uuid
-
 from typing import Any
 
 from core.bus import EventBus
@@ -33,8 +32,8 @@ from memory.manager import MemoryManager
 from memory.token_log import TokenLog
 from planning.models import (
     ExecutionPlan,
-    PlanStatus,
     PlannedTask,
+    PlanStatus,
     TaskStatus,
 )
 from planning.prompts import REPLANNER_SYSTEM_PROMPT, build_planner_prompt
@@ -67,15 +66,29 @@ _VERBS_RE = re.compile(
 
 
 def _looks_multistep(text: str) -> bool:
-    """True if *text* probably contains two or more distinct actions."""
+    """True if *text* probably contains two or more distinct actions.
+
+    Returns True for BOTH of these shapes:
+      - Two or more verbs joined by a conjunction
+          ("create a folder and open Firefox" → verb_count=2)
+      - One verb with multiple targets joined by a conjunction
+          ("open firefox and file explorer" → verb_count=1, but still two tool calls)
+    """
     if not text:
         return False
     has_conjunction = _MULTISTEP_RE.search(text) is not None
     verb_count = len(_VERBS_RE.findall(text))
-    if has_conjunction and verb_count >= 2:
+    # Any conjunction + at least one action verb → let the LLM planner decide.
+    # Previously required verb_count >= 2, which silently dropped the second
+    # target in "open X and Y" (one verb, two apps).
+    if has_conjunction and verb_count >= 1:
         return True
     # More than one enumerator ("first ... second ...", numbered list).
-    if re.search(r"\b(?:first|1\.|1\))\s.*\b(?:second|2\.|2\))\s", text, re.IGNORECASE | re.DOTALL):
+    if re.search(
+        r"\b(?:first|1\.|1\))\s.*\b(?:second|2\.|2\))\s",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    ):
         return True
     return False
 
@@ -375,9 +388,9 @@ class Planner:
         seen_ids: set[str] = set()
         tasks: list[PlannedTask] = []
         for i, t in enumerate(tasks_raw):
-            tid = str(t.get("id") or f"t{i+1}").strip()
+            tid = str(t.get("id") or f"t{i + 1}").strip()
             if not tid or tid in seen_ids:
-                tid = f"t{i+1}"
+                tid = f"t{i + 1}"
             seen_ids.add(tid)
             tool = str(t.get("tool") or "").strip()
             if tool not in TASK_REGISTRY:
@@ -464,9 +477,7 @@ class Planner:
         recent = self._memory.short_term.get_recent(limit=4)
         recent_lines = [f"- {m['role']}: {m['content']}" for m in recent]
         fact_lines = [
-            f"- {f['key']}: {f['value']}"
-            for f in facts
-            if "key" in f and "value" in f
+            f"- {f['key']}: {f['value']}" for f in facts if "key" in f and "value" in f
         ]
         parts: list[str] = []
         if recent_lines:

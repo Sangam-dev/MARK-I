@@ -301,6 +301,20 @@ def _voice_file_operation(message: str, args: dict[str, Any]) -> str:
     return _default_voice(text, args)
 
 
+def _voice_web_search(message: str, _args: dict[str, Any]) -> str:
+    """Voice for web_search.
+
+    Gemini grounding already returns plain text shaped to 2-3 sentences;
+    DuckDuckGo answers are also plain text. Both are already
+    TTS-ready — pass them through unchanged. The only transformation
+    needed is a graceful fallback for empty results.
+    """
+    text = (message or "").strip()
+    if not text:
+        return "I couldn't find anything on that right now, sir."
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Registry + dispatcher
 # ---------------------------------------------------------------------------
@@ -321,6 +335,7 @@ TOOL_VOICE: dict[str, ToolVoice] = {
     "execute_protocol": _passthrough,
     "desktop_control": _voice_desktop_control,
     "system_monitor": _passthrough,
+    "web_search": _voice_web_search,
 }
 
 
@@ -381,5 +396,5 @@ def _already_natural(text: str) -> bool:
         "tell me",
         "no ",
     )
-    
+
     return any(lowered.startswith(p) for p in prefixes)
