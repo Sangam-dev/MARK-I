@@ -26,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import ValidationError
 
 from api.bridge import attach_bridge
-from api.routes import files, health, history, tasks, weather
+from api.routes import files, health, history, rag, tasks, weather
 from api.routes import memory as memory_routes
 from api.routes import settings as settings_routes
 from api.schemas import WSIncoming
@@ -136,10 +136,11 @@ async def lifespan(app: FastAPI):
     app.state.mic_task = mic_task
 
     logger.info(
-        "KANCHA API server ready (session=%s, tts=%s, voice=%s)",
+        "KANCHA API server ready (session=%s, tts=%s, voice=%s, rag=%s)",
         DEFAULT_SESSION_ID,
         pipeline.tts_enabled,
         app.state.voice_available,
+        pipeline.rag_enabled,
     )
     try:
         yield
@@ -174,6 +175,7 @@ app.include_router(tasks.router, prefix="/api")
 app.include_router(files.router, prefix="/api")
 app.include_router(weather.router, prefix="/api")
 app.include_router(settings_routes.router, prefix="/api")
+app.include_router(rag.router, prefix="/api")
 
 
 @app.websocket("/ws")

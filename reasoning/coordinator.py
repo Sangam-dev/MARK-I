@@ -18,6 +18,7 @@ from core.events import (
     TaskCompleted,
 )
 from memory.manager import MemoryManager
+from memory.rag import MemoryRouter, RAGManager, RetrievedChunk
 from memory.token_log import TokenLog
 from reasoning.llm_client import (
     GeminiClient,
@@ -49,6 +50,15 @@ class ReasoningCoordinator:
     and RAG entries) is carried inline by the primary Gemini response
     JSON envelope and persisted here via MemoryManager.save_sql /
     append_rag — there is no separate extraction step anymore.
+
+    RAG ownership
+    -------------
+    This class is the **Conversation Manager** in the RAG architecture.
+    It never touches the vector database: retrieval goes through
+    :class:`~memory.rag.manager.RAGManager`, gated by a
+    :class:`~memory.rag.router.MemoryRouter`. Conversely the RAG Manager
+    never builds prompts — turning retrieved chunks into prompt text is
+    :meth:`_format_rag_context`, and it lives here on purpose.
     """
 
     def __init__(
@@ -57,11 +67,18 @@ class ReasoningCoordinator:
         gemini_client: GeminiClient,
         memory_manager: MemoryManager,
         token_log: TokenLog | None = None,
+        rag_manager: RAGManager | None = None,
+        rag_router: MemoryRouter | None = None,
     ) -> None:
         self.bus = bus
         self.gemini_client = gemini_client
         self.memory_manager = memory_manager
         self.token_log = token_log
+        # Both None when RAG is disabled or failed to start. Every use
+        # site null-checks, so the conversational path is unchanged in
+        # that case.
+        self.rag_manager = rag_manager
+        self.rag_router = rag_router
         # Pending task turns keyed by session_id
         self._pending_turns: dict[str, dict[str, Any]] = {}
         self._last_tasks: dict[str, dict[str, Any]] = {}
@@ -78,13 +95,25 @@ class ReasoningCoordinator:
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _build_system_prompt(self, memory_event: MemoryRetrieved | None) -> str:
+    def _build_system_prompt(
+        self,
+        memory_event: MemoryRetrieved | None,
+        retrieved: list[RetrievedChunk] | None = None,
+    ) -> str:
         """
-        Build the system prompt: KANCHA persona + explicit user facts only.
+        Build the system prompt: persona + structured facts + retrieved memory.
+
+        Three distinct layers, deliberately kept apart:
+
+        * **persona** — who the assistant is.
+        * **User facts** — structured key/value memory from SQLite.
+        * **Relevant long-term memory** — semantic chunks from the vector
+          store, present only when the Memory Router asked for retrieval
+          and something scored above the similarity threshold.
 
         Conversation history is passed separately as a message list —
         it must NEVER appear here as "structured facts", which confuses
-        the LLM into anchoring on old turns. RAG/vector context is disabled.
+        the LLM into anchoring on old turns.
         """
         parts = [JARVIS_PERSONA]
 
@@ -101,7 +130,110 @@ class ReasoningCoordinator:
             if fact_lines:
                 parts.append("User facts:\n" + "\n".join(fact_lines))
 
+        rag_block = self._format_rag_context(retrieved)
+        if rag_block:
+            parts.append(rag_block)
+
         return "\n\n".join(parts)
+
+    def _format_rag_context(self, retrieved: list[RetrievedChunk] | None) -> str:
+        """Render retrieved chunks into a prompt block.
+
+        This is the Conversation Manager's job, not the RAG Manager's —
+        which is why it takes structured :class:`RetrievedChunk` objects
+        and produces the string, rather than receiving a pre-baked
+        prompt fragment.
+
+        The block is budgeted by ``KANCHA_RAG_MAX_CONTEXT_CHARS``.
+        Chunks arrive sorted by score, so truncation always drops the
+        least relevant material first.
+        """
+        if not retrieved:
+            return ""
+
+        budget = 4000
+        if self.rag_manager is not None:
+            budget = self.rag_manager.config.max_context_chars
+
+        lines: list[str] = []
+        used = 0
+        included = 0
+
+        for index, chunk in enumerate(retrieved, start=1):
+            source = f", source: {chunk.source}" if chunk.source else ""
+            page = chunk.metadata.get("page")
+            page_note = f", page {page}" if page else ""
+            header = (
+                f"[{index}] {chunk.title} "
+                f"({chunk.doc_type}, relevance {chunk.score:.2f}{source}{page_note})"
+            )
+            body = chunk.content.strip()
+            entry = f"{header}\n{body}"
+
+            if used + len(entry) > budget:
+                if included == 0:
+                    # Always include at least one chunk, truncated to fit,
+                    # rather than retrieving something and then showing
+                    # the model nothing.
+                    entry = entry[:budget].rstrip() + " […]"
+                    lines.append(entry)
+                    included += 1
+                break
+
+            lines.append(entry)
+            used += len(entry)
+            included += 1
+
+        if not lines:
+            return ""
+
+        if included < len(retrieved):
+            logger.debug(
+                "RAG context truncated to %d/%d chunk(s) by the %d-char budget",
+                included,
+                len(retrieved),
+                budget,
+            )
+
+        return (
+            "Relevant long-term memory (retrieved for this message):\n\n"
+            + "\n\n".join(lines)
+            + "\n\nUse this material only where it genuinely answers the user. "
+            "Ignore anything irrelevant, and never mention that you looked "
+            "anything up or refer to these numbered entries."
+        )
+
+    async def _retrieve_rag_context(
+        self, user_input: str, intent_event: IntentIdentified | None
+    ) -> list[RetrievedChunk]:
+        """Ask the router whether to retrieve, then retrieve if so.
+
+        Fully guarded: retrieval enriches a reply, so any failure here
+        must degrade the answer rather than break the turn.
+        """
+        if self.rag_manager is None or self.rag_router is None:
+            return []
+
+        try:
+            decision = await self.rag_router.decide(
+                user_input,
+                intent=intent_event.intent.value if intent_event else None,
+                is_task=bool(intent_event.requires_task) if intent_event else False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Memory router failed (%s) — skipping retrieval", exc)
+            return []
+
+        if not decision.retrieve:
+            logger.debug("RAG skipped: %s", decision.reason)
+            return []
+
+        logger.info("RAG retrieval triggered: %s", decision.reason)
+        try:
+            return await self.rag_manager.retrieve(decision.query or user_input)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("RAG retrieval failed (%s) — answering without it", exc)
+            return []
 
     def _get_history(self) -> list[dict[str, str]]:
         """Return short_term buffer as a clean [{role, content}] list."""
@@ -110,11 +242,21 @@ class ReasoningCoordinator:
             for m in self.memory_manager.short_term.get_recent()
         ]
 
-    async def _persist_response_memory(self, payload: dict[str, Any]) -> None:
+    async def _persist_response_memory(
+        self, payload: dict[str, Any], session_id: str = "default"
+    ) -> None:
         """Persist sql/rag memory carried by the primary Gemini response.
 
         Best-effort: a failure to persist must never break the reply.
         Absent keys ("sql"/"rag") are simply skipped.
+
+        ``rag`` entries go to two places with different standing:
+
+        * the **vector database** — the authoritative semantic store,
+          written through the RAG Manager so chunking, embedding and
+          duplicate detection all apply;
+        * ``memory/rag.txt`` — a human-readable audit log, for
+          inspection and debugging only. Nothing ever reads it back.
         """
         sql = payload.get("sql")
         if sql:
@@ -126,13 +268,33 @@ class ReasoningCoordinator:
                 logger.warning("SQL memory persist failed (non-fatal): %s", exc)
 
         rag = payload.get("rag")
-        if rag:
+        if not rag:
+            return
+
+        # 1. Authoritative store.
+        if self.rag_manager is not None:
             try:
-                appended = await self.memory_manager.append_rag(rag)
-                if appended:
-                    logger.info("Appended %d RAG entries to rag.txt", appended)
+                results = await self.rag_manager.index_conversation_entries(
+                    rag, session_id=session_id
+                )
+                indexed = sum(r.chunks_indexed for r in results)
+                if indexed:
+                    logger.info(
+                        "Indexed %d RAG chunk(s) from response into the vector store",
+                        indexed,
+                    )
             except Exception as exc:
-                logger.warning("RAG memory append failed (non-fatal): %s", exc)
+                logger.warning("RAG vector index failed (non-fatal): %s", exc)
+        else:
+            logger.debug("RAG disabled — response rag entries go to the audit log only")
+
+        # 2. Audit log (unchanged behaviour).
+        try:
+            appended = await self.memory_manager.append_rag(rag)
+            if appended:
+                logger.info("Appended %d RAG entries to rag.txt (audit log)", appended)
+        except Exception as exc:
+            logger.warning("RAG audit append failed (non-fatal): %s", exc)
 
     def _is_retry_request(self, user_input: str) -> bool:
         return bool(_RETRY_RE.match(user_input))
@@ -259,15 +421,25 @@ class ReasoningCoordinator:
         self, event: ReasoningRequested, session_id: str
     ) -> None:
         memory_event = event.memory_events[0] if event.memory_events else None
-        system = self._build_system_prompt(memory_event)
+
+        # ── Memory Router -> RAG retrieval ────────────────────────────
+        # Gated on purpose: retrieving for "hi" or "open chrome" wastes
+        # an embedding call and pollutes the prompt. See memory/rag/router.py.
+        retrieved = await self._retrieve_rag_context(
+            event.intent_event.raw_input if event.intent_event else "",
+            event.intent_event,
+        )
+
+        system = self._build_system_prompt(memory_event, retrieved)
 
         # history already ends with the user's current message (added in step 1)
         history = self._get_history()
 
         logger.debug(
-            "Calling LLM (streaming) | history_turns=%d | system_len=%d",
+            "Calling LLM (streaming) | history_turns=%d | system_len=%d | rag_chunks=%d",
             len(history),
             len(system),
+            len(retrieved),
         )
 
         # Stream the JSON envelope token-by-token. While it arrives, strip
@@ -407,8 +579,9 @@ class ReasoningCoordinator:
 
         # ── Step 5: Persist memory from the primary Gemini response ───────
         # Memory now comes directly from the response JSON envelope — no
-        # separate extraction step after the conversation.
-        await self._persist_response_memory(payload)
+        # separate extraction step after the conversation. `sql` lands in
+        # SQLite, `rag` in the vector store (+ the rag.txt audit log).
+        await self._persist_response_memory(payload, session_id=session_id)
 
         # ── Step 6: Mark stream done + emit final response ────────────────
         self.bus.emit(PartialResponse(text="", done=True, session_id=session_id))

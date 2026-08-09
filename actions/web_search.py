@@ -1,25 +1,3 @@
-"""actions/web_search.py
-
-Live web search via Playwright (DuckDuckGo HTML) + Groq synthesis.
-
-Flow
-----
-1. Check in-memory TTL cache.
-2. Launch headless Chromium, search DuckDuckGo HTML, collect result
-   titles + snippets.
-3. Pass snippets to Groq (llama-3.1-8b-instant) which synthesises a
-   short, plain-English answer. Falls back to the best raw snippet if
-   Groq is unavailable.
-4. Cache the answer for 5 minutes.
-
-Threading note
---------------
-sync_playwright() is greenlet-bound. A process-wide browser singleton
-breaks when asyncio.to_thread picks a different worker thread
-("Cannot switch to a different thread"). A fresh context is created
-per call — always correct regardless of which thread runs the action.
-"""
-
 from __future__ import annotations
 
 import glob
@@ -31,15 +9,16 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any
 
+from numpy import str_
+
 logger = logging.getLogger("kancha.actions.web_search")
 
 # ── TTL cache ─────────────────────────────────────────────────────────────────
 
-_CACHE_TTL_S: float = 300.0  # 5 minutes
+_CACHE_TTL_S: float = 60.0  # 1 minutes
 _CACHE_MAX: int = 200
 
 _cache: dict[str, tuple[str, float]] = {}  # key -> (answer, expires_monotonic)
-
 
 def _ck(query: str) -> str:
     return hashlib.md5(" ".join(query.lower().split()).encode()).hexdigest()
@@ -70,7 +49,8 @@ _groq_init_done: bool = False
 
 _GROQ_SYSTEM = (
     "You are a concise factual assistant. "
-    "Answer in 1-2  for simple and long for complex in plain English sentences using only the provided search snippets. "
+    "Answer in 1-2  for simple and long for complex in plain English sentences using only the provided search snippets." \
+    "respond like a human(jarvis), not an AI. "
     "State the answer directly — no markdown, no lists, no source citations, no preamble."
 )
 
@@ -97,13 +77,7 @@ def _init_groq() -> None:
         _groq_init_done = True
 
 
-def _synthesize_with_groq(query: str, results: list[dict[str, str]]) -> str | None:
-    """Synthesise a short plain-English answer from raw search snippets.
-
-    Uses Groq llama-3.1-8b-instant (<1 s on the free tier, 14.4K RPD,
-    500K TPD — well within normal daily use). Falls back to the best raw
-    snippet when Groq is unavailable.
-    """
+def _synthesize_with_groq(query: str, results: list[dict[str, str]] | str) -> str | None:
     _init_groq()
 
     lines: list[str] = []
@@ -146,6 +120,102 @@ def _synthesize_with_groq(query: str, results: list[dict[str, str]]) -> str | No
         return lines[0][:450] if lines else None
 
 
+# ── Gemini (Google Search grounding), rotating across 8 keys ────────────────
+
+# Reads GEMINI_API_KEY_1 .. GEMINI_API_KEY_8 (skips any that are unset).
+_GEMINI_KEY_ENV_VARS: list[str] = [f"GEMINI_API_KEY_{i}" for i in range(7, 0, -1)]
+
+_gemini_last_good_idx: int = 0
+
+_genai_module: Any = None
+_genai_import_failed: bool = False
+
+
+def _get_gemini_keys() -> list[str]:
+    keys = []
+    for var in _GEMINI_KEY_ENV_VARS:
+        val = os.getenv(var, "").strip()
+        if val:
+            keys.append(val)
+    return keys
+
+
+def _get_genai_module() -> Any:
+    global _genai_module, _genai_import_failed
+    if _genai_module is not None or _genai_import_failed:
+        return _genai_module
+    try:
+        from google import genai  # noqa: PLC0415
+
+        _genai_module = genai
+    except ImportError:
+        logger.warning("web_search: google-genai not installed — skipping Gemini")
+        _genai_import_failed = True
+    return _genai_module
+
+
+def _gemini_search(query: str) -> str | None:
+    global _gemini_last_good_idx
+
+    keys = _get_gemini_keys()
+    if not keys:
+        logger.debug(
+            "web_search: no GEMINI_API_KEY_1.._8 set — skipping Gemini"
+        )
+        return None
+
+    genai = _get_genai_module()
+    if genai is None:
+        return None
+
+    n = len(keys)
+    start = _gemini_last_good_idx % n
+
+    for attempt in range(n):
+        idx = (start + attempt) % n
+        key = keys[idx]
+        try:
+            client = genai.Client(api_key=key)
+            response = client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=query,
+                config={"tools": [{"google_search": {}}]},
+
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "web_search: Gemini key #%d failed (%s) — trying next key",
+                idx + 1,
+                exc,
+            )
+            continue
+
+        try:
+            text = (response.text or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "web_search: Gemini key #%d response.text failed: %s",
+                idx + 1,
+                exc,
+            )
+            continue
+
+        if not text:
+            logger.info(
+                "web_search: Gemini key #%d returned empty text — trying next key",
+                idx + 1,
+            )
+            continue
+
+        # This key worked — remember it so next call tries it first.
+        _gemini_last_good_idx = idx
+        #return text[:2000]  # hard cap — answers should be short
+        return _synthesize_with_groq(query, text)
+
+    logger.warning("web_search: all %d Gemini keys failed or returned empty", n)
+    return None
+
+
 # ── Playwright search ─────────────────────────────────────────────────────────
 
 
@@ -171,13 +241,10 @@ def _search_playwright(query: str) -> str | None:
         logger.warning("web_search: playwright not installed")
         return None
 
-    # df=m restricts results to the past month so stale cached pages
-    # (e.g. old Wikipedia snapshots) don't outrank current news.
-    # Appending the year further biases DDG toward recent content.
     year = time.strftime("%Y")
     fresh_query = f"{query} {year}" if year not in query else query
     url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode(
-        {"q": fresh_query, "df": "m"}
+        {"q": fresh_query, "df": "d"}
     )
     try:
         with sync_playwright() as p:
@@ -240,9 +307,17 @@ def web_search(query: str) -> SearchResult:
         logger.debug("web_search: cache hit for %r", query[:60])
         return SearchResult(True, cached)
 
+    # Primary: Gemini with Google Search grounding, rotating across keys.
+    # answer = _gemini_search(query)
+    # if answer:
+    #     logger.info("web_search: answered by Gemini (%d chars)", len(answer))
+    #     _cache_put(query, answer)
+    #     return SearchResult(True, answer)
+
+    # Fallback: Playwright + Groq synthesis.
     answer = _search_playwright(query)
     if answer:
-        logger.info("web_search: answered (%d chars)", len(answer))
+        logger.info("web_search: answered by Playwright fallback (%d chars)", len(answer))
         _cache_put(query, answer)
         return SearchResult(True, answer)
 

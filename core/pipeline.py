@@ -31,9 +31,19 @@ from core.events import (
     ResponseReady,
     SystemError,
     SystemMonitorAlert,
+    TextInputReceived,
+    TranscriptReady,
 )
 from core.system_monitor_loop import SystemMonitorLoop
 from memory.manager import MemoryManager
+from memory.rag import (
+    IngestService,
+    MemoryRouter,
+    RAGConfig,
+    RAGManager,
+    RagFileSync,
+    build_router,
+)
 from memory.token_log import TokenLog, jsonl_sink
 from nlu.classifier import NLUClassifier
 from output.response_formatter import ResponseFormatter
@@ -60,6 +70,37 @@ DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "memory" / "data"
 DEFAULT_MONITOR_INTERVAL = 30
 
 
+async def _warm_and_sync_rag(
+    rag_manager: RAGManager,
+    rag_config: RAGConfig,
+    session_id: str,
+) -> None:
+    """Background boot task: warm the index, then replay ``memory/rag.txt``.
+
+    Runs detached from ``build_pipeline`` so neither step delays the
+    assistant becoming responsive. Both halves are individually guarded —
+    a failure here costs recall, never availability.
+    """
+    if rag_config.warm_on_boot:
+        try:
+            await rag_manager.warm()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("RAG warm-up failed (non-fatal): %s", exc)
+
+    if not rag_config.sync_on_boot:
+        return
+
+    try:
+        report = await RagFileSync(rag_config, rag_manager).run(session_id=session_id)
+        if report.entries_indexed:
+            # Newly-indexed rows invalidated the similarity matrix; rebuild
+            # it now so the next user turn still gets a warm index.
+            await rag_manager.warm()
+        logger.info("RAG boot sync complete — %s", report.summary())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("RAG boot sync failed (non-fatal): %s", exc)
+
+
 @dataclass
 class Pipeline:
     """Handle bundle for a fully-wired KANCHA event pipeline.
@@ -83,6 +124,14 @@ class Pipeline:
     session_id: str
     tts_enabled: bool
     monitor_enabled: bool
+    # ── RAG (long-term semantic memory) ───────────────────────────────
+    # All three are None when RAG is disabled (KANCHA_RAG_ENABLED=0) or
+    # when its startup failed; every consumer already null-checks, so a
+    # broken vector store degrades the assistant instead of killing it.
+    rag: RAGManager | None = None
+    rag_router: MemoryRouter | None = None
+    rag_ingest: IngestService | None = None
+    rag_enabled: bool = False
 
 
 async def build_pipeline(
@@ -92,6 +141,7 @@ async def build_pipeline(
     enable_console_formatter: bool = True,
     enable_system_monitor: bool = True,
     monitor_interval_s: float | None = None,
+    enable_rag: bool | None = None,
 ) -> Pipeline:
     """Construct and wire every KANCHA module onto a fresh EventBus.
 
@@ -119,6 +169,10 @@ async def build_pipeline(
         Override the polling interval (seconds). Defaults to
         ``DEFAULT_MONITOR_INTERVAL`` (30s) or the ``KANCHA_MONITOR_INTERVAL``
         env var if set.
+    enable_rag:
+        Build the RAG subsystem (long-term semantic memory + document
+        upload index). ``None`` defers to ``KANCHA_RAG_ENABLED`` (default
+        on). Pass ``False`` in tests that must not touch the vector store.
     """
     data_dir = data_dir or DEFAULT_DATA_DIR
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -182,6 +236,53 @@ async def build_pipeline(
         )
     bus.register_handlers(memory)
 
+    # ── RAG: long-term semantic memory ──────────────────────────────────
+    # SQLite (above) keeps structured facts; this keeps meaning. The two
+    # are deliberately separate stores with separate write paths — see
+    # memory/rag/__init__.py for the split.
+    #
+    # Startup is best-effort: a missing embedding key or an unreadable
+    # vector store must degrade the assistant to "no long-term recall",
+    # never prevent it from booting.
+    rag_config = RAGConfig.from_env(data_dir=data_dir)
+    rag_manager: RAGManager | None = None
+    rag_router: MemoryRouter | None = None
+    rag_ingest: IngestService | None = None
+
+    rag_wanted = rag_config.enabled if enable_rag is None else enable_rag
+    if rag_wanted:
+        try:
+            rag_manager = RAGManager(rag_config)
+            await rag_manager.initialize()
+            rag_router = build_router(rag_config)
+            rag_ingest = IngestService(rag_config, rag_manager)
+            logger.info(
+                "RAG enabled — router=%s, %s", rag_router.name, rag_config.describe()
+            )
+
+            # Warm the index and replay memory/rag.txt in the background.
+            #
+            # Deliberately NOT awaited. The first boot after a long
+            # conversation history has to embed every entry in the audit
+            # log, which can take minutes — blocking startup on that would
+            # leave the user staring at a dead assistant. Warm-up runs
+            # first (fast, and it makes the very first query cheap), then
+            # the replay converges the index a few seconds later.
+            asyncio.create_task(
+                _warm_and_sync_rag(rag_manager, rag_config, session_id),
+                name="rag_boot_sync",
+            )
+        except Exception as exc:
+            logger.warning(
+                "RAG initialisation failed: %s — continuing without semantic memory.",
+                exc,
+            )
+            rag_manager = None
+            rag_router = None
+            rag_ingest = None
+    else:
+        logger.info("RAG disabled (KANCHA_RAG_ENABLED=0 or enable_rag=False)")
+
     # ── LLM + token logging ─────────────────────────────────────────────
     token_log = TokenLog(
         session_id=session_id,
@@ -215,12 +316,40 @@ async def build_pipeline(
 
     bus.subscribe(IntentIdentified, _handle_intent_identified)
 
+    # ── RAG query prefetch ────────────────────────────────────────────────
+    # Latency, not correctness. Embedding the query is the only slow step
+    # in retrieval (a network round-trip); the search itself is a warm
+    # numpy dot product. Starting the embedding the moment the transcript
+    # lands lets it finish inside the window the NLU classifier already
+    # spends, so by the time the coordinator asks for context it is
+    # cached and the retrieval costs effectively nothing.
+    #
+    # The router gate is applied here too, so "hi" and "open chrome" never
+    # trigger an embedding call at all.
+    if rag_manager is not None and rag_router is not None:
+
+        async def _prefetch_rag_query(event: TranscriptReady | TextInputReceived) -> None:
+            text = (getattr(event, "text", "") or "").strip()
+            if not text:
+                return
+            try:
+                decision = await rag_router.decide(text)
+            except Exception:  # noqa: BLE001
+                return
+            if decision.retrieve:
+                rag_manager.prefetch(decision.query or text)
+
+        bus.subscribe(TranscriptReady, _prefetch_rag_query)
+        bus.subscribe(TextInputReceived, _prefetch_rag_query)
+
     # ── Reasoning Coordinator ─────────────────────────────────────────────
     coordinator = ReasoningCoordinator(
         bus=bus,
         gemini_client=llm,
         memory_manager=memory,
         token_log=token_log,
+        rag_manager=rag_manager,
+        rag_router=rag_router,
     )
     coordinator.register()
 
@@ -262,10 +391,11 @@ async def build_pipeline(
         asyncio.create_task(tts_handler.warmup(), name="tts_warmup")
 
     logger.info(
-        "Pipeline built (session=%s, tts=%s, console_formatter=%s)",
+        "Pipeline built (session=%s, tts=%s, console_formatter=%s, rag=%s)",
         session_id,
         enable_tts,
         enable_console_formatter,
+        rag_manager is not None,
     )
 
     return Pipeline(
@@ -283,6 +413,10 @@ async def build_pipeline(
         session_id=session_id,
         tts_enabled=enable_tts,
         monitor_enabled=enable_system_monitor,
+        rag=rag_manager,
+        rag_router=rag_router,
+        rag_ingest=rag_ingest,
+        rag_enabled=rag_manager is not None,
     )
 
 
@@ -308,5 +442,11 @@ async def shutdown_pipeline(pipeline: Pipeline, drain_timeout: float = 3.0) -> N
         await pipeline.memory.close()
     except Exception as exc:
         logger.warning("Memory close error (non-fatal): %s", exc)
+
+    if pipeline.rag is not None:
+        try:
+            await pipeline.rag.close()
+        except Exception as exc:
+            logger.warning("RAG close error (non-fatal): %s", exc)
 
     logger.info("Pipeline shut down (session=%s)", pipeline.session_id)

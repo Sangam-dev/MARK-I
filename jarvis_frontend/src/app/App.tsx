@@ -7,6 +7,8 @@ import {
     type HistoryTurn,
     type SettingsModel,
     type HealthInfo,
+    type RAGDocument,
+    type RAGStats,
 } from "./lib/api";
 
 declare global {
@@ -148,6 +150,228 @@ export interface PanelData {
     wsLatencyMs: number | null;
     onToggleTts: () => void;
     onToggleVoiceMode: () => void;
+    // RAG knowledge base — backs the upload widget in the FILES panel.
+    ragDocuments: RAGDocument[] | null;
+    ragStats: RAGStats | null;
+    onRagChanged: () => void;
+}
+
+// ── RAG knowledge base widget ────────────────────────────────────────────────
+//
+// Drives the upload pipeline (POST /api/rag/upload), which is completely
+// independent of the conversation pipeline — no WebSocket traffic, no bus
+// events. Uploaded documents are chunked, embedded and indexed server-side;
+// the assistant then retrieves from them automatically when a question
+// warrants it (see memory/rag/router.py for the retrieve/skip decision).
+function RagKnowledgeBase({
+    documents,
+    stats,
+    onChanged,
+}: {
+    documents: RAGDocument[] | null;
+    stats: RAGStats | null;
+    onChanged: () => void;
+}) {
+    const inputRef = useRef<HTMLInputElement>(null);
+    const [busy, setBusy] = useState(false);
+    const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(
+        null,
+    );
+    const [dragging, setDragging] = useState(false);
+
+    const accept = (stats?.supported_extensions ?? [".pdf", ".txt", ".md", ".docx"]).join(",");
+    const available = stats?.ready !== false;
+
+    const upload = async (files: FileList | null) => {
+        if (!files || files.length === 0) return;
+        setBusy(true);
+        setStatus(null);
+
+        let indexed = 0;
+        const failures: string[] = [];
+        for (const file of Array.from(files)) {
+            try {
+                const result = await api.uploadDocument(file);
+                indexed += result.chunks_indexed;
+            } catch (err) {
+                failures.push(
+                    `${file.name}: ${err instanceof Error ? err.message : String(err)}`,
+                );
+            }
+        }
+
+        setBusy(false);
+        setStatus(
+            failures.length === 0
+                ? { ok: true, text: `Indexed ${indexed} chunk(s) from ${files.length} file(s).` }
+                : { ok: false, text: failures[0] },
+        );
+        onChanged();
+        if (inputRef.current) inputRef.current.value = "";
+    };
+
+    const remove = async (id: string) => {
+        try {
+            await api.deleteRagDocument(id);
+            setStatus({ ok: true, text: "Document removed." });
+            onChanged();
+        } catch (err) {
+            setStatus({
+                ok: false,
+                text: err instanceof Error ? err.message : String(err),
+            });
+        }
+    };
+
+    return (
+        <div style={{ marginTop: 14, paddingTop: 12, borderTop: "1px solid rgba(0,229,255,0.14)" }}>
+            <div
+                style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    marginBottom: 8,
+                }}
+            >
+                <span style={{ fontSize: 10, letterSpacing: 2, opacity: 0.75 }}>
+                    KNOWLEDGE BASE
+                </span>
+                <span style={{ fontSize: 9, opacity: 0.45 }}>
+                    {stats ? `${stats.documents} docs · ${stats.chunks} chunks` : "—"}
+                </span>
+            </div>
+
+            {!available ? (
+                <div style={{ fontSize: 11, color: ORG, opacity: 0.8 }}>
+                    RAG is offline — uploads are disabled. Check the backend logs.
+                </div>
+            ) : (
+                <>
+                    <div
+                        className="no-drag"
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => !busy && inputRef.current?.click()}
+                        onDragOver={(e) => {
+                            e.preventDefault();
+                            setDragging(true);
+                        }}
+                        onDragLeave={() => setDragging(false)}
+                        onDrop={(e) => {
+                            e.preventDefault();
+                            setDragging(false);
+                            if (!busy) upload(e.dataTransfer.files);
+                        }}
+                        style={{
+                            border: `1px dashed ${dragging ? CYN : "rgba(0,229,255,0.35)"}`,
+                            background: dragging ? "rgba(0,229,255,0.07)" : "transparent",
+                            borderRadius: 4,
+                            padding: "12px 8px",
+                            textAlign: "center",
+                            cursor: busy ? "progress" : "pointer",
+                            fontSize: 11,
+                            opacity: busy ? 0.55 : 1,
+                            transition: "background .15s, border-color .15s",
+                        }}
+                    >
+                        {busy ? (
+                            <span style={{ color: CYN }}>INDEXING…</span>
+                        ) : (
+                            <>
+                                <div style={{ color: CYN, marginBottom: 3 }}>
+                                    ↑ DROP FILES OR CLICK
+                                </div>
+                                <div style={{ fontSize: 9, opacity: 0.45 }}>
+                                    {accept.replace(/\./g, "").toUpperCase().replace(/,/g, " · ")}
+                                </div>
+                            </>
+                        )}
+                    </div>
+
+                    <input
+                        ref={inputRef}
+                        type="file"
+                        multiple
+                        accept={accept}
+                        style={{ display: "none" }}
+                        onChange={(e) => upload(e.target.files)}
+                    />
+
+                    {status && (
+                        <div
+                            style={{
+                                fontSize: 10,
+                                marginTop: 7,
+                                lineHeight: 1.45,
+                                color: status.ok ? GRN : RED,
+                            }}
+                        >
+                            {status.text}
+                        </div>
+                    )}
+
+                    {documents && documents.length > 0 && (
+                        <div style={{ marginTop: 10, maxHeight: 130, overflowY: "auto" }}>
+                            {documents.map((doc) => (
+                                <div
+                                    key={doc.id}
+                                    style={{
+                                        display: "flex",
+                                        justifyContent: "space-between",
+                                        alignItems: "center",
+                                        gap: 6,
+                                        marginBottom: 6,
+                                        paddingBottom: 5,
+                                        borderBottom: "1px solid rgba(0,229,255,0.06)",
+                                    }}
+                                >
+                                    <div style={{ minWidth: 0 }}>
+                                        <div
+                                            style={{
+                                                fontSize: 11,
+                                                whiteSpace: "nowrap",
+                                                overflow: "hidden",
+                                                textOverflow: "ellipsis",
+                                            }}
+                                            title={doc.title}
+                                        >
+                                            {doc.title}
+                                        </div>
+                                        <div style={{ fontSize: 9, opacity: 0.4 }}>
+                                            {doc.doc_type} · {doc.chunk_count} chunks
+                                        </div>
+                                    </div>
+                                    <span
+                                        className="no-drag"
+                                        role="button"
+                                        tabIndex={0}
+                                        onClick={() => remove(doc.id)}
+                                        title="Remove from knowledge base"
+                                        style={{
+                                            cursor: "pointer",
+                                            color: RED,
+                                            opacity: 0.65,
+                                            fontSize: 12,
+                                            flexShrink: 0,
+                                            padding: "0 3px",
+                                        }}
+                                    >
+                                        ×
+                                    </span>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+
+                    {documents && documents.length === 0 && (
+                        <div style={{ fontSize: 10, opacity: 0.4, marginTop: 8 }}>
+                            No documents indexed yet.
+                        </div>
+                    )}
+                </>
+            )}
+        </div>
+    );
 }
 
 function PanelContent({ id, data }: { id: PanelId; data: PanelData }) {
@@ -597,6 +821,15 @@ function PanelContent({ id, data }: { id: PanelId; data: PanelData }) {
                           h.tts_enabled ? GRN : ORG,
                       ],
                       [
+                          "RAG",
+                          h.rag_available
+                              ? `${h.rag_documents} DOCS`
+                              : h.rag_enabled
+                                ? "ERROR"
+                                : "DISABLED",
+                          h.rag_available ? GRN : h.rag_enabled ? RED : ORG,
+                      ],
+                      [
                           "WS LATENCY",
                           data.wsLatencyMs != null
                               ? `${data.wsLatencyMs}ms`
@@ -654,6 +887,8 @@ function PanelContent({ id, data }: { id: PanelId; data: PanelData }) {
                                 fontSize: 11.5,
                                 lineHeight: 1.6,
                                 whiteSpace: "pre-wrap",
+                                maxHeight: 150,
+                                overflowY: "auto",
                             }}
                         >
                             {msg}
@@ -685,6 +920,12 @@ function PanelContent({ id, data }: { id: PanelId; data: PanelData }) {
                             </div>
                         ))
                     )}
+
+                    <RagKnowledgeBase
+                        documents={data.ragDocuments}
+                        stats={data.ragStats}
+                        onChanged={data.onRagChanged}
+                    />
                 </>
             );
         }
@@ -916,6 +1157,10 @@ export default function App() {
     const [alarmsMessage, setAlarmsMessage] = useState<string | null>(null);
     const [filesMessage, setFilesMessage] = useState<string | null>(null);
     const [health, setHealth] = useState<HealthInfo | null>(null);
+    const [ragDocuments, setRagDocuments] = useState<RAGDocument[] | null>(null);
+    const [ragStats, setRagStats] = useState<RAGStats | null>(null);
+    // Bumped after an upload/delete so the FILES panel refetches the index.
+    const [ragVersion, setRagVersion] = useState(0);
 
     const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
     const waveRef = useRef<SVGPathElement>(null);
@@ -1059,8 +1304,23 @@ export default function App() {
                     const data = await api.getAlarms();
                     if (!cancelled) setAlarmsMessage(data.message);
                 } else if (panel === "files") {
-                    const data = await api.listFiles("desktop");
-                    if (!cancelled) setFilesMessage(data.message);
+                    // Two independent sources: the OS desktop listing and
+                    // the RAG index. Settled together so one backend being
+                    // down (e.g. RAG disabled) still renders the other.
+                    const [files, docs, stats] = await Promise.allSettled([
+                        api.listFiles("desktop"),
+                        api.getRagDocuments(),
+                        api.getRagStats(),
+                    ]);
+                    if (cancelled) return;
+                    if (files.status === "fulfilled")
+                        setFilesMessage(files.value.message);
+                    setRagDocuments(
+                        docs.status === "fulfilled" ? docs.value : [],
+                    );
+                    setRagStats(
+                        stats.status === "fulfilled" ? stats.value : null,
+                    );
                 } else if (panel === "developer") {
                     const data = await api.getHealth();
                     if (!cancelled) setHealth(data);
@@ -1077,7 +1337,7 @@ export default function App() {
         return () => {
             cancelled = true;
         };
-    }, [panel]);
+    }, [panel, ragVersion]);
 
     const sendText = () => {
         const text = inputText.trim();
@@ -1120,6 +1380,9 @@ export default function App() {
         wsLatencyMs,
         onToggleTts: toggleTts,
         onToggleVoiceMode: toggleVoiceMode,
+        ragDocuments,
+        ragStats,
+        onRagChanged: () => setRagVersion((v) => v + 1),
     };
 
     // IPC: main process tells us to switch mode

@@ -61,3 +61,82 @@ class AlarmCreateRequest(BaseModel):
 class ActionResult(BaseModel):
     success: bool
     message: str
+
+
+# ── REST: RAG (upload + document management) ─────────────────────────────────
+#
+# These mirror the dataclasses in memory/rag/models.py and
+# memory/rag/ingest.py. They are re-declared here as Pydantic models rather
+# than reused directly so the wire format stays owned by the API layer and
+# cannot drift accidentally when an internal dataclass gains a field.
+
+
+class RAGUploadResult(BaseModel):
+    """Response for ``POST /api/rag/upload``."""
+
+    success: bool
+    filename: str
+    message: str
+    document_id: str = ""
+    title: str = ""
+    chunks_indexed: int = 0
+    chunks_skipped: int = 0
+    error: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RAGDocumentOut(BaseModel):
+    """One indexed document, as listed by ``GET /api/rag/documents``."""
+
+    id: str
+    title: str
+    source: str = ""
+    doc_type: str = "document"
+    created_at: str = ""
+    updated_at: str = ""
+    chunk_count: int = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RAGDeleteResult(BaseModel):
+    document_id: str
+    title: str = ""
+    chunks_removed: int = 0
+
+
+class RAGSearchHit(BaseModel):
+    """One retrieval result. Matches ``RetrievedChunk.to_dict()``."""
+
+    title: str
+    type: str
+    score: float
+    content: str
+    source: str = ""
+    document_id: str = ""
+    chunk_id: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RAGSearchResponse(BaseModel):
+    query: str
+    count: int
+    results: list[RAGSearchHit] = Field(default_factory=list)
+
+
+class RAGStats(BaseModel):
+    """Index snapshot + effective config, for the UI and for debugging."""
+
+    ready: bool = False
+    enabled: bool = False
+    embedder: str = ""
+    store: str = ""
+    dimensions: int = 0
+    documents: int = 0
+    chunks: int = 0
+    top_k: int = 0
+    similarity_threshold: float = 0.0
+    chunk_size: int = 0
+    chunk_overlap: int = 0
+    supported_extensions: list[str] = Field(default_factory=list)
+    max_upload_bytes: int = 0
+    error: str = ""
