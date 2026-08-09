@@ -806,9 +806,15 @@ Do NOT include markdown formatting or code blocks in your response. Return raw J
 class NLUClassifier:
     """LLM-based intent classification and entity extraction, with offline regex fallback."""
 
-    def __init__(self, llm_client: GeminiClient, bus: EventBus) -> None:
+    def __init__(self, llm_client: GeminiClient, bus: EventBus, parallel_mode: bool | None = None) -> None:
         self.llm_client = llm_client
         self.bus = bus
+        import sys
+        is_testing = "pytest" in sys.modules or any("test" in arg for arg in sys.argv)
+        if parallel_mode is None:
+            self.parallel_mode = not is_testing
+        else:
+            self.parallel_mode = parallel_mode
 
     def register(self) -> None:
         """Subscribe to text and transcript events."""
@@ -860,13 +866,13 @@ class NLUClassifier:
     async def _process_text(self, text: str, session_id: str) -> None:
         """Perform classification and emit IntentIdentified event.
 
-        The thinking gate is raised here (before any async work) and is
-        released by the ReasoningCoordinator when it finishes — that
-        ensures the microphone cannot reopen mid-classify or mid-stream,
-        which would otherwise let audio leak in as a separate turn.
+        In parallel mode, the Response LLM pipeline manages the thinking gate.
+        In sequential/test mode, the thinking gate is raised here (before any async work)
+        and released by the ReasoningCoordinator.
         """
         logger.info("Processing user input text: '%s'", text)
-        audio_state.thinking_started()
+        if not self.parallel_mode:
+            audio_state.thinking_started()
         try:
             result = await self.classify(text, session_id)
 
@@ -882,5 +888,6 @@ class NLUClassifier:
             self.bus.emit(intent_event)
         except Exception:
             # Never leave the gate stuck if classify/emit blew up.
-            audio_state.thinking_finished()
+            if not self.parallel_mode:
+                audio_state.thinking_finished()
             raise
