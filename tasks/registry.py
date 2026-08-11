@@ -53,33 +53,18 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
         optional_params=("date", "units"),
         param_types={"city": str, "date": str, "units": str},
     ),
-    "sleep": TaskSpec(
-        name="sleep",
-        description="Put the current device to sleep.",
-        required_params=(),
-        optional_params=(),
-        requires_confirmation=True,
-        is_destructive=True,
-        param_types={},
-    ),
-    "shutdown": TaskSpec(
-        name="shutdown",
-        description="Shut the current device down.",
-        required_params=(),
-        optional_params=(),
-        requires_confirmation=True,
-        is_destructive=True,
-        param_types={},
-    ),
-    "restart": TaskSpec(
-        name="restart",
-        description="Restart the current device.",
-        required_params=(),
-        optional_params=(),
-        requires_confirmation=True,
-        is_destructive=True,
-        param_types={},
-    ),
+    # Power-state tasks — sleep, shutdown, restart — have been REMOVED on
+    # purpose, not merely gated. The assistant has no route to power the
+    # machine off, restart it, or suspend it: no entry here, no dispatch
+    # branch in tasks/executor.py, no action in actions/system_tool.py.
+    #
+    # This registry is the catalog rendered into *both* LLM prompts
+    # (planning/prompts.py for the Task LLM, reasoning/coordinator.py for
+    # the Conversation LLM), so removing the entry removes the capability
+    # from what either model believes it can do. Re-adding one here is
+    # enough to hand the assistant the power button again — don't.
+    #
+    # Enforced by tests/test_system_tool.py::test_registry_has_no_power_tasks.
     "file_operation": TaskSpec(
         name="file_operation",
         description=(
@@ -153,6 +138,49 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
         required_params=("query",),
         optional_params=(),
         param_types={"query": str},
+    ),
+    "system": TaskSpec(
+        name="system",
+        description=(
+            "Control the Linux system through an allowlist of structured "
+            "actions: open_application (target=app), open_path (target=file "
+            "or folder), wifi (operation=on|off|status), cpu, memory, disk "
+            "(target=mount point), processes (operation=cpu|memory, "
+            "limit=1..50), kill_process (pid or name), lock_screen, "
+            "system_info, service (name, operation=status|start|stop|restart, "
+            "scope=user|system). There is NO shutdown, reboot, restart or "
+            "sleep action — this assistant cannot change the machine's power "
+            "state at all. Destructive actions (kill_process, and "
+            "start/stop/restart of a service) ALWAYS refuse the first time "
+            "and report that approval is needed: ask the user, and only "
+            "after they agree, repeat the same request with confirm=true. "
+            "Setting confirm=true up front does nothing — the refusal is "
+            "enforced by the tool, not by you."
+        ),
+        required_params=("action",),
+        optional_params=(
+            "operation",
+            "target",
+            "name",
+            "pid",
+            "scope",
+            "limit",
+            "confirm",
+        ),
+        # NOTE: deliberately not `requires_confirmation=True`. That flag
+        # blocks a task wholesale in tasks/executor.py, which would take
+        # "what's my disk usage" down with "reboot". The confirmation gate
+        # lives per-action inside actions/system_tool.py instead.
+        param_types={
+            "action": str,
+            "operation": str,
+            "target": str,
+            "name": str,
+            "pid": int,
+            "scope": str,
+            "limit": int,
+            "confirm": bool,
+        },
     ),
     "system_monitor": TaskSpec(
         name="system_monitor",

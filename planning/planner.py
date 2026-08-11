@@ -1,8 +1,15 @@
-"""Planner — convert a user request into an :class:`ExecutionPlan`.
+"""Planner — the Task LLM. Converts a delegated task into an :class:`ExecutionPlan`.
 
-The Planner subscribes to :class:`IntentIdentified` and, when the intent
-is a task (or potentially multi-task), asks the LLM to decompose it
-into atomic tool tasks. Each task is validated against
+The Planner is a **subordinate executor**. It subscribes to
+:class:`TaskRequested` — the explicit delegation emitted by the
+Conversation LLM (``reasoning/coordinator.py``) — and never to raw user
+input. It therefore never decides *whether* something is a task; that
+decision belongs to the Conversation LLM alone. Its job starts once the
+work has already been decided, and is limited to: pick the tool(s),
+order them, get them run, report back.
+
+It asks the LLM to decompose the delegated instruction into atomic tool
+tasks. Each task is validated against
 :data:`tasks.registry.TASK_REGISTRY`, references are resolved, and the
 plan is emitted as a :class:`PlanCreated` event for the Scheduler.
 
@@ -10,6 +17,12 @@ The Planner is **only** a strategist. It never runs tools itself. On
 permanent task failure the Scheduler emits
 :class:`PlanReplanRequested`; the Planner's :meth:`replan` rebuilds a
 new plan starting from the remaining work.
+
+When the plan reaches a terminal state the Planner correlates the
+:class:`PlanCompleted` back to the originating :class:`TaskRequested`
+and emits a :class:`TaskResultReady` — structured execution data, never
+a user-facing sentence. Phrasing the outcome (including failures) is the
+Conversation LLM's job.
 """
 
 from __future__ import annotations
@@ -22,14 +35,15 @@ from typing import Any
 
 from core.bus import EventBus
 from core.events import (
-    Intent,
-    IntentIdentified,
+    PlanCompleted,
     PlanCreated,
     PlanReplanRequested,
-    ResponseReady,
+    TaskRequested,
+    TaskResultReady,
 )
 from memory.manager import MemoryManager
 from memory.token_log import TokenLog
+from nlu.classifier import classify_tool_request
 from planning.models import (
     ExecutionPlan,
     PlannedTask,
@@ -93,11 +107,36 @@ def _looks_multistep(text: str) -> bool:
     return False
 
 
-def _strip_session_default(intent: IntentIdentified) -> str:
-    """The IntentIdentified.session_id is set by the bridge; if the
+def _strip_session_default(request: TaskRequested) -> str:
+    """The TaskRequested.session_id is set by the Conversation LLM; if the
     planner is invoked directly (e.g. from tests), fall back to
     'default'."""
-    return intent.session_id or "default"
+    return request.session_id or "default"
+
+
+def _format_delegation_context(request: TaskRequested) -> str:
+    """Render the delegation's extra fields for the decomposition prompt.
+
+    Everything here is a hint from the Conversation LLM — the expected
+    shape of the answer, parameters it already resolved, and what any
+    conversational reference pointed at. The instruction itself is passed
+    separately as the user request.
+    """
+    lines: list[str] = []
+    if request.task_type:
+        lines.append(f"- suggested tool: {request.task_type}")
+    if request.parameters:
+        lines.append(f"- known parameters: {json.dumps(request.parameters)}")
+    if request.expected_result:
+        lines.append(f"- expected result: {request.expected_result}")
+    if request.context:
+        lines.append(f"- resolved references: {json.dumps(request.context)}")
+    if not lines:
+        return ""
+    return (
+        "Delegated task details (the suggested tool is a hint, not an "
+        "instruction — use the catalog):\n" + "\n".join(lines)
+    )
 
 
 def _plan_to_dict(plan: ExecutionPlan) -> dict[str, Any]:
@@ -124,68 +163,104 @@ def _plan_to_dict(plan: ExecutionPlan) -> dict[str, Any]:
     }
 
 
-def _build_single_task_plan(
-    intent: IntentIdentified,
+def _one_task_plan(
+    tool: str,
+    params: dict[str, Any],
+    instruction: str,
     session_id: str,
-) -> ExecutionPlan | None:
-    """Fast path: when NLU already produced a concrete tool decision
-    **and** the raw request looks like a single atomic action, skip
-    the LLM and build a one-task plan directly.
+) -> ExecutionPlan:
+    """Wrap a single validated tool call in a one-task plan.
 
-    The plan is functionally identical to what the old
-    ``ReasoningCoordinator`` did, but it goes through the same
-    Scheduler so retries, replan, and parallel execution still work.
-
-    If the raw input contains conjunctions ("open firefox **and**
-    create a folder") or enumerations, we deliberately refuse the
-    fast path: NLU's regex often latches onto the first verb and
-    silently drops the rest. The Planner's LLM call is the only
-    thing that can decompose multi-step requests.
+    It still goes through the Scheduler, so retries, replan and the
+    normal completion path all behave identically to a decomposed plan.
     """
-    if not intent.requires_task:
-        return None
-    if not intent.task_type:
-        return None
-    if intent.task_type not in TASK_REGISTRY:
-        logger.warning(
-            "Fast-path: unknown task_type %s in intent; falling back to LLM",
-            intent.task_type,
-        )
-        return None
-
-    if _looks_multistep(intent.raw_input or ""):
-        logger.info(
-            "Fast-path skipped — request looks multi-step: %r",
-            intent.raw_input,
-        )
-        return None
-
-    # Strip our private keys out of the params before validation so we
-    # don't confuse the registry's type checker.
-    params = dict(intent.task_params or {})
-    ok, reason = validate_task(intent.task_type, params)
-    if not ok:
-        logger.warning("Fast-path validation failed: %s", reason)
-        return None
-
-    plan_id = f"plan-{uuid.uuid4().hex[:8]}"
-    task = PlannedTask(
-        id="t1",
-        description=f"{intent.task_type}({params})",
-        tool=intent.task_type,
-        arguments=params,
-        depends_on=(),
-        retryable=True,
-        max_retries=1,
-        status=TaskStatus.PENDING,
-    )
     return ExecutionPlan(
-        id=plan_id,
-        user_request=intent.raw_input,
-        tasks=[task],
+        id=f"plan-{uuid.uuid4().hex[:8]}",
+        user_request=instruction,
+        tasks=[
+            PlannedTask(
+                id="t1",
+                description=f"{tool}({params})",
+                tool=tool,
+                arguments=params,
+                depends_on=(),
+                retryable=True,
+                max_retries=1,
+                status=TaskStatus.PENDING,
+            )
+        ],
         session_id=session_id,
         status=PlanStatus.CREATED,
     )
+
+
+def _build_single_task_plan(
+    request: TaskRequested,
+    session_id: str,
+) -> ExecutionPlan | None:
+    """Fast path: build a one-task plan without an LLM call.
+
+    Two ways to hit it, in order of trust:
+
+    1. The Conversation LLM named a ``task_type`` that exists in the
+       registry and whose parameters validate.
+    2. The deterministic matcher in :mod:`nlu.classifier` recognises the
+       instruction ("open firefox", "what's the weather in London").
+
+    Note what neither of these does: decide whether the turn *is* a
+    task. That is settled before we get here — the delegation itself is
+    the decision. This is tool **selection** only, and it exists purely
+    to keep the common single-action case free of a second LLM call.
+
+    If the instruction contains conjunctions ("open firefox **and**
+    create a folder") or enumerations, we deliberately refuse the fast
+    path: the regex matcher latches onto the first verb and silently
+    drops the rest. The Planner's LLM call is the only thing that can
+    decompose multi-step requests.
+    """
+    instruction = (request.instruction or "").strip()
+
+    if _looks_multistep(instruction):
+        logger.info("Fast-path skipped — request looks multi-step: %r", instruction)
+        return None
+
+    # 1. Trust the Conversation LLM's tool hint when it holds up.
+    task_type = (request.task_type or "").strip()
+    if task_type:
+        if task_type not in TASK_REGISTRY:
+            logger.info(
+                "Delegated task_type %r is not in the registry — decomposing instead",
+                task_type,
+            )
+        else:
+            params = dict(request.parameters or {})
+            ok, reason = validate_task(task_type, params)
+            if ok:
+                return _one_task_plan(task_type, params, instruction, session_id)
+            logger.info(
+                "Delegated parameters for %s failed validation (%s) — "
+                "falling through to tool selection",
+                task_type,
+                reason,
+            )
+
+    # 2. Deterministic matcher on the (already self-contained) instruction.
+    if instruction:
+        decision = classify_tool_request(instruction)
+        if decision is not None:
+            params = dict(decision.parameters)
+            ok, _ = validate_task(decision.task_name, params)
+            if ok:
+                logger.info(
+                    "Matched delegated instruction to %s%s (no LLM call)",
+                    decision.task_name,
+                    f" params={params}" if params else "",
+                )
+                return _one_task_plan(
+                    decision.task_name, params, instruction, session_id
+                )
+
+    return None
 
 
 # ── Planner ───────────────────────────────────────────────────────────
@@ -208,49 +283,134 @@ class Planner:
         self._max_tasks = max_tasks_per_plan
         self._token_log = token_log
         self._resolver = ReferenceResolver()
+        # plan_id -> the TaskRequested that produced it. This is what lets
+        # a PlanCompleted find its way back to the Conversation LLM as a
+        # TaskResultReady. A replan re-registers the same request under
+        # the new plan id.
+        self._delegations: dict[str, TaskRequested] = {}
+        # Plans whose replan is being built. Their completion is held back
+        # until we know whether a replacement plan exists, so one
+        # delegation never produces two results (and the user never hears
+        # two answers for one request).
+        self._replanning: set[str] = set()
+        self._deferred_completions: dict[str, PlanCompleted] = {}
 
     # ── registration ──────────────────────────────────────────────
 
     def register(self) -> None:
-        self._bus.subscribe(IntentIdentified, self.on_intent)
+        """Subscribe the Task LLM to delegations — and nothing else.
+
+        Deliberately absent: any subscription to ``TextInputReceived``,
+        ``TranscriptReady`` or ``IntentIdentified``. Raw user input must
+        reach the Conversation LLM only; this layer acts on explicit
+        :class:`TaskRequested` events.
+        """
+        self._bus.subscribe(TaskRequested, self.on_task_requested)
         self._bus.subscribe(PlanReplanRequested, self.on_replan_requested)
+        self._bus.subscribe(PlanCompleted, self.on_plan_completed)
 
     # ── public handlers ───────────────────────────────────────────
 
-    async def on_intent(self, event: IntentIdentified) -> None:
-        """Handle an intent that may require one or more tool tasks."""
-        # Conversational / query intents don't need planning — leave
-        # them for the existing ReasoningCoordinator. (The coordinator
-        # is still subscribed and will emit ResponseReady for these.)
-        if event.intent in (Intent.CONVERSATIONAL, Intent.QUERY):
-            return
-        if not event.requires_task:
-            return
-
+    async def on_task_requested(self, event: TaskRequested) -> None:
+        """Plan and dispatch one task delegated by the Conversation LLM."""
         session_id = _strip_session_default(event)
-        plan = await self.plan_from_intent(event, session_id)
+        logger.info(
+            "Task delegated | task_id=%s type=%s | %r",
+            event.task_id,
+            event.task_type or "(unspecified)",
+            event.instruction,
+        )
+
+        plan = await self.plan_from_request(event, session_id)
         if plan is None:
-            # Fallback: just route the single task through the existing
-            # TaskExecutionRequested path by emitting a "raw" intent the
-            # coordinator already understands. To keep things simple we
-            # emit a ResponseReady with a clarification message.
-            self._bus.emit(
-                ResponseReady(
-                    text=(
-                        "I couldn't break that request down into steps. "
-                        "Could you rephrase it?"
-                    ),
-                    session_id=session_id,
-                )
+            # Report the failure as data. Explaining it to the user is
+            # the Conversation LLM's call, not ours.
+            self._emit_result(
+                event,
+                status="failed",
+                results=[],
+                error="could not decompose the instruction into known tools",
+                session_id=session_id,
             )
             return
 
         # Apply reference resolution pass.
         self._apply_references(plan)
 
+        self._delegations[plan.id] = event
         self._bus.emit(
             PlanCreated(
                 plan=_plan_to_dict(plan),
+                session_id=session_id,
+            )
+        )
+
+    async def on_plan_completed(self, event: PlanCompleted) -> None:
+        """Return the finished plan to the Conversation LLM as a Task Result.
+
+        Plans this Planner did not create (none exist today, but the bus
+        is open) are ignored rather than answered for. A plan that is
+        being replanned right now is held: reporting it *and* its
+        replacement would answer one request twice.
+        """
+        if event.plan_id in self._replanning:
+            self._deferred_completions[event.plan_id] = event
+            logger.debug(
+                "Holding completion of plan %s while its replan is decided",
+                event.plan_id,
+            )
+            return
+        self._report_completion(event)
+
+    def _report_completion(self, event: PlanCompleted) -> None:
+        request = self._delegations.pop(event.plan_id, None)
+        if request is None:
+            logger.debug(
+                "PlanCompleted for %s has no delegation on record — ignoring",
+                event.plan_id,
+            )
+            return
+
+        error = "" if event.status == "completed" else (event.summary or "").strip()
+        self._emit_result(
+            request,
+            status=event.status,
+            results=list(event.task_results or []),
+            error=error,
+            session_id=event.session_id or request.session_id,
+        )
+
+    def _flush_deferred_completion(self, plan_id: str) -> None:
+        """Report a completion that was held while a replan was decided."""
+        held = self._deferred_completions.pop(plan_id, None)
+        if held is not None:
+            self._report_completion(held)
+
+    def _emit_result(
+        self,
+        request: TaskRequested,
+        status: str,
+        results: list[dict[str, Any]],
+        error: str,
+        session_id: str,
+    ) -> None:
+        """Emit the structured Task Result. Execution data only — no prose."""
+        logger.info(
+            "Task result | task_id=%s status=%s tools=%d%s",
+            request.task_id,
+            status,
+            len(results),
+            f" error={error!r}" if error else "",
+        )
+        self._bus.emit(
+            TaskResultReady(
+                task_id=request.task_id,
+                status=status,
+                results=results,
+                error=error,
+                task_type=request.task_type,
+                instruction=request.instruction,
+                user_request=request.user_request,
                 session_id=session_id,
             )
         )
@@ -270,24 +430,47 @@ class Planner:
             f"Original user request: {event.remaining_tasks[0].get('user_request', '') if event.remaining_tasks else ''}\n\n"
             f"Failed task context: {json.dumps(failed_task)}"
         )
-        new_plan = await self._ask_llm_for_plan(
-            user_request=(
-                event.remaining_tasks[0].get("user_request", "")
-                if event.remaining_tasks
-                else ""
-            ),
-            extra_context=(
-                f"Previously failed task: {event.failed_task_id} ({event.reason}). "
-                "Skip it and continue with the rest of the request."
-            ),
+        # The delegation (if this plan came from one) knows the original
+        # instruction, which is better replan material than the sparse
+        # remaining-task payload.
+        request = self._delegations.get(event.plan_id)
+        user_request = (
+            event.remaining_tasks[0].get("user_request", "")
+            if event.remaining_tasks
+            else ""
         )
+        if not user_request and request is not None:
+            user_request = request.instruction
+
+        if request is not None:
+            self._replanning.add(event.plan_id)
+        try:
+            new_plan = await self._ask_llm_for_plan(
+                user_request=user_request,
+                extra_context=(
+                    f"Previously failed task: {event.failed_task_id} ({event.reason}). "
+                    "Skip it and continue with the rest of the request."
+                ),
+            )
+        finally:
+            self._replanning.discard(event.plan_id)
+
         if new_plan is None:
             logger.warning(
                 "Replan for plan %s produced no plan; giving up.",
                 event.plan_id,
             )
+            # Nothing replaces it, so the original outcome is the answer.
+            self._flush_deferred_completion(event.plan_id)
             return
         self._apply_references(new_plan)
+        if request is not None:
+            # The retry now owns the delegation. The original plan's
+            # completion — already in hand or still to arrive — is
+            # superseded and must stay silent, or the user gets told twice.
+            self._delegations.pop(event.plan_id, None)
+            self._deferred_completions.pop(event.plan_id, None)
+            self._delegations[new_plan.id] = request
         self._bus.emit(
             PlanCreated(
                 plan=_plan_to_dict(new_plan),
@@ -297,19 +480,22 @@ class Planner:
 
     # ── public helpers (also used by tests) ───────────────────────
 
-    async def plan_from_intent(
-        self, event: IntentIdentified, session_id: str
+    async def plan_from_request(
+        self, request: TaskRequested, session_id: str
     ) -> ExecutionPlan | None:
-        """Build an ExecutionPlan for an IntentIdentified event."""
-        # Fast path: single task the NLU already nailed.
-        fast = _build_single_task_plan(event, session_id)
+        """Build an ExecutionPlan for a delegated :class:`TaskRequested`."""
+        # Fast path: a single atomic action we can map without an LLM.
+        fast = _build_single_task_plan(request, session_id)
         if fast is not None:
             return fast
 
-        # Slow path: ask the LLM to decompose.
-        context = await self._gather_context(event.raw_input, session_id)
+        # Slow path: ask the LLM to decompose the instruction.
+        context = await self._gather_context(request.instruction, session_id)
+        delegation = _format_delegation_context(request)
+        if delegation:
+            context = f"{context}\n\n{delegation}" if context else delegation
         return await self._ask_llm_for_plan(
-            user_request=event.raw_input,
+            user_request=request.instruction,
             extra_context=context,
             session_id=session_id,
         )

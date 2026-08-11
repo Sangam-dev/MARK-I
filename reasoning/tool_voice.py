@@ -329,12 +329,14 @@ TOOL_VOICE: dict[str, ToolVoice] = {
     "cancel_alarms": _passthrough,
     "get_weather": _voice_weather,
     "file_operation": _voice_file_operation,
-    "sleep": _passthrough,
-    "shutdown": _passthrough,
-    "restart": _passthrough,
+    # No sleep/shutdown/restart voices — those tasks no longer exist.
     "execute_protocol": _passthrough,
     "desktop_control": _voice_desktop_control,
     "system_monitor": _passthrough,
+    # SystemTool already returns spoken-shape text ("Wi-Fi turned off.",
+    # "CPU at 42%, 287 processes."), and its listings are multi-line —
+    # the default colon-rewrite would mangle those into one blob.
+    "system": _passthrough,
     "web_search": _voice_web_search,
 }
 

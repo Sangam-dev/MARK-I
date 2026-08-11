@@ -5,7 +5,6 @@ from dataclasses import dataclass
 
 from .alarms import cancel_alarms, list_alarms, set_alarm
 from .apps import open_app
-from .power import restart, shutdown, sleep
 from .weather import get_weather
 
 
@@ -74,49 +73,25 @@ def handle_device_command(user_input: str) -> DeviceCommandResult:
         return DeviceCommandResult(True, result.message)
 
     if text in {
-        "sleep now",
-        "suspend now",
-        "go to sleep",
-        "put pc to sleep",
-        "put my pc to sleep",
-        "put computer to sleep",
-        "put my computer to sleep",
-        "put this device to sleep",
-        "sleep the computer now",
-    }:
-        result = sleep()
-        return DeviceCommandResult(True, result.message)
-
-    if text in {
+        "shutdown",
+        "shut down",
         "shut down now",
-        "shut down the computer now",
-        "shut down my computer now",
-        "shut down this device",
-        "turn off now",
-        "turn off the computer now",
-        "turn off my computer",
-        "power off now",
-        "power off this device",
-    }:
-        result = shutdown()
-        return DeviceCommandResult(True, result.message)
-
-    if text in {
-        "restart the computer now",
-        "restart my computer now",
-        "restart this device now",
+        "restart",
+        "restart now",
+        "reboot",
         "reboot now",
-        "reboot the computer now",
-        "reboot my device",
-        "reboot this device now",
+        "sleep",
+        "sleep now",
+        "suspend",
+        "power off",
+        "turn off my computer",
     }:
-        result = restart()
-        return DeviceCommandResult(True, result.message)
-
-    if text in {"shutdown", "shut down", "restart", "reboot", "sleep", "suspend", "power off"}:
+        # Power-state control was removed from the assistant. This branch
+        # answers instead of acting — the sleep()/shutdown()/restart()
+        # calls that used to live here are gone, along with actions/power.py.
         return DeviceCommandResult(
             True,
-            "For power actions, say the full command with now, like shutdown now or restart now.",
+            "I can't change this machine's power state.",
         )
 
     return DeviceCommandResult(False)

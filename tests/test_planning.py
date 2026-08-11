@@ -1,8 +1,9 @@
 """Integration tests for the Planner/Scheduler/Executor subsystem.
 
 These tests use a mocked GeminiClient to produce deterministic plans
-and verify the full event flow from IntentIdentified -> PlanCreated ->
-TaskStarted -> TaskCompleted -> PlanCompleted.
+and verify the full event flow from TaskRequested (the Conversation LLM's
+delegation) -> PlanCreated -> TaskStarted -> TaskCompleted -> PlanCompleted
+-> TaskResultReady.
 
 Run with::
 
@@ -18,13 +19,13 @@ from typing import Any
 
 from core.bus import EventBus
 from core.events import (
-    Intent,
-    IntentIdentified,
     PlanCompleted,
     PlanCreated,
     ResponseReady,
     TaskCompleted,
     TaskExecutionRequested,
+    TaskRequested,
+    TaskResultReady,
 )
 from memory.token_log import TokenLog
 from planning.executor import PlanExecutor
@@ -201,14 +202,13 @@ async def test_plan_decomposition_single_task() -> None:
     scheduler.executor.register()
 
     # Trigger the planner
-    intent = IntentIdentified(
-        intent=Intent.TASK,
-        raw_input="open firefox",
-        requires_task=True,
+    request = TaskRequested(
+        task_id="task-1",
+        instruction="open firefox",
         task_type="open_app",
-        task_params={"app_name": "firefox"},
+        parameters={"app_name": "firefox"},
     )
-    await planner.on_intent(intent)
+    await planner.on_task_requested(request)
 
     await asyncio.sleep(0.1)  # let events propagate
     await bus.drain()
@@ -271,11 +271,10 @@ async def test_plan_decomposition_multi_task() -> None:
     scheduler.register()
     scheduler.executor.register()
 
-    await planner.on_intent(
-        IntentIdentified(
-            intent=Intent.TASK,
-            raw_input="Create Test folder, add README.md, and open it",
-            requires_task=True,
+    await planner.on_task_requested(
+        TaskRequested(
+            task_id="task-1",
+            instruction="Create Test folder, add README.md, and open it",
         )
     )
 
@@ -352,11 +351,10 @@ async def test_parallel_tasks_run_concurrently() -> None:
     scheduler.register()
     scheduler.executor.register()
 
-    await planner.on_intent(
-        IntentIdentified(
-            intent=Intent.TASK,
-            raw_input="do two things at once",
-            requires_task=True,
+    await planner.on_task_requested(
+        TaskRequested(
+            task_id="task-1",
+            instruction="do two things at once",
         )
     )
 
@@ -406,11 +404,10 @@ async def test_reference_resolution() -> None:
     scheduler.register()
     scheduler.executor.register()
 
-    await planner.on_intent(
-        IntentIdentified(
-            intent=Intent.TASK,
-            raw_input="Create folder Test and open it",
-            requires_task=True,
+    await planner.on_task_requested(
+        TaskRequested(
+            task_id="task-1",
+            instruction="Create folder Test and open it",
         )
     )
 
@@ -431,7 +428,7 @@ async def test_reference_resolution() -> None:
 
 
 async def test_fast_path_single_task() -> None:
-    """When NLU has a concrete task_type, skip the LLM."""
+    """When the delegation names a concrete task_type, skip the LLM."""
     bus = EventBus()
     memory = MockMemory()
 
@@ -442,20 +439,19 @@ async def test_fast_path_single_task() -> None:
 
     bus.subscribe(PlanCreated, _on_plan_created)
 
-    # The fast path uses NLU's precomputed task_type
+    # The fast path uses the delegated task_type
     llm = MockGeminiClient(plan_json={})  # should not be called
 
     planner = Planner(bus=bus, llm=llm, memory=memory)
     planner.register()
 
-    # Direct intent with task_type already resolved
-    await planner.on_intent(
-        IntentIdentified(
-            intent=Intent.TASK,
-            raw_input="open firefox",
-            requires_task=True,
+    # Delegation with task_type already resolved
+    await planner.on_task_requested(
+        TaskRequested(
+            task_id="task-1",
+            instruction="open firefox",
             task_type="open_app",
-            task_params={"app_name": "firefox"},
+            parameters={"app_name": "firefox"},
         )
     )
 
@@ -487,13 +483,12 @@ async def test_single_tool_with_conjunction_uses_fast_path() -> None:
     planner = Planner(bus=bus, llm=llm, memory=memory)
     planner.register()
 
-    await planner.on_intent(
-        IntentIdentified(
-            intent=Intent.TASK,
-            raw_input="open firefox and run it",
-            requires_task=True,
+    await planner.on_task_requested(
+        TaskRequested(
+            task_id="task-1",
+            instruction="open firefox and run it",
             task_type="open_app",
-            task_params={"app_name": "firefox"},
+            parameters={"app_name": "firefox"},
         )
     )
 
@@ -511,7 +506,7 @@ async def test_single_tool_with_conjunction_uses_fast_path() -> None:
 
 async def test_multistep_request_bypasses_fast_path() -> None:
     """A request with multiple actions (e.g. "open X and create Y")
-    must skip the NLU-driven fast path and reach the Planner LLM,
+    must skip the single-task fast path and reach the Planner LLM,
     so the second action isn't silently dropped."""
     bus = EventBus()
     llm = MockGeminiClient(
@@ -549,15 +544,14 @@ async def test_multistep_request_bypasses_fast_path() -> None:
     planner = Planner(bus=bus, llm=llm, memory=memory)
     planner.register()
 
-    # Simulate what NLU emits after its regex fast path: it collapses
-    # the multi-step input into a single (garbled) open_app task.
-    await planner.on_intent(
-        IntentIdentified(
-            intent=Intent.TASK,
-            raw_input="open firefox and create a folder called test",
-            requires_task=True,
+    # Simulate a delegation whose tool hint collapsed a multi-step
+    # instruction into a single (garbled) open_app task.
+    await planner.on_task_requested(
+        TaskRequested(
+            task_id="task-1",
+            instruction="open firefox and create a folder called test",
             task_type="open_app",
-            task_params={"app_name": "firefox and create a folder called test"},
+            parameters={"app_name": "firefox and create a folder called test"},
         )
     )
 
@@ -603,11 +597,10 @@ async def test_task_validation_unknown_tool() -> None:
     planner = Planner(bus=bus, llm=llm, memory=memory)
     planner.register()
 
-    await planner.on_intent(
-        IntentIdentified(
-            intent=Intent.TASK,
-            raw_input="do something",
-            requires_task=True,
+    await planner.on_task_requested(
+        TaskRequested(
+            task_id="task-1",
+            instruction="do something",
         )
     )
 
@@ -654,11 +647,10 @@ async def test_dependency_cycle_detection() -> None:
     planner = Planner(bus=bus, llm=llm, memory=memory)
     planner.register()
 
-    await planner.on_intent(
-        IntentIdentified(
-            intent=Intent.TASK,
-            raw_input="cycle test",
-            requires_task=True,
+    await planner.on_task_requested(
+        TaskRequested(
+            task_id="task-1",
+            instruction="cycle test",
         )
     )
 
@@ -684,11 +676,11 @@ async def test_natural_summary_carries_tool_result() -> None:
     llm = MockGeminiClient()
     memory = MockMemory()
 
-    plan_completed: list[PlanCompleted] = []
+    task_results: list[TaskResultReady] = []
     responses: list[ResponseReady] = []
 
-    async def _on_plan_completed(e: PlanCompleted) -> None:
-        plan_completed.append(e)
+    async def _on_task_result(e: TaskResultReady) -> None:
+        task_results.append(e)
 
     async def _on_response(e: ResponseReady) -> None:
         responses.append(e)
@@ -704,7 +696,7 @@ async def test_natural_summary_carries_tool_result() -> None:
         )
 
     bus.subscribe(TaskExecutionRequested, _on_task_exec)
-    bus.subscribe(PlanCompleted, _on_plan_completed)
+    bus.subscribe(TaskResultReady, _on_task_result)
     bus.subscribe(ResponseReady, _on_response)
 
     coordinator = ReasoningCoordinator(bus=bus, gemini_client=llm, memory_manager=memory)
@@ -714,17 +706,17 @@ async def test_natural_summary_carries_tool_result() -> None:
     scheduler.executor.register()
 
     bus.emit(
-        PlanCompleted(
-            plan_id="plan-test",
+        TaskResultReady(
+            task_id="task-test",
             status="completed",
-            summary="It's 18°C and clear in London.",
-            task_results=[
+            results=[
                 {
                     "tool": "get_weather",
                     "result": "It's 18°C and clear in London.",
                     "arguments": {"city": "London"},
                 }
             ],
+            instruction="Get the current weather in London.",
             user_request="what's the weather in London?",
             session_id="default",
         )
@@ -733,7 +725,7 @@ async def test_natural_summary_carries_tool_result() -> None:
     await asyncio.sleep(0.2)
     await bus.drain()
 
-    assert len(plan_completed) == 1, plan_completed
+    assert len(task_results) == 1, task_results
     assert len(responses) == 1, responses
     text = responses[0].text
     assert "18" in text and "London" in text, text
@@ -760,11 +752,11 @@ async def test_natural_summary_cancelled_short_circuit() -> None:
     coordinator.register()
 
     bus.emit(
-        PlanCompleted(
-            plan_id="plan-test",
+        TaskResultReady(
+            task_id="task-test",
             status="cancelled",
-            summary="Cancelled",
-            task_results=[{"tool": "open_app", "result": "Opening firefox", "arguments": {}}],
+            results=[{"tool": "open_app", "result": "Opening firefox", "arguments": {}}],
+            instruction="Open Firefox.",
             user_request="open firefox",
             session_id="default",
         )
@@ -801,11 +793,10 @@ async def test_natural_summary_for_multitask_plan() -> None:
     coordinator.register()
 
     bus.emit(
-        PlanCompleted(
-            plan_id="plan-test",
+        TaskResultReady(
+            task_id="task-test",
             status="completed",
-            summary="Created folder: Test\nYou have 2 alarms set.",
-            task_results=[
+            results=[
                 {
                     "tool": "file_operation",
                     "result": "Created folder: Test",
@@ -822,6 +813,10 @@ async def test_natural_summary_for_multitask_plan() -> None:
                     "arguments": {"app_name": "files"},
                 },
             ],
+            instruction=(
+                "Create a folder called Test, list the alarms, and open the "
+                "file manager."
+            ),
             user_request="create a folder called Test, list my alarms, and open the file manager",
             session_id="default",
         )
@@ -867,13 +862,13 @@ async def test_token_log_records_llm_calls() -> None:
     coordinator.register()
 
     bus.emit(
-        PlanCompleted(
-            plan_id="plan-token-log",
+        TaskResultReady(
+            task_id="task-token-log",
             status="completed",
-            summary="Done",
-            task_results=[
+            results=[
                 {"tool": "get_weather", "result": "It is sunny.", "arguments": {"city": "London"}}
             ],
+            instruction="Get the current weather in London.",
             user_request="what's the weather in London?",
             session_id="default",
         )

@@ -199,6 +199,89 @@ class AssistantStateChanged(BaseEvent):
 
 
 @dataclass(frozen=True)
+class TaskRequested(BaseEvent):
+    """The **Task Request** — the Conversation LLM delegating to the Task LLM.
+
+    This is the ONLY way work reaches the Task LLM. Raw user input never
+    does: the Conversation LLM (``reasoning/coordinator.py``) decides
+    whether a task is needed, resolves conversational references
+    ("do it", "send that") against the session history, and emits this
+    event with a self-contained instruction.
+
+    Fields
+    ------
+    task_id:
+        Correlation id. Echoed back on :class:`TaskResultReady`.
+    task_type:
+        Optional tool hint from ``tasks.registry.TASK_REGISTRY``. The
+        Task LLM validates it and is free to override — it owns *how* to
+        execute, the Conversation LLM owns *whether* and *what*.
+    instruction:
+        Imperative, self-contained description of the work. Must never
+        contain unresolved references ("it", "that").
+    parameters:
+        Arguments the Conversation LLM already knows. Validated against
+        the registry; a bad set simply falls through to decomposition.
+    expected_result:
+        What the Conversation LLM expects back, in words. Passed to the
+        planner as context.
+    context:
+        Free-form resolution trace, e.g.
+        ``{"referenced_object": "previous_email"}``. Prompt context only.
+    follow_up:
+        When true the Conversation LLM wants to see the result and decide
+        the next action itself (task chaining across turns) rather than
+        just having it phrased for the user.
+    user_request:
+        The raw user text that triggered the delegation. Logging and
+        naturalisation context only — the Task LLM must plan from
+        ``instruction``.
+
+    emitted by: reasoning/coordinator.py (Conversation LLM)
+    consumed by: planning/planner.py (Task LLM)
+    """
+
+    task_id: str = ""
+    task_type: str = ""
+    instruction: str = ""
+    parameters: dict[str, Any] = field(default_factory=dict)
+    expected_result: str = ""
+    context: dict[str, Any] = field(default_factory=dict)
+    follow_up: bool = False
+    user_request: str = ""
+
+
+@dataclass(frozen=True)
+class TaskResultReady(BaseEvent):
+    """The **Task Result** — the Task LLM reporting back to the Conversation LLM.
+
+    Execution data only. The Task LLM must never put a user-facing
+    sentence here; turning this into speech is the Conversation LLM's
+    job (see ``reasoning/coordinator.py:on_task_result``).
+
+    ``status`` is one of ``"completed" | "partial" | "failed" |
+    "cancelled"`` — the same vocabulary :class:`PlanCompleted` uses.
+
+    ``results`` carries the per-tool outcomes in
+    :class:`PlanCompleted.task_results` shape
+    (``{"tool", "result", "arguments"}``) so the existing
+    :func:`reasoning.naturalize.naturalize_plan_response` consumes it
+    unchanged.
+
+    emitted by: planning/planner.py (Task LLM)
+    consumed by: reasoning/coordinator.py (Conversation LLM)
+    """
+
+    task_id: str = ""
+    status: str = "completed"
+    results: list[dict[str, Any]] = field(default_factory=list)
+    error: str = ""
+    task_type: str = ""
+    instruction: str = ""
+    user_request: str = ""
+
+
+@dataclass(frozen=True)
 class TaskExecutionRequested(BaseEvent):
     """
     Event triggered when a task execution is requested.

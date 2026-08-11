@@ -25,14 +25,17 @@ Full event pipeline::
     [Voice]  MicrophoneListener → TranscriptReady  ┐
     [Text]   TextInputHandler   → TextInputReceived ┘
                                         ↓
-                    NLUClassifier → IntentIdentified
+                      ReasoningCoordinator          (Conversation LLM)
+                        ├── Chat  → ResponseReady
+                        └── Work  → TaskRequested
                                         ↓
-                     Intent → ReasoningRequested
+                                     Planner        (Task LLM)
                                         ↓
-                      ReasoningCoordinator
-                        ├── Task  → TaskExecutionRequested → TaskExecutor
-                        │              → TaskCompleted → LLM → ResponseReady
-                        └── Chat  → LLM → ResponseReady
+                            PlanScheduler → TaskExecutor → tools
+                                        ↓
+                                  TaskResultReady
+                                        ↓
+                      ReasoningCoordinator → ResponseReady
                                         ↓
                        TTSHandler (speaks) + ResponseFormatter (prints)
 """
@@ -172,9 +175,11 @@ async def _run(args: argparse.Namespace) -> None:
     key_count = len(pipeline.llm.pool._entries) if pipeline.llm.pool else 0
     logger.info("GeminiClient initialised  (%d API key(s) in pool)", key_count)
     logger.info("Memory initialised  (structured facts=SQLite, vector/RAG=disabled)")
-    logger.info("NLUClassifier registered  (regex fast-path + LLM fallback)")
-    logger.info("Reasoning bridge registered  (facts only, RAG disabled)")
-    logger.info("ReasoningCoordinator registered")
+    logger.info(
+        "ReasoningCoordinator registered  "
+        "(Conversation LLM — sole subscriber to user input)"
+    )
+    logger.info("Planner registered  (Task LLM — subscribes to TaskRequested only)")
     logger.info(
         "TaskExecutor registered  "
         "(tasks: open_app, set_alarm, list_alarms, cancel_alarms, "

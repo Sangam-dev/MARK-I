@@ -1,25 +1,66 @@
+"""The Conversation LLM — KANCHA's controller.
+
+Every user utterance enters here and nowhere else. This class decides
+whether a turn is ordinary conversation or needs real work done, and
+when it needs work done it delegates *explicitly* via
+:class:`~core.events.TaskRequested` to the Task LLM
+(:mod:`planning.planner`). The Task LLM never sees raw user input.
+
+    USER ─► ReasoningCoordinator ─┬─► ResponseReady            (talk)
+                                  └─► TaskRequested            (act)
+                                          │
+                                       Task LLM ─► tools ─► TaskResultReady
+                                          │
+                                  ReasoningCoordinator ─► ResponseReady
+
+Because this class owns the conversation, it — and only it — can
+resolve references like "do it", "send that", "use the second one".
+Resolution happens *before* delegation: the ``instruction`` carried by
+:class:`~core.events.TaskRequested` is always self-contained.
+
+Conversation history ownership
+--------------------------------
+The coordinator owns the short-term in-memory buffer directly.
+It adds user/assistant turns synchronously so the context is
+always up-to-date before the LLM call.  Durable memory (SQL facts
+and RAG entries) is carried inline by the primary Gemini response
+JSON envelope and persisted here via MemoryManager.save_sql /
+append_rag — there is no separate extraction step anymore.
+
+RAG ownership
+-------------
+This class is the **Conversation Manager** in the RAG architecture.
+It never touches the vector database: retrieval goes through
+:class:`~memory.rag.manager.RAGManager`, gated by a
+:class:`~memory.rag.router.MemoryRouter`. Conversely the RAG Manager
+never builds prompts — turning retrieved chunks into prompt text is
+:meth:`_format_rag_context`, and it lives here on purpose.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import logging
-import re
+import os
+import uuid
 from typing import Any
 
 from core.audio_state import audio_state
 from core.bus import EventBus
 from core.events import (
-    Intent,
     IntentIdentified,
     MemoryRetrieved,
     PartialResponse,
-    PlanCompleted,
-    ReasoningRequested,
     ResponseReady,
-    TaskCompleted,
+    TaskRequested,
+    TaskResultReady,
+    TextInputReceived,
+    TranscriptReady,
 )
 from memory.manager import MemoryManager
 from memory.rag import MemoryRouter, RAGManager, RetrievedChunk
 from memory.token_log import TokenLog
+from planning.prompts import format_tool_catalog
 from reasoning.llm_client import (
     GeminiClient,
     extract_streamed_message,
@@ -30,36 +71,133 @@ from reasoning.prompt_builder import JARVIS_PERSONA
 
 logger = logging.getLogger("kancha.reasoning.coordinator")
 
-_RETRY_RE = re.compile(
-    r"^\s*(?:redo(?: it)?|retry(?: it)?|try again|do it again|run it again|"
-    r"execute it again|again)\s*[.!?]*\s*$",
-    re.IGNORECASE,
-)
+
+# Marker prefix for the synthetic history turn that carries a task result
+# back into the conversation on the chaining path. It is explained to the
+# model in CONTROLLER_INSTRUCTIONS so it never mistakes one for the user
+# speaking.
+TASK_RESULT_TURN_PREFIX = "[task result]"
+
+# How many times one user turn may chain into another task before we stop
+# feeding results back to the controller. Chaining is a real requirement
+# ("find the email, then reply to it"), but a controller that keeps
+# setting follow_up would otherwise run tools in a loop with nobody
+# watching. Past the cap the result is simply reported to the user.
+MAX_TASK_CHAIN_DEPTH = 4
+
+# How long a delegated task may run before its acknowledgement ("Opening
+# Firefox…") is spoken. Under this, the user hears one response — the
+# outcome — instead of a confirmation followed by a near-identical
+# confirmation. Over it, the acknowledgement goes out so a slow tool
+# (a cold-start web search, a desktop automation) isn't dead air.
+#
+# 3s is chosen from measured round trips: weather, app launches, alarms
+# and file operations all land inside ~2.5s, so they answer once. Only
+# work that is genuinely going to keep the user waiting announces itself.
+#
+# Override with KANCHA_TASK_ACK_DELAY (seconds); 0 speaks it immediately,
+# which restores the always-two-responses behaviour.
+DEFAULT_TASK_ACK_DELAY_S = 3.0
+
+
+def _ack_delay_from_env() -> float:
+    raw = os.getenv("KANCHA_TASK_ACK_DELAY")
+    if not raw:
+        return DEFAULT_TASK_ACK_DELAY_S
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return DEFAULT_TASK_ACK_DELAY_S
+
+
+def _controller_instructions() -> str:
+    """Build the controller half of the system prompt.
+
+    Rendered from :data:`tasks.registry.TASK_REGISTRY` (via
+    :func:`planning.prompts.format_tool_catalog`) so the catalog the
+    Conversation LLM reasons about is exactly the one the Executor
+    enforces.
+    """
+    return f"""
+CRITICAL SYSTEM INSTRUCTION — you are the controller of this assistant.
+
+You decide, for every message, whether it is ordinary conversation or
+whether it needs real work done. Nothing else in the system makes that
+decision. When work is needed you delegate it by including a "task"
+object in your JSON response; an execution layer you cannot see picks it
+up, runs the tools, and reports back to you.
+
+# Work the execution layer can do
+
+{format_tool_catalog()}
+
+# When the request needs one of those
+
+1. Set "message" to a SHORT acknowledgement in the present continuous
+   tense — "Checking the weather in Kathmandu now.", "Opening Firefox…",
+   "Searching for that…". You are announcing that work has started.
+2. Include a "task" object describing the work.
+3. NEVER claim the work is done. No "Done.", "Completed.", "Message
+   sent.", "Deleted.". You will be told the outcome afterwards and you
+   will report it then. Equally, never say you are unable to do these
+   things — you can, through the task layer.
+
+# When it does not
+
+Answer normally and omit "task" entirely. Greetings, opinions,
+explanations, questions about yourself, and anything you can answer from
+memory or the conversation are all ordinary conversation.
+
+# Resolving references — this is your job alone
+
+The execution layer never sees this conversation. It only sees the
+"instruction" string you write. So a message like "do it", "go ahead",
+"send it", "check that", "use the second one", "try again", "yes,
+proceed" or "cancel that" must be resolved by YOU, from the conversation
+above, into a complete instruction.
+
+    User: Should I send this email to Dr. Rana?
+    You:  The draft looks fine. I can send it whenever you like.
+    User: Yeah, do that.
+    task.instruction -> "Send the drafted email to Dr. Rana."
+    task.context     -> {{"referenced_object": "previous_email"}}
+
+If you genuinely cannot tell what "it" refers to, do NOT delegate — ask
+the user which one they mean and omit "task".
+
+# Writing the task object
+
+- "instruction": one imperative sentence, self-contained. No pronouns
+  referring to earlier turns, no "the one I mentioned".
+- "task_type": the catalog name you believe fits, or omit it if unsure —
+  the execution layer will choose and may override you.
+- "parameters": concrete values you already know (city, app name, path,
+  query). Omit what you do not know rather than inventing it.
+- "expected_result": what you expect to get back, in a few words.
+- "context": optional notes about what you resolved, e.g.
+  {{"referenced_object": "previous_email"}}.
+- "follow_up": true ONLY when you will need to look at the result and
+  decide a further action yourself — e.g. "find the latest email from my
+  professor and reply saying I'll attend", where the reply depends on
+  what the search returns. Leave it false when the result just needs to
+  be reported to the user.
+
+One "task" object per response. If a request needs several tool calls
+that you can specify up-front, describe them all in a single
+"instruction" — the execution layer decomposes and orders them itself.
+
+# Reading results back
+
+A turn beginning with "{TASK_RESULT_TURN_PREFIX}" is not the user
+speaking. It is the execution layer reporting to you. Turn it into a
+natural reply for the user, in your own voice, and — if the original
+request needs another step — delegate that next step with a new "task".
+Never read raw tool output or status codes aloud.
+"""
 
 
 class ReasoningCoordinator:
-    """
-    Orchestrates context retrieval, LLM prompt construction, tool dispatch,
-    and response generation — all through the EventBus.
-
-    Conversation history ownership
-    --------------------------------
-    The coordinator owns the short-term in-memory buffer directly.
-    It adds user/assistant turns synchronously so the context is
-    always up-to-date before the LLM call.  Durable memory (SQL facts
-    and RAG entries) is carried inline by the primary Gemini response
-    JSON envelope and persisted here via MemoryManager.save_sql /
-    append_rag — there is no separate extraction step anymore.
-
-    RAG ownership
-    -------------
-    This class is the **Conversation Manager** in the RAG architecture.
-    It never touches the vector database: retrieval goes through
-    :class:`~memory.rag.manager.RAGManager`, gated by a
-    :class:`~memory.rag.router.MemoryRouter`. Conversely the RAG Manager
-    never builds prompts — turning retrieved chunks into prompt text is
-    :meth:`_format_rag_context`, and it lives here on purpose.
-    """
+    """Conversation LLM: intent, reference resolution, delegation, response."""
 
     def __init__(
         self,
@@ -69,6 +207,7 @@ class ReasoningCoordinator:
         token_log: TokenLog | None = None,
         rag_manager: RAGManager | None = None,
         rag_router: MemoryRouter | None = None,
+        ack_delay_s: float | None = None,
     ) -> None:
         self.bus = bus
         self.gemini_client = gemini_client
@@ -79,19 +218,463 @@ class ReasoningCoordinator:
         # that case.
         self.rag_manager = rag_manager
         self.rag_router = rag_router
-        # Pending task turns keyed by session_id
-        self._pending_turns: dict[str, dict[str, Any]] = {}
-        self._last_tasks: dict[str, dict[str, Any]] = {}
-        # Sessions whose thinking gate is held and will be released by a
-        # terminal handler (on_task_completed or on_plan_completed)
-        # rather than by on_reasoning_requested itself. The conversational
-        # branch releases inline; the task/retry branches add here.
-        self._gated_session_ids: set[str] = set()
+        # task_id -> the TaskRequested we delegated. Popped when its
+        # result comes back; tells us whether the result should be
+        # chained (follow_up) or simply reported.
+        self._in_flight: dict[str, TaskRequested] = {}
+        # session_id -> a short record of the last delegation and how it
+        # turned out. Injected into the prompt so "try again" and
+        # "cancel that" resolve against something concrete.
+        self._last_task: dict[str, dict[str, Any]] = {}
+        # session_id -> how many tasks the current user turn has chained
+        # into. Reset on every new user utterance.
+        self._chain_depth: dict[str, int] = {}
+        # task_id -> the timer that will speak the withheld acknowledgement
+        # if the task is still running when it expires.
+        self._pending_acks: dict[str, asyncio.Task] = {}
+        self._ack_delay_s = (
+            _ack_delay_from_env() if ack_delay_s is None else max(0.0, ack_delay_s)
+        )
+        self._response_stream_finished = asyncio.Event()
+        self._response_stream_finished.set()
 
     def register(self) -> None:
-        self.bus.subscribe(ReasoningRequested, self.on_reasoning_requested)
-        self.bus.subscribe(TaskCompleted, self.on_task_completed)
-        self.bus.subscribe(PlanCompleted, self.on_plan_completed)
+        """Subscribe the controller to user input and to task results.
+
+        These are the only two inputs the system has. Note what is NOT
+        here: no ``IntentIdentified``, no ``ReasoningRequested``. User
+        input reaches exactly one LLM — this one.
+        """
+        self.bus.subscribe(TextInputReceived, self.on_user_input)
+        self.bus.subscribe(TranscriptReady, self.on_user_input)
+        self.bus.subscribe(TaskResultReady, self.on_task_result)
+
+    # ── Entry point: the user says something ──────────────────────────────────
+
+    async def on_user_input(self, event: TextInputReceived | TranscriptReady) -> None:
+        """Run one conversational turn, and delegate a task if one is needed."""
+        text = (getattr(event, "text", "") or "").strip()
+        if not text:
+            return
+
+        session_id = event.session_id
+
+        self._response_stream_finished.clear()
+        # A new utterance starts a fresh chain budget.
+        self._chain_depth[session_id] = 0
+
+        # Start thinking gate
+        audio_state.thinking_started()
+
+        try:
+            self.memory_manager.short_term.add("user", text)
+            payload = await self._run_conversation_turn(
+                session_id=session_id,
+                retrieval_query=text,
+            )
+        finally:
+            self._response_stream_finished.set()
+            audio_state.thinking_finished()
+
+        # Delegation happens after the acknowledgement is out of the door,
+        # so a long-running task never delays the immediate response.
+        self._maybe_delegate(payload, session_id=session_id, user_request=text)
+
+    # ── Entry point: the Task LLM reports back ────────────────────────────────
+
+    async def on_task_result(self, event: TaskResultReady) -> None:
+        """Turn a structured Task Result into the final user-facing response.
+
+        The Task LLM returns execution data only — status plus per-tool
+        output. Deciding what the user hears, including how a failure is
+        explained, happens here.
+        """
+        session_id = event.session_id
+        request = self._in_flight.pop(event.task_id, None) if event.task_id else None
+        if event.task_id:
+            # The outcome is here, so the "starting now" line is redundant.
+            self._cancel_ack(event.task_id)
+
+        record = self._last_task.get(session_id)
+        if record is not None and record.get("task_id") == event.task_id:
+            record["status"] = event.status
+            record["error"] = event.error
+
+        # The acknowledgement may still be streaming; never talk over it.
+        await self._response_stream_finished.wait()
+        audio_state.thinking_started()
+
+        try:
+            depth = self._chain_depth.get(session_id, 0)
+            if request is not None and request.follow_up:
+                if depth < MAX_TASK_CHAIN_DEPTH:
+                    # Chaining: hand the result back to the conversation
+                    # so the controller can decide the next action itself.
+                    self._chain_depth[session_id] = depth + 1
+                    await self._continue_after_result(event, request)
+                    return
+                logger.warning(
+                    "Task chain for session %s hit the depth cap (%d) — "
+                    "reporting the result instead of chaining again",
+                    session_id,
+                    MAX_TASK_CHAIN_DEPTH,
+                )
+
+            response_text = await naturalize_plan_response(
+                llm=self.gemini_client,
+                user_request=event.user_request or event.instruction,
+                task_results=list(event.results or []),
+                status=event.status,
+                token_log=self.token_log,
+            )
+
+            self.memory_manager.short_term.add("assistant", response_text)
+            self.bus.emit(ResponseReady(text=response_text, session_id=session_id))
+        finally:
+            audio_state.thinking_finished()
+
+    async def _continue_after_result(
+        self, event: TaskResultReady, request: TaskRequested
+    ) -> None:
+        """Chained turn: feed a task result back through the controller.
+
+        Used when the Conversation LLM flagged the delegation as
+        ``follow_up`` — i.e. it needs to *see* the outcome before it can
+        decide what to do next ("find the email, then reply to it").
+        The response it generates may carry another ``task``, which is
+        delegated exactly like a first-turn one.
+        """
+        self._response_stream_finished.clear()
+        try:
+            self.memory_manager.short_term.add(
+                "user", self._format_result_turn(event)
+            )
+            payload = await self._run_conversation_turn(
+                session_id=event.session_id,
+                retrieval_query=request.instruction or event.instruction,
+            )
+        finally:
+            self._response_stream_finished.set()
+
+        self._maybe_delegate(
+            payload,
+            session_id=event.session_id,
+            user_request=request.user_request or event.user_request,
+        )
+
+    def _format_result_turn(self, event: TaskResultReady) -> str:
+        """Render a Task Result as an internal history turn.
+
+        Prefixed with :data:`TASK_RESULT_TURN_PREFIX`, which
+        :func:`_controller_instructions` teaches the model to read as
+        "the execution layer is reporting", never as user speech.
+        """
+        lines = [f"{TASK_RESULT_TURN_PREFIX} status={event.status}"]
+        if event.instruction:
+            lines.append(f"requested: {event.instruction}")
+        for entry in event.results or []:
+            tool = str(entry.get("tool", "")).strip() or "tool"
+            output = str(entry.get("result", "")).strip()
+            if output:
+                lines.append(f"{tool}: {output}")
+        if event.error:
+            lines.append(f"error: {event.error}")
+        return "\n".join(lines)
+
+    # ── Delegation ────────────────────────────────────────────────────────────
+
+    def _maybe_delegate(
+        self, payload: dict[str, Any], session_id: str, user_request: str
+    ) -> bool:
+        """Emit :class:`TaskRequested` if the controller asked for work.
+
+        Returns True when a task was delegated. The Task LLM is only ever
+        reached through this method.
+        """
+        task = payload.get("task")
+        if not isinstance(task, dict):
+            return False
+
+        instruction = str(task.get("instruction") or "").strip()
+        task_type = str(task.get("task_type") or "").strip()
+        if not instruction and not task_type:
+            return False
+        if not instruction:
+            # A bare task_type is still actionable; the raw request is the
+            # best instruction we have for it.
+            instruction = user_request
+
+        parameters = task.get("parameters")
+        context = task.get("context")
+        request = TaskRequested(
+            task_id=f"task-{uuid.uuid4().hex[:8]}",
+            task_type=task_type,
+            instruction=instruction,
+            parameters=dict(parameters) if isinstance(parameters, dict) else {},
+            expected_result=str(task.get("expected_result") or "").strip(),
+            context=dict(context) if isinstance(context, dict) else {},
+            follow_up=bool(task.get("follow_up", False)),
+            user_request=user_request,
+            session_id=session_id,
+        )
+
+        self._in_flight[request.task_id] = request
+        self._last_task[session_id] = {
+            "task_id": request.task_id,
+            "task_type": request.task_type,
+            "instruction": request.instruction,
+            "status": "running",
+            "error": "",
+        }
+
+        logger.info(
+            "Delegating to the Task LLM | task_id=%s type=%s follow_up=%s | %r",
+            request.task_id,
+            request.task_type or "(unspecified)",
+            request.follow_up,
+            request.instruction,
+        )
+        self._schedule_ack(request, str(payload.get("_ack") or "").strip())
+        self.bus.emit(request)
+        return True
+
+    def _schedule_ack(self, request: TaskRequested, text: str) -> None:
+        """Speak the acknowledgement only if the task turns out to be slow.
+
+        "Opening Firefox…" followed a beat later by "Firefox is open, sir."
+        is two confirmations of one action. So a withheld acknowledgement
+        waits out :attr:`_ack_delay_s`: if the result lands first the user
+        hears the outcome alone, and if it doesn't, the acknowledgement
+        goes out so a long tool call isn't silence.
+        """
+        if not text:
+            return
+
+        if self._ack_delay_s <= 0:
+            self._emit_ack(request.session_id, text)
+            return
+
+        async def _wait_then_ack() -> None:
+            try:
+                await asyncio.sleep(self._ack_delay_s)
+            except asyncio.CancelledError:
+                return
+            # Re-check under no intervening await: on_task_result pops the
+            # request the moment the result arrives, so this is race-free.
+            if request.task_id not in self._in_flight:
+                return
+            self._pending_acks.pop(request.task_id, None)
+            logger.debug(
+                "Task %s still running after %.1fs — speaking the acknowledgement",
+                request.task_id,
+                self._ack_delay_s,
+            )
+            self._emit_ack(request.session_id, text)
+
+        self._pending_acks[request.task_id] = asyncio.create_task(
+            _wait_then_ack(), name=f"task_ack:{request.task_id}"
+        )
+
+    def _emit_ack(self, session_id: str, text: str) -> None:
+        self.bus.emit(PartialResponse(text="", done=True, session_id=session_id))
+        self.bus.emit(ResponseReady(text=text, session_id=session_id))
+
+    def _cancel_ack(self, task_id: str) -> None:
+        """Drop a withheld acknowledgement — its result got here first."""
+        pending = self._pending_acks.pop(task_id, None)
+        if pending is not None and not pending.done():
+            pending.cancel()
+
+    # ── Conversational turn ───────────────────────────────────────────────────
+
+    async def _run_conversation_turn(
+        self, session_id: str, retrieval_query: str
+    ) -> dict[str, Any]:
+        """Stream one controller response and return its parsed envelope.
+
+        The caller is responsible for having added the triggering turn to
+        short-term memory first. Emits ``PartialResponse`` while the text
+        streams and ``ResponseReady`` at the end, then returns the parsed
+        ``{message, task?, sql?, rag?}`` payload so the caller can act on
+        any delegation.
+
+        A turn that delegates is the exception: its message is only an
+        acknowledgement, so it is returned under ``_ack`` **unsent** and
+        :meth:`_schedule_ack` decides whether the user ever hears it.
+        """
+        # 1. Retrieve SQLite facts
+        facts = await self.memory_manager.get_all_facts()
+        memory_event = MemoryRetrieved(
+            session_id=session_id,
+            query=retrieval_query,
+            structured_context=facts,
+            episodic_context=[],
+        )
+
+        # 2. Retrieve RAG chunks
+        retrieved = await self._retrieve_rag_context(retrieval_query, intent_event=None)
+
+        # 3. Build the system prompt: persona + memory + controller rules
+        system = self._build_system_prompt(memory_event, retrieved, session_id)
+
+        # 4. Stream the reply (history already ends with the current turn)
+        history = self._get_history()
+
+        logger.debug(
+            "Calling Conversation LLM (streaming) | history_turns=%d | system_len=%d | rag_chunks=%d",
+            len(history),
+            len(system),
+            len(retrieved),
+        )
+
+        response_text, payload, streamed = await self._stream_once(
+            history=history,
+            system=system,
+            session_id=session_id,
+            call_site="conversational",
+        )
+
+        # If the stream returned nothing usable — first chunk won the race
+        # but no real text followed (Gemini occasionally streams just the
+        # opening JSON and then stalls), or the call raised before any
+        # chunk arrived — retry once before giving up. Without this, the
+        # mic opens into dead silence and the user sees the assistant
+        # "ignore" their question.
+        if not response_text:
+            logger.info("Empty LLM stream (session=%s); retrying once", session_id)
+            response_text, payload, streamed = await self._stream_once(
+                history=history,
+                system=system,
+                session_id=session_id,
+                call_site="conversational-retry",
+            )
+
+        # Last resort: surface a user-visible fallback so the mic doesn't
+        # open into dead silence. TTS will speak this short apology and
+        # the mic reopens for the user's next attempt.
+        if not response_text:
+            logger.error(
+                "LLM produced no usable text after retry (session=%s); surfacing fallback",
+                session_id,
+            )
+            response_text = (
+                "Sorry, sir — my response came back blank. Could you say that again?"
+            )
+
+        # 5. Add assistant turn to short_term SYNCHRONOUSLY
+        self.memory_manager.short_term.add("assistant", response_text)
+
+        # 6. Persist memory carried by the response envelope. `sql` lands
+        # in SQLite, `rag` in the vector store (+ the rag.txt audit log).
+        await self._persist_response_memory(payload, session_id=session_id)
+
+        # 7. Deliver — unless this turn is an acknowledgement of work that
+        # is about to start and nothing has been shown yet. In that case
+        # the text is handed to _schedule_ack, which speaks it only if the
+        # task outlives the grace period.
+        if payload.get("task") and not streamed:
+            payload["_ack"] = response_text
+            return payload
+
+        self.bus.emit(PartialResponse(text="", done=True, session_id=session_id))
+        self.bus.emit(ResponseReady(text=response_text, session_id=session_id))
+
+        return payload
+
+    async def _stream_once(
+        self,
+        history: list[dict[str, str]],
+        system: str,
+        session_id: str,
+        call_site: str,
+    ) -> tuple[str, dict[str, Any], bool]:
+        """Stream the JSON envelope once.
+
+        Returns ``(visible text, payload, streamed)`` where ``streamed``
+        says whether the text was forwarded to the user as it generated.
+
+        The envelope streams token-by-token. While it arrives we strip the
+        scaffolding and forward ONLY the visible ``message`` text as
+        ``PartialResponse`` events so the UI renders words as they
+        generate. The full buffer is parsed once at the end for the
+        authoritative message plus the ``task``/``sql``/``rag`` fields.
+
+        The exception is a turn that opens with a ``"task"`` key. That
+        message is an acknowledgement of work about to start, and we may
+        end up never showing it (see :meth:`_schedule_ack`) — so it is
+        held back rather than streamed. The format instructions require
+        ``task`` to come first precisely so this decision can be made
+        before the first visible character is committed to; if a model
+        ignores that and streams the message first, we simply stream it
+        and the acknowledgement is shown as usual.
+        """
+        raw_parts: list[str] = []
+        buffer = ""
+        prev_visible = ""
+        # None until the envelope reveals which key came first.
+        delegating: bool | None = None
+        try:
+            async for chunk in self.gemini_client.generate_with_history_stream(
+                history=history,
+                system=system,
+                hedge_width=1,
+                call_site=call_site,
+            ):
+                raw_parts.append(chunk)
+                buffer += chunk
+
+                if delegating is None:
+                    if '"message"' in buffer:
+                        delegating = False
+                    elif '"task"' in buffer:
+                        delegating = True
+
+                if delegating:
+                    continue
+
+                visible = extract_streamed_message(buffer)
+                if len(visible) > len(prev_visible):
+                    self.bus.emit(
+                        PartialResponse(
+                            text=visible[len(prev_visible) :],
+                            session_id=session_id,
+                        )
+                    )
+                    prev_visible = visible
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Streaming Conversation LLM call failed (session=%s): %s",
+                session_id,
+                exc,
+            )
+
+        raw_response = "".join(raw_parts)
+        payload = parse_memory_response(raw_response)
+        response_text = payload.get("message", "").strip()
+
+        # Decide if the parsed message is *actually* the message or a
+        # raw-text fallback that ``parse_memory_response`` substitutes
+        # when the JSON envelope is missing or broken. We treat the
+        # message as suspicious only if:
+        #   - it is empty
+        #   - OR it equals the raw text AND the raw text looks like a
+        #     partial/whole JSON envelope (``{...}`` shape), which means
+        #     parse_memory_response gave us back the literal JSON it
+        #     couldn't decode.
+        # We deliberately do NOT fall back when the raw text is plain
+        # English (e.g. the streaming LLM client yielded a single fallback
+        # chunk like "I'm having trouble thinking right now. Could you
+        # try again?" on an upstream exception).
+        raw_stripped = raw_response.strip()
+        looks_like_json = raw_stripped.startswith("{") and raw_stripped.endswith("}")
+        raw_text_fallback = response_text == raw_stripped and looks_like_json
+        # The third condition (`response_text.startswith("{")`) catches the
+        # case where the parse succeeded but returned a dict-as-message
+        # (which shouldn't happen but historically did on schema drift).
+        if not response_text or raw_text_fallback or response_text.startswith("{"):
+            response_text = prev_visible
+
+        return response_text, payload, bool(prev_visible)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -99,17 +682,22 @@ class ReasoningCoordinator:
         self,
         memory_event: MemoryRetrieved | None,
         retrieved: list[RetrievedChunk] | None = None,
+        session_id: str | None = None,
     ) -> str:
         """
-        Build the system prompt: persona + structured facts + retrieved memory.
+        Build the system prompt: persona + facts + memory + controller rules.
 
-        Three distinct layers, deliberately kept apart:
+        Layers, deliberately kept apart:
 
         * **persona** — who the assistant is.
         * **User facts** — structured key/value memory from SQLite.
         * **Relevant long-term memory** — semantic chunks from the vector
           store, present only when the Memory Router asked for retrieval
           and something scored above the similarity threshold.
+        * **Recent action** — what was last delegated and how it went, so
+          "try again" / "cancel that" resolve against something concrete.
+        * **Controller instructions** — the tool catalog and the rules for
+          delegating work.
 
         Conversation history is passed separately as a message list —
         it must NEVER appear here as "structured facts", which confuses
@@ -134,7 +722,39 @@ class ReasoningCoordinator:
         if rag_block:
             parts.append(rag_block)
 
+        action_block = self._format_last_task(session_id)
+        if action_block:
+            parts.append(action_block)
+
+        parts.append(_controller_instructions().strip())
+
         return "\n\n".join(parts)
+
+    def _format_last_task(self, session_id: str | None) -> str:
+        """Render the last delegation so follow-ups have something to bind to.
+
+        This is the state that makes "try again", "did that work?" and
+        "cancel that" resolvable *here* rather than by handing the Task
+        LLM the whole conversation and hoping.
+        """
+        if not session_id:
+            return ""
+        record = self._last_task.get(session_id)
+        if not record:
+            return ""
+        lines = [
+            "Most recent action you delegated (for resolving follow-ups "
+            "like \"try again\" or \"cancel that\"):",
+            f"- instruction: {record.get('instruction', '')}",
+            f"- status: {record.get('status', 'unknown')}",
+        ]
+        task_type = record.get("task_type")
+        if task_type:
+            lines.insert(1, f"- type: {task_type}")
+        error = record.get("error")
+        if error:
+            lines.append(f"- error: {error}")
+        return "\n".join(lines)
 
     def _format_rag_context(self, retrieved: list[RetrievedChunk] | None) -> str:
         """Render retrieved chunks into a prompt block.
@@ -295,355 +915,3 @@ class ReasoningCoordinator:
                 logger.info("Appended %d RAG entries to rag.txt (audit log)", appended)
         except Exception as exc:
             logger.warning("RAG audit append failed (non-fatal): %s", exc)
-
-    def _is_retry_request(self, user_input: str) -> bool:
-        return bool(_RETRY_RE.match(user_input))
-
-    def _format_task_response(self, event: TaskCompleted) -> str:
-        """Return a factual response based only on the executor result."""
-        details = (event.result if event.success else event.error).strip()
-        if event.success:
-            if details:
-                return details
-            return f"The '{event.task_name}' action completed successfully."
-
-        if details:
-            return f"I couldn't complete '{event.task_name}': {details}"
-        return f"I couldn't complete '{event.task_name}'."
-
-    # ── Main handler ──────────────────────────────────────────────────────────
-
-    async def on_reasoning_requested(self, event: ReasoningRequested) -> None:
-        # Defensive: if NLU was bypassed (e.g. direct bus.emit from a
-        # caller that didn't go through _process_text) and the gate is
-        # not yet held, claim it so the mic can't reopen mid-think.
-        gate_held = audio_state.thinking_active.is_set()
-        if not gate_held:
-            audio_state.thinking_started()
-
-        try:
-            return await self._handle_reasoning(event)
-        finally:
-            # The conversational branch emits ResponseReady itself, but
-            # the task/retry branches hand off and the response for
-            # those paths arrives later via on_task_completed /
-            # on_plan_completed. Releasing here would let the mic
-            # reopen during task/plan execution — wrong. Instead we
-            # release on every branch's *terminal* handler. So this
-            # block is intentionally empty unless an exception escaped.
-            if gate_held:
-                # We didn't claim it ourselves; don't release it.
-                pass
-
-    async def _handle_reasoning(self, event: ReasoningRequested) -> None:
-        session_id = event.session_id
-        intent_event = event.intent_event
-        user_input = intent_event.raw_input
-
-        # ── Step 1: Add user turn to short_term SYNCHRONOUSLY ─────────────
-        # This must happen BEFORE get_recent() so the LLM sees the current
-        # message as part of the conversation (not just appended externally).
-        self.memory_manager.short_term.add("user", user_input)
-
-        # ── Step 2: Task path — defer to Planner ────────────────────────
-        # The Planner (planning/planner.py) is already subscribed to
-        # IntentIdentified and will decompose this request into an
-        # ExecutionPlan, dispatch it via the PlanScheduler, and emit
-        # PlanCompleted when it's done. We just record the user input
-        # for memory; we do NOT emit TaskExecutionRequested ourselves.
-        if intent_event.requires_task:
-            logger.info(
-                "Task intent detected: %s  params=%s — handed off to Planner",
-                intent_event.task_type,
-                intent_event.task_params,
-            )
-            self._last_tasks[session_id] = {
-                "task_type": intent_event.task_type,
-                "task_params": dict(intent_event.task_params),
-                "user_input": user_input,
-                "memory_event": (
-                    event.memory_events[0] if event.memory_events else None
-                ),
-            }
-            # Task path: keep the thinking gate raised until either
-            # on_task_completed or on_plan_completed fires (they release
-            # it). If the planner doesn't pick this up at all, the gate
-            # would otherwise stay held forever — log a warning so the
-            # deadlock is visible.
-            self._gated_session_ids.add(session_id)
-            return
-
-        # ── Step 3b: Retry path — re-plan from the last user request ─────
-        # "Do it again" used to re-emit a single TaskExecutionRequested.
-        # We now treat it as a fresh request to the Planner: the user
-        # wants the same plan re-run. The Planner decides whether to
-        # one-shot it (single task) or decompose.
-        if self._is_retry_request(user_input):
-            last_task = self._last_tasks.get(session_id)
-            if last_task is None:
-                response_text = "I don't have a previous action to retry."
-                self.memory_manager.short_term.add("assistant", response_text)
-                self.bus.emit(ResponseReady(text=response_text, session_id=session_id))
-                # No Planner handoff; release the gate here.
-                audio_state.thinking_finished()
-                return
-
-            # Rebuild a synthetic IntentIdentified from the last known
-            # task so the Planner's existing subscription picks it up.
-            retry_intent = IntentIdentified(
-                intent=Intent.TASK,
-                raw_input=last_task.get("user_input", user_input),
-                confidence=1.0,
-                session_id=session_id,
-                requires_task=True,
-                task_type=last_task.get("task_type") or "",
-                task_params=last_task.get("task_params") or {},
-            )
-            logger.info(
-                "Retrying via Planner: %s params=%s",
-                retry_intent.task_type,
-                retry_intent.task_params,
-            )
-            self.bus.emit(retry_intent)
-            # Same gated-release contract as the task path above.
-            self._gated_session_ids.add(session_id)
-            return
-
-        # ── Step 3: Conversational path — stream LLM (JSON envelope) ──────
-        try:
-            await self._stream_conversational_reply(event, session_id)
-        finally:
-            # Conversational path emits ResponseReady itself; release here
-            # so the mic can reopen after TTS finishes.
-            audio_state.thinking_finished()
-
-    async def _stream_conversational_reply(
-        self, event: ReasoningRequested, session_id: str
-    ) -> None:
-        memory_event = event.memory_events[0] if event.memory_events else None
-
-        # ── Memory Router -> RAG retrieval ────────────────────────────
-        # Gated on purpose: retrieving for "hi" or "open chrome" wastes
-        # an embedding call and pollutes the prompt. See memory/rag/router.py.
-        retrieved = await self._retrieve_rag_context(
-            event.intent_event.raw_input if event.intent_event else "",
-            event.intent_event,
-        )
-
-        system = self._build_system_prompt(memory_event, retrieved)
-
-        # history already ends with the user's current message (added in step 1)
-        history = self._get_history()
-
-        logger.debug(
-            "Calling LLM (streaming) | history_turns=%d | system_len=%d | rag_chunks=%d",
-            len(history),
-            len(system),
-            len(retrieved),
-        )
-
-        # Stream the JSON envelope token-by-token. While it arrives, strip
-        # the scaffolding and forward ONLY the visible `message` text as
-        # PartialResponse events so the UI renders words as they generate.
-        # The full buffer is parsed once at the end for the authoritative
-        # message + sql/rag persistence (see _persist_response_memory).
-        raw_parts: list[str] = []
-        buffer = ""
-        prev_visible = ""
-        stream_failed = False
-        try:
-            async for chunk in self.gemini_client.generate_with_history_stream(
-                history=history,
-                system=system,
-                hedge_width=1,
-                call_site="conversational",
-            ):
-                raw_parts.append(chunk)
-                buffer += chunk
-                visible = extract_streamed_message(buffer)
-                if len(visible) > len(prev_visible):
-                    self.bus.emit(
-                        PartialResponse(
-                            text=visible[len(prev_visible) :],
-                            session_id=session_id,
-                        )
-                    )
-                    prev_visible = visible
-        except Exception as exc:  # noqa: BLE001
-            stream_failed = True
-            logger.warning(
-                "Streaming LLM call failed (session=%s): %s", session_id, exc
-            )
-
-        raw_response = "".join(raw_parts)
-        payload = parse_memory_response(raw_response)
-        response_text = payload.get("message", "").strip()
-
-        # Decide if the parsed message is *actually* the message or a
-        # raw-text fallback that ``parse_memory_response`` substitutes
-        # when the JSON envelope is missing or broken. We treat the
-        # message as suspicious only if:
-        #   - it is empty
-        #   - OR it equals the raw text AND the raw text looks like a
-        #     partial/whole JSON envelope (``{...}`` shape), which means
-        #     parse_memory_response gave us back the literal JSON it
-        #     couldn't decode.
-        # We deliberately do NOT fall back when the raw text is plain
-        # English (e.g. the streaming LLM client yielded a single fallback
-        # chunk like "I'm having trouble thinking right now. Could you
-        # try again?" on an upstream exception). Before this guard,
-        # every such fallback was silently discarded because
-        # ``response_text == raw_response`` was treated as a failure signal
-        # even when the raw text was perfectly good conversational copy.
-        raw_stripped = raw_response.strip()
-        looks_like_json = raw_stripped.startswith("{") and raw_stripped.endswith("}")
-        raw_text_fallback = response_text == raw_stripped and looks_like_json
-        # The third condition (`response_text.startswith("{")`) catches the
-        # case where the parse succeeded but returned a dict-as-message
-        # (which shouldn't happen but historically did on schema drift).
-        if not response_text or raw_text_fallback or response_text.startswith("{"):
-            response_text = prev_visible
-
-        # If the stream returned nothing usable — first chunk won the race
-        # but no real text followed (Gemini occasionally streams just the
-        # opening JSON and then stalls), or the call raised before any
-        # chunk arrived — retry once before giving up. Without this, the
-        # mic opens into dead silence and the user sees the assistant
-        # "ignore" their question.
-        if not response_text:
-            if stream_failed or raw_parts:
-                logger.info(
-                    "Empty LLM stream (session=%s, raw=%d chars, prev_visible=%d chars); retrying once",
-                    session_id,
-                    len(raw_response),
-                    len(prev_visible),
-                )
-                try:
-                    raw_parts.clear()
-                    prev_visible = ""
-                    async for chunk in self.gemini_client.generate_with_history_stream(
-                        history=history,
-                        system=system,
-                        hedge_width=1,
-                        call_site="conversational-retry",
-                    ):
-                        raw_parts.append(chunk)
-                        buffer = "".join(raw_parts)
-                        visible = extract_streamed_message(buffer)
-                        if len(visible) > len(prev_visible):
-                            self.bus.emit(
-                                PartialResponse(
-                                    text=visible[len(prev_visible) :],
-                                    session_id=session_id,
-                                )
-                            )
-                            prev_visible = visible
-                    raw_response = "".join(raw_parts)
-                    payload = parse_memory_response(raw_response)
-                    response_text = payload.get("message", "").strip()
-                    raw_stripped = raw_response.strip()
-                    looks_like_json = raw_stripped.startswith(
-                        "{"
-                    ) and raw_stripped.endswith("}")
-                    raw_text_fallback = (
-                        response_text == raw_stripped and looks_like_json
-                    )
-                    if (
-                        not response_text
-                        or raw_text_fallback
-                        or response_text.startswith("{")
-                    ):
-                        response_text = prev_visible
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "Retry of streaming LLM call failed (session=%s): %s",
-                        session_id,
-                        exc,
-                    )
-
-        # Last resort: surface a user-visible fallback so the mic doesn't
-        # open into dead silence. TTS will speak this short apology and
-        # the mic reopens for the user's next attempt.
-        if not response_text:
-            logger.error(
-                "LLM produced no usable text after retry (session=%s, user_input=%r); surfacing fallback",
-                session_id,
-                event.intent_event.raw_input if event.intent_event else None,
-            )
-            response_text = (
-                "Sorry, sir — my response came back blank. Could you say that again?"
-            )
-
-        # ── Step 4: Add assistant turn to short_term SYNCHRONOUSLY ────────
-        self.memory_manager.short_term.add("assistant", response_text)
-
-        # ── Step 5: Persist memory from the primary Gemini response ───────
-        # Memory now comes directly from the response JSON envelope — no
-        # separate extraction step after the conversation. `sql` lands in
-        # SQLite, `rag` in the vector store (+ the rag.txt audit log).
-        await self._persist_response_memory(payload, session_id=session_id)
-
-        # ── Step 6: Mark stream done + emit final response ────────────────
-        self.bus.emit(PartialResponse(text="", done=True, session_id=session_id))
-        self.bus.emit(ResponseReady(text=response_text, session_id=session_id))
-
-    # ── Task completion handler ───────────────────────────────────────────────
-
-    async def on_task_completed(self, event: TaskCompleted) -> None:
-        session_id = event.session_id
-        pending = self._pending_turns.pop(session_id, None)
-
-        try:
-            if not pending:
-                logger.warning(
-                    "TaskCompleted for session %s but no pending turn found — ignoring.",
-                    session_id,
-                )
-                return
-
-            response_text = self._format_task_response(event)
-
-            # Add assistant response to short_term.
-            self.memory_manager.short_term.add("assistant", response_text)
-
-            self.bus.emit(ResponseReady(text=response_text, session_id=session_id))
-        finally:
-            # Release the gate if this session was the one holding it
-            # open across a deferred task handoff. Conversational turns
-            # never enter _gated_session_ids, so this is a no-op for them.
-            self._maybe_release_gate(session_id)
-
-    async def on_plan_completed(self, event: PlanCompleted) -> None:
-        """Emit a user-facing response when a plan finishes.
-
-        Single-task plans run through :mod:`reasoning.tool_voice`
-        synchronously (zero LLM cost). Multi-task and failure paths go
-        through :mod:`reasoning.naturalize` which calls the LLM to
-        combine the per-tool results into one JARVIS-style reply.
-        """
-        session_id = event.session_id
-        summary = (event.summary or "").strip()
-
-        try:
-            response_text = await naturalize_plan_response(
-                llm=self.gemini_client,
-                user_request=event.user_request or summary,
-                task_results=list(event.task_results or []),
-                status=event.status,
-                token_log=self.token_log,
-            )
-
-            self.memory_manager.short_term.add("assistant", response_text)
-
-            self.bus.emit(ResponseReady(text=response_text, session_id=session_id))
-        finally:
-            self._maybe_release_gate(session_id)
-
-    def _maybe_release_gate(self, session_id: str) -> None:
-        """Release the thinking gate if this session was holding it open
-        across a deferred task/plan handoff. Idempotent and safe to call
-        from any handler — conversational turns never enter the gated
-        set, so this is a no-op for them."""
-        if session_id in self._gated_session_ids:
-            self._gated_session_ids.discard(session_id)
-            audio_state.thinking_finished()

@@ -25,12 +25,33 @@ MEMORY_RESPONSE_FORMAT = """\
 Respond with ONLY one JSON object, no markdown, no code fences, no preamble:
 
 {
+  "task": {
+    "task_type": "...",
+    "instruction": "...",
+    "parameters": {},
+    "expected_result": "...",
+    "context": {},
+    "follow_up": false
+  },
   "message": "Your reply to the user",
   "sql": [{"key": "...", "value": "..."}],
   "rag": [{"type": "...", "title": "...", "content": "..."}]
 }
 
 Rules:
+- "task" is OPTIONAL and delegates one unit of work to the execution
+  layer. Include it ONLY when the request needs a tool, a system action,
+  or live data. Omit it entirely for ordinary conversation. The task
+  layer never sees the conversation — "instruction" must therefore be
+  self-contained, with every reference ("it", "that", "the second one")
+  already resolved into explicit values.
+
+- When you include "task", it MUST be the FIRST key in the object,
+  before "message". Ordinary replies start directly with "message".
+  This ordering is load-bearing: it is how the assistant knows, while
+  your reply is still being generated, whether it is about to start
+  work — which decides whether your acknowledgement is spoken at all.
+
 - "message" is REQUIRED and is the only text shown to the user.
 
 - "sql" is OPTIONAL and holds STRUCTURED memory: short key/value facts.
@@ -62,6 +83,8 @@ Rules:
 
 - Omit "sql" and "rag" entirely when there is nothing to store.
   Never return empty arrays and never return null.
+
+- Omit "task" entirely when no action is required. Never return null.
 """
 # JSON string escapes that can appear inside the streamed ``message`` value.
 # Decoding them the same way ``json.loads`` does keeps the streamed display
@@ -128,12 +151,18 @@ def extract_streamed_message(buffer: str) -> str:
 
 
 def parse_memory_response(raw: str) -> dict[str, Any]:
-    """Parse the model's JSON memory envelope into ``{message, sql?, rag?}``.
+    """Parse the model's JSON envelope into ``{message, task?, sql?, rag?}``.
 
     Tolerant parser — never raises. Falls back to ``{"message": <raw>}``
-    when the model returns plain text or malformed JSON. ``sql``/``rag``
-    are omitted (never empty arrays, never null) so callers can safely
-    test ``if "sql" in response``.
+    when the model returns plain text or malformed JSON. ``task``/``sql``/
+    ``rag`` are omitted (never empty, never null) so callers can safely
+    test ``if "task" in response``.
+
+    ``task`` is the Conversation LLM's delegation to the Task LLM; the
+    coordinator turns it into a :class:`core.events.TaskRequested`. It is
+    only surfaced when it is a dict carrying something actionable — an
+    ``instruction`` or a ``task_type`` — so a hallucinated empty object
+    can never trigger execution.
     """
     text = (raw or "").strip()
     if not text:
@@ -161,6 +190,13 @@ def parse_memory_response(raw: str) -> dict[str, Any]:
         message = text
 
     payload: dict[str, Any] = {"message": message}
+
+    task = data.get("task")
+    if isinstance(task, dict) and (
+        str(task.get("instruction") or "").strip()
+        or str(task.get("task_type") or "").strip()
+    ):
+        payload["task"] = task
 
     sql = data.get("sql")
     if isinstance(sql, list) and sql:

@@ -227,8 +227,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         state=AssistantState.THINKING, session_id=session_id
                     )
                 )
-                # ReasoningCoordinator's `_is_retry_request` regex recognizes
-                # this phrase and re-runs the last concrete task.
+                # Goes through the normal conversational path: the
+                # Conversation LLM sees the session history (including a
+                # summary of the last delegated task) and re-issues it.
                 pipeline.bus.emit(
                     TextInputReceived(text="retry", session_id=session_id)
                 )

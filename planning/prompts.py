@@ -11,8 +11,14 @@ from __future__ import annotations
 from tasks.registry import TASK_REGISTRY
 
 
-def _format_tool_catalog() -> str:
-    """Render the registry as a compact catalog for the LLM."""
+def format_tool_catalog() -> str:
+    """Render the registry as a compact catalog for the LLM.
+
+    Public because the Conversation LLM needs the same catalog to decide
+    *whether* a request is actionable and to propose a ``task_type``.
+    Both prompts reading one registry is what keeps the two layers from
+    drifting apart (the Executor enforces the same names).
+    """
     lines = []
     for name, spec in TASK_REGISTRY.items():
         req = ", ".join(spec.required_params) if spec.required_params else "—"
@@ -88,7 +94,7 @@ Respond with raw JSON only.
 
 def build_planner_prompt(user_request: str, extra_context: str = "") -> str:
     """Render the full Planner prompt for a given user request."""
-    catalog = _format_tool_catalog()
+    catalog = format_tool_catalog()
     system = PLANNER_SYSTEM_PROMPT.format(tool_catalog=catalog)
     body = f"{system}\n\n# User request\n\n{user_request.strip()}"
     if extra_context:

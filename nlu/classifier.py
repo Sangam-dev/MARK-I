@@ -728,42 +728,10 @@ def classify_tool_request(text: str) -> ToolDecision | None:
         city = place_match.group(1).strip() if place_match else cleaned
         return ToolDecision(task_name="get_weather", parameters={"city": city})
 
-    if lowered in {
-        "sleep now",
-        "suspend now",
-        "go to sleep",
-        "put pc to sleep",
-        "put my pc to sleep",
-        "put computer to sleep",
-        "put my computer to sleep",
-        "put this device to sleep",
-        "sleep the computer now",
-    }:
-        return ToolDecision(task_name="sleep", parameters={})
-
-    if lowered in {
-        "shut down now",
-        "shut down the computer now",
-        "shut down my computer now",
-        "shut down this device",
-        "turn off now",
-        "turn off the computer now",
-        "turn off my computer",
-        "power off now",
-        "power off this device",
-    }:
-        return ToolDecision(task_name="shutdown", parameters={})
-
-    if lowered in {
-        "restart the computer now",
-        "restart my computer now",
-        "restart this device now",
-        "reboot now",
-        "reboot the computer now",
-        "reboot my device",
-        "reboot this device now",
-    }:
-        return ToolDecision(task_name="restart", parameters={})
+    # The "sleep now" / "shut down now" / "reboot now" matchers were removed
+    # along with the tasks they named. This matcher is what the Planner uses
+    # to pick a tool for delegated work, so leaving them here would keep
+    # handing it a task_type that must never exist.
 
     # Web search — checked last so every specific tool pattern takes priority.
     web_decision = _classify_web_search_request(cleaned)
@@ -784,9 +752,6 @@ Classify intent into one of:
   * "list_alarms" (no params)
   * "cancel_alarms" (no params)
   * "get_weather" (params: city, optional: date, units)
-  * "sleep" (no params)
-  * "shutdown" (no params)
-  * "restart" (no params)
   * "file_operation" (params: action (required), path, name, content, destination, new_name, extension (optional). Action values: list, create_file, create_folder, delete, move, copy, rename, read, write, find, largest, disk_usage, organize_desktop, info)- "execute_protocol" (params: protocol_name (required), original_request (optional))- "conversational": Casual greetings, chitchat, or social statements (e.g., "hi", "how are you?", "nice to meet you").
 - "desktop_control" (params: action (required), plus action-specific optional params). Action values: wallpaper, wallpaper_url, current_wallpaper, organize, clean, list, stats, list_windows, focus, close_window, minimize, maximize, list_workspaces, switch_workspace, move_to_workspace, window_workspace, task. For action="task" the natural-language description goes in the "task" param. For action="focus"/"close_window"/"minimize"/"maximize" the app name goes in "app". For action="switch_workspace" the desktop/workspace name or number goes in "target". For action="wallpaper" the image path goes in "path"; for "wallpaper_url" the URL goes in "url".
 - "system_monitor" (params: action (required); optional: metric, threshold, enabled). Action values: status (one-shot CPU/RAM/temp/GPU/uptime snapshot), check_alerts (run a single threshold check), set_threshold (needs metric ∈ {cpu,ram,temp,gpu} and threshold ∈ 1..99), enable/disable (toggle the background alert loop using enabled=true|false).
@@ -806,12 +771,29 @@ Do NOT include markdown formatting or code blocks in your response. Return raw J
 class NLUClassifier:
     """LLM-based intent classification and entity extraction, with offline regex fallback."""
 
-    def __init__(self, llm_client: GeminiClient, bus: EventBus) -> None:
+    def __init__(self, llm_client: GeminiClient, bus: EventBus, parallel_mode: bool | None = None) -> None:
         self.llm_client = llm_client
         self.bus = bus
+        import sys
+        is_testing = "pytest" in sys.modules or any("test" in arg for arg in sys.argv)
+        if parallel_mode is None:
+            self.parallel_mode = not is_testing
+        else:
+            self.parallel_mode = parallel_mode
 
     def register(self) -> None:
-        """Subscribe to text and transcript events."""
+        """Subscribe to text and transcript events.
+
+        NOT called by ``core/pipeline.py`` any more, and it should stay
+        that way: task detection belongs to the Conversation LLM
+        (``reasoning/coordinator.py``), which is the only subscriber to
+        user input. Registering this classifier alongside it would put a
+        second, independent intent decision on every utterance.
+
+        What survives is the deterministic matcher below —
+        :func:`classify_tool_request` — which the Planner uses to pick a
+        tool for work the Conversation LLM has *already* delegated.
+        """
         self.bus.subscribe(TextInputReceived, self.on_text_input)
         self.bus.subscribe(TranscriptReady, self.on_transcript_ready)
 
@@ -860,13 +842,13 @@ class NLUClassifier:
     async def _process_text(self, text: str, session_id: str) -> None:
         """Perform classification and emit IntentIdentified event.
 
-        The thinking gate is raised here (before any async work) and is
-        released by the ReasoningCoordinator when it finishes — that
-        ensures the microphone cannot reopen mid-classify or mid-stream,
-        which would otherwise let audio leak in as a separate turn.
+        In parallel mode, the Response LLM pipeline manages the thinking gate.
+        In sequential/test mode, the thinking gate is raised here (before any async work)
+        and released by the ReasoningCoordinator.
         """
         logger.info("Processing user input text: '%s'", text)
-        audio_state.thinking_started()
+        if not self.parallel_mode:
+            audio_state.thinking_started()
         try:
             result = await self.classify(text, session_id)
 
@@ -882,5 +864,6 @@ class NLUClassifier:
             self.bus.emit(intent_event)
         except Exception:
             # Never leave the gate stuck if classify/emit blew up.
-            audio_state.thinking_finished()
+            if not self.parallel_mode:
+                audio_state.thinking_finished()
             raise

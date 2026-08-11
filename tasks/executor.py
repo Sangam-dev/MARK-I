@@ -10,13 +10,13 @@ from actions.alarms import cancel_alarms, list_alarms, set_alarm
 from actions.apps import open_app
 from actions.desktop_control import desktop_control
 from actions.file_controller import file_controller
-from actions.power import restart, shutdown, sleep
 from actions.system_commands import SystemCommandExecutor
 from actions.system_monitor import (
     SystemMonitor,
     format_status_text,
     get_system_status,
 )
+from actions.system_tool import get_shared_system_tool
 from actions.weather import get_weather
 from actions.web_search import web_search
 from core.bus import EventBus
@@ -208,17 +208,10 @@ class TaskExecutor:
             result = await asyncio.to_thread(get_weather, city, date, units)
             return TaskExecutionResult(result.success, result.message)
 
-        if task_name == "sleep":
-            result = await asyncio.to_thread(sleep)
-            return TaskExecutionResult(result.success, result.message)
-
-        if task_name == "shutdown":
-            result = await asyncio.to_thread(shutdown)
-            return TaskExecutionResult(result.success, result.message)
-
-        if task_name == "restart":
-            result = await asyncio.to_thread(restart)
-            return TaskExecutionResult(result.success, result.message)
+        # No sleep / shutdown / restart branch. Power-state control was
+        # removed from the assistant entirely — see the note in
+        # tasks/registry.py. A request naming one falls through to the
+        # "no handler" result at the bottom of this method.
 
         if task_name == "file_operation":
             result_text = await asyncio.to_thread(file_controller, params)
@@ -279,6 +272,15 @@ class TaskExecutor:
             query = params.get("query", "")
             result = await asyncio.to_thread(web_search, query)
             return TaskExecutionResult(result.success, result.message)
+
+        if task_name == "system":
+            # SystemTool is already async (asyncio.create_subprocess_exec),
+            # so no to_thread hop here. It returns a structured result;
+            # this layer flattens it into the executor's success/message.
+            result = await get_shared_system_tool().execute(params)
+            if result.success:
+                return TaskExecutionResult(True, result.output or "Done.")
+            return TaskExecutionResult(False, result.error or "System action failed.")
 
         if task_name == "system_monitor":
             return await self._dispatch_system_monitor(params)

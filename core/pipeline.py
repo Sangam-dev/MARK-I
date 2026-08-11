@@ -1,12 +1,25 @@
 """Reusable KANCHA pipeline construction.
 
 Both the CLI entry point (``main.py``) and the FastAPI/WebSocket server
-(``api/server.py``) need the exact same EventBus wiring: EventBus -> Memory ->
-LLM -> NLU -> Reasoning bridge -> ReasoningCoordinator -> Planner ->
-PlanScheduler -> TaskExecutor -> output handlers. Before this module existed,
-that ~150 lines of wiring lived inline inside ``main.py:_run()``, which meant
-the API server would have had to duplicate it (and the two copies would
-inevitably drift).
+(``api/server.py``) need the exact same EventBus wiring. Before this module
+existed, that ~150 lines of wiring lived inline inside ``main.py:_run()``,
+which meant the API server would have had to duplicate it (and the two
+copies would inevitably drift).
+
+The control flow it wires up is a hierarchy, not a fan-out::
+
+    input (mic / text / WebSocket)
+        -> ReasoningCoordinator          Conversation LLM — the controller
+             |- ResponseReady            -> ResponseFormatter, TTS
+             `- TaskRequested            explicit delegation
+                  -> Planner             Task LLM — the executor
+                       -> PlanScheduler -> PlanExecutor -> TaskExecutor
+                       -> TaskResultReady
+                            -> ReasoningCoordinator -> ResponseReady
+
+The Conversation LLM is the only subscriber to user input; the Task LLM is
+the only consumer of ``TaskRequested``. See ``reasoning/coordinator.py``
+and ``planning/planner.py`` for the two halves.
 
 ``build_pipeline()`` is now the single source of truth. Anything that needs a
 running KANCHA pipeline (CLI, API server, tests, a future gRPC front door,
@@ -25,9 +38,6 @@ from pathlib import Path
 
 from core.bus import EventBus
 from core.events import (
-    IntentIdentified,
-    MemoryRetrieved,
-    ReasoningRequested,
     ResponseReady,
     SystemError,
     SystemMonitorAlert,
@@ -292,29 +302,18 @@ async def build_pipeline(
     await llm.initialize()
 
     # ── NLU ───────────────────────────────────────────────────────────────
+    # Built but deliberately NOT subscribed to the bus. User input goes to
+    # exactly one LLM — the ReasoningCoordinator (Conversation LLM) — which
+    # is the single authority on whether a turn needs a task. Registering
+    # the classifier here would put a second, independent intent decision
+    # on every utterance, which is the fan-out this pipeline used to have.
+    #
+    # Its deterministic matcher (`nlu.classifier.classify_tool_request`)
+    # still earns its keep: the Planner calls it to pick a tool for work
+    # that has *already* been delegated, which keeps simple actions free of
+    # a second LLM round-trip. The object below is kept on the Pipeline
+    # handle for callers that want to classify text on demand.
     nlu = NLUClassifier(llm_client=llm, bus=bus)
-    nlu.register()
-
-    # ── Reasoning request bridge ──────────────────────────────────────────
-    # RAG is intentionally disabled. This bridge forwards intents to reasoning
-    # with only durable user facts from SQLite, and no vector/episodic context.
-    async def _handle_intent_identified(event: IntentIdentified) -> None:
-        facts = await memory.get_all_facts()
-        memory_event = MemoryRetrieved(
-            session_id=event.session_id,
-            query=event.raw_input,
-            structured_context=facts,
-            episodic_context=[],
-        )
-        bus.emit(
-            ReasoningRequested(
-                session_id=event.session_id,
-                intent_event=event,
-                memory_events=[memory_event],
-            )
-        )
-
-    bus.subscribe(IntentIdentified, _handle_intent_identified)
 
     # ── RAG query prefetch ────────────────────────────────────────────────
     # Latency, not correctness. Embedding the query is the only slow step
@@ -342,7 +341,10 @@ async def build_pipeline(
         bus.subscribe(TranscriptReady, _prefetch_rag_query)
         bus.subscribe(TextInputReceived, _prefetch_rag_query)
 
-    # ── Reasoning Coordinator ─────────────────────────────────────────────
+    # ── Conversation LLM (controller) ─────────────────────────────────────
+    # The single entry point for user input. Decides whether a turn is
+    # conversation or work, resolves "do it"/"that one" against the session
+    # history, and delegates via TaskRequested.
     coordinator = ReasoningCoordinator(
         bus=bus,
         gemini_client=llm,
@@ -357,11 +359,13 @@ async def build_pipeline(
     task_executor = TaskExecutor(bus=bus)
     task_executor.register()
 
-    # ── Planner + Plan Scheduler ──────────────────────────────────────────
-    # These run on top of the existing task executor. The Planner decomposes
-    # multi-step requests; the PlanScheduler walks the dependency graph and
-    # dispatches individual tasks via the existing TaskExecutor (re-using
-    # TaskExecutionRequested).
+    # ── Task LLM (Planner) + Plan Scheduler ───────────────────────────────
+    # These run on top of the existing task executor. The Planner subscribes
+    # to TaskRequested — the Conversation LLM's delegation, never raw user
+    # input — and decomposes it; the PlanScheduler walks the dependency graph
+    # and dispatches individual tasks via the existing TaskExecutor (re-using
+    # TaskExecutionRequested). The Planner then reports the outcome back to
+    # the Conversation LLM as TaskResultReady.
     planner = Planner(
         bus=bus,
         llm=llm,
