@@ -190,6 +190,22 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
             "confirm": bool,
         },
     ),
+    "youtube_video": TaskSpec(
+        name="youtube_video",
+        description=(
+            "Play a song, music video or video on YouTube. Use it whenever "
+            "the user asks to play, put on or watch something — a song, an "
+            "artist, a track by name, a tutorial, or a video about a topic. "
+            "Pass the user's own phrasing as 'request' (e.g. 'play a random "
+            "song by Durgesh Thapa', 'play a video about RAG'); the tool "
+            "extracts the search terms itself, including whether they asked "
+            "for a random pick. It searches YouTube and opens the result in "
+            "the browser — it never downloads anything."
+        ),
+        required_params=("request",),
+        optional_params=(),
+        param_types={"request": str},
+    ),
     "gmail": TaskSpec(
         name="gmail",
         description=(

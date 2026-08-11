@@ -341,6 +341,9 @@ TOOL_VOICE: dict[str, ToolVoice] = {
     # "'Invoice' moved to Trash."), and its listings are multi-line —
     # the default colon-rewrite would mangle those into one blob.
     "gmail": _passthrough,
+    # "Playing 'Despacito' by Luis Fonsi on YouTube." is already the
+    # sentence to say — the colon-rewrite would mangle the quoted title.
+    "youtube_video": _passthrough,
     "web_search": _voice_web_search,
 }
 

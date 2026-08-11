@@ -42,4 +42,5 @@ dependencies = [
     "uvicorn[standard]>=0.51.0",
     "websockets>=16.0",
     "argparse>=1.4.0",
+    "yt-dlp>=2026.7.4",
 ]

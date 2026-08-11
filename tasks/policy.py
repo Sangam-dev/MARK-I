@@ -203,6 +203,7 @@ _FIELD_QUESTIONS: dict[str, str] = {
     "city": "Which city?",
     "app_name": "Which application?",
     "action": "What should I do exactly?",
+    "request": "What would you like me to play?",
 }
 
 

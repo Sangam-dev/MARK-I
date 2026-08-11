@@ -20,6 +20,7 @@ from actions.system_monitor import (
 from actions.system_tool import get_shared_system_tool
 from actions.weather import get_weather
 from actions.web_search import web_search
+from actions.youtube_video import youtube_video
 from core.bus import EventBus
 from core.events import TaskCompleted, TaskExecutionRequested
 from tasks.registry import TASK_REGISTRY, validate_task
@@ -282,6 +283,22 @@ class TaskExecutor:
             if result.success:
                 return TaskExecutionResult(True, result.output or "Done.")
             return TaskExecutionResult(False, result.error or "System action failed.")
+
+        if task_name == "youtube_video":
+            # yt-dlp's search is blocking, so it goes to a thread like the
+            # other synchronous actions.
+            result = await asyncio.to_thread(
+                youtube_video, params.get("request", "")
+            )
+            if result.get("success"):
+                channel = result.get("channel") or ""
+                by = f" by {channel}" if channel else ""
+                return TaskExecutionResult(
+                    True, f"Playing '{result['title']}'{by} on YouTube."
+                )
+            return TaskExecutionResult(
+                False, result.get("error") or "Could not play that on YouTube."
+            )
 
         if task_name == "gmail":
             # GmailTool is already async (imaplib/smtplib run via
