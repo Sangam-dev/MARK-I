@@ -60,10 +60,12 @@ from core.events import (
 from memory.manager import MemoryManager
 from memory.rag import MemoryRouter, RAGManager, RetrievedChunk
 from memory.token_log import TokenLog
+from planning.orchestrator import looks_like_assent, looks_like_refusal
 from planning.prompts import format_tool_catalog
 from reasoning.llm_client import (
     GeminiClient,
     extract_streamed_message,
+    looks_like_envelope,
     parse_memory_response,
 )
 from reasoning.naturalize import naturalize_plan_response
@@ -85,6 +87,15 @@ TASK_RESULT_TURN_PREFIX = "[task result]"
 # watching. Past the cap the result is simply reported to the user.
 MAX_TASK_CHAIN_DEPTH = 4
 
+# Task statuses that are a question rather than an outcome. On these the
+# controller asks the user and the task stays open in the Orchestrator.
+WAITING_STATUSES = frozenset({"waiting_for_input", "waiting_for_confirmation"})
+
+# Modes that continue the task already open in this session, rather than
+# starting a new one. Mirrors planning/orchestrator.py, which validates
+# whatever we propose against the real task state.
+RESUME_MODES = frozenset({"answer", "confirm", "reject", "cancel", "modify"})
+
 # How long a delegated task may run before its acknowledgement ("Opening
 # Firefox…") is spoken. Under this, the user hears one response — the
 # outcome — instead of a confirmation followed by a near-identical
@@ -98,6 +109,27 @@ MAX_TASK_CHAIN_DEPTH = 4
 # Override with KANCHA_TASK_ACK_DELAY (seconds); 0 speaks it immediately,
 # which restores the always-two-responses behaviour.
 DEFAULT_TASK_ACK_DELAY_S = 3.0
+
+
+# How much raw tool output to carry forward as reference context. Enough
+# for a listing of ten emails with their ids; short of pasting an entire
+# inbox into every subsequent prompt.
+MAX_REFERENCE_CHARS = 1800
+
+
+def _compact_raw(results: list[dict[str, Any]] | None) -> str:
+    """Render tool output for the controller's eyes only."""
+    lines: list[str] = []
+    for entry in results or []:
+        text = str(entry.get("result", "")).strip()
+        if not text:
+            continue
+        tool = str(entry.get("tool", "")).strip() or "tool"
+        lines.append(f"{tool}: {text}")
+    joined = "\n".join(lines)
+    if len(joined) > MAX_REFERENCE_CHARS:
+        joined = joined[:MAX_REFERENCE_CHARS].rstrip() + "\n… (truncated)"
+    return joined
 
 
 def _ack_delay_from_env() -> float:
@@ -181,6 +213,41 @@ the user which one they mean and omit "task".
   professor and reply saying I'll attend", where the reply depends on
   what the search returns. Leave it false when the result just needs to
   be reported to the user.
+- "mode": what this message does to the task already in progress. See
+  below. Omit it (or use "new") when the user is starting something.
+
+# Continuing a task that is already waiting
+
+The execution layer can come back with a QUESTION instead of a result —
+it may need a value it does not have, or approval before it changes
+something. When that happens you ask the user, in your own words, and
+the task stays open. Any block titled "Task currently in progress"
+above tells you what is open and what it is waiting for.
+
+The user's next message is then usually about THAT task, not a new one.
+Set "mode" so the execution layer resumes it instead of starting over:
+
+- "answer"  — they supplied the value that was asked for. Put it in
+              "parameters" under the field name from the question.
+              ("Tell him I'll submit tomorrow" → parameters {{"body": "..."}})
+- "confirm" — they approved it. "yes", "go ahead", "do it", "send it".
+- "reject"  — they declined it. "no", "don't", "not now".
+- "cancel"  — they called the whole thing off. "cancel that", "forget it".
+- "modify"  — they changed the task. "actually send it to bob@x.com" →
+              mode "modify" with parameters {{"to": "bob@x.com"}}.
+- "new"     — genuinely unrelated to the open task.
+
+Rules that matter:
+
+- When resuming, "instruction" may repeat the original request; the
+  parameters and the mode are what carry the new information.
+- NEVER answer a question the execution layer asked by inventing the
+  value yourself. If the user has not said what the email should say,
+  ask them — do not write it for them.
+- NEVER set "mode" to "confirm" unless the user, in their own message,
+  actually agreed. Your own judgement that something is fine is not the
+  user's approval, and claiming it is will be rejected.
+- If nothing is in progress, "mode" is "new" whatever the user says.
 
 One "task" object per response. If a request needs several tool calls
 that you can specify up-front, describe them all in a single
@@ -193,6 +260,12 @@ speaking. It is the execution layer reporting to you. Turn it into a
 natural reply for the user, in your own voice, and — if the original
 request needs another step — delegate that next step with a new "task".
 Never read raw tool output or status codes aloud.
+
+When such a turn says the layer is WAITING — for a value or for
+approval — your reply is a question to the user and nothing else. Ask it
+naturally ("What would you like the email to say?", "That'll send the
+email to John — want me to go ahead?") and OMIT "task" entirely. The
+task is already open; delegating again would start a second one.
 """
 
 
@@ -278,7 +351,57 @@ class ReasoningCoordinator:
 
         # Delegation happens after the acknowledgement is out of the door,
         # so a long-running task never delays the immediate response.
-        self._maybe_delegate(payload, session_id=session_id, user_request=text)
+        if not self._maybe_delegate(
+            payload, session_id=session_id, user_request=text
+        ):
+            self._maybe_resume_open_task(text, session_id)
+
+    def _maybe_resume_open_task(self, text: str, session_id: str) -> None:
+        """Route a bare yes/no to the open task the controller forgot.
+
+        The controller is *supposed* to answer "yes" with a task carrying
+        ``mode: "confirm"``. When it instead replies conversationally —
+        which models do, because "yes" reads like small talk — the user's
+        approval would evaporate and the task would sit waiting forever.
+        This is the net: an unambiguous yes or no, and a task actually
+        waiting on one, is enough to resume it.
+
+        Deliberately narrow. Anything with more in it than assent or
+        refusal is left to the controller, which can see what the extra
+        words changed.
+        """
+        record = self._last_task.get(session_id) or {}
+        if record.get("status") not in WAITING_STATUSES:
+            return
+        task_id = str(record.get("task_id") or "")
+        if not task_id:
+            return
+
+        if looks_like_assent(text):
+            mode = "confirm"
+        elif looks_like_refusal(text):
+            mode = "reject"
+        else:
+            return
+
+        logger.info(
+            "Controller attached no task to a bare %r — resuming task %s as %s",
+            text,
+            task_id,
+            mode,
+        )
+        record["status"] = "running"
+        self.bus.emit(
+            TaskRequested(
+                task_id=task_id,
+                task_type=str(record.get("task_type") or ""),
+                instruction=str(record.get("instruction") or ""),
+                user_request=text,
+                mode=mode,
+                resume_task_id=task_id,
+                session_id=session_id,
+            )
+        )
 
     # ── Entry point: the Task LLM reports back ────────────────────────────────
 
@@ -299,9 +422,24 @@ class ReasoningCoordinator:
         if record is not None and record.get("task_id") == event.task_id:
             record["status"] = event.status
             record["error"] = event.error
+            record["question"] = event.question
+            record["missing_fields"] = list(event.missing_fields)
+            record["description"] = event.description
+            # Keep the unabridged tool output. The user hears a short
+            # spoken summary with no ids in it, but "trash the second
+            # one" still has to resolve to a real message id — so the
+            # data is remembered even though it is never said.
+            record["raw"] = _compact_raw(event.results)
 
         # The acknowledgement may still be streaming; never talk over it.
         await self._response_stream_finished.wait()
+
+        # The orchestrator is waiting on the user. Ask them — this is the
+        # only route a question from the execution layer has to a person.
+        if event.status in WAITING_STATUSES:
+            await self._ask_on_behalf_of_task(event)
+            return
+
         audio_state.thinking_started()
 
         try:
@@ -362,6 +500,57 @@ class ReasoningCoordinator:
             user_request=request.user_request or event.user_request,
         )
 
+    async def _ask_on_behalf_of_task(self, event: TaskResultReady) -> None:
+        """Put the execution layer's question to the user, in our voice.
+
+        The Task LLM is not allowed to address the user, so a question it
+        raises arrives here as ``waiting_for_input`` /
+        ``waiting_for_confirmation`` and is asked as an ordinary
+        conversational turn. The task stays open in the Orchestrator;
+        the user's reply comes back through :meth:`on_user_input` with a
+        ``mode`` that resumes it.
+
+        Any ``task`` the model attaches to this turn is dropped. The task
+        is already open — delegating here would start a second one, which
+        is precisely the "two unrelated tasks" bug this layer exists to
+        prevent.
+        """
+        session_id = event.session_id
+        self._last_task[session_id] = {
+            "task_id": event.task_id,
+            "task_type": event.task_type,
+            "instruction": event.instruction,
+            "status": event.status,
+            "error": "",
+            "question": event.question,
+            "missing_fields": list(event.missing_fields),
+            "description": event.description,
+        }
+
+        audio_state.thinking_started()
+        self._response_stream_finished.clear()
+        try:
+            self.memory_manager.short_term.add("user", self._format_result_turn(event))
+            payload = await self._run_conversation_turn(
+                session_id=session_id,
+                retrieval_query=event.instruction or event.user_request,
+            )
+        finally:
+            self._response_stream_finished.set()
+            audio_state.thinking_finished()
+
+        if payload.get("task"):
+            logger.info(
+                "Ignoring a delegation on the question turn for task %s — "
+                "that task is already open and awaiting the user",
+                event.task_id,
+            )
+        # A withheld acknowledgement would otherwise never be spoken:
+        # this turn's message IS the question, so deliver it.
+        ack = str(payload.get("_ack") or "").strip()
+        if ack:
+            self._emit_ack(session_id, ack)
+
     def _format_result_turn(self, event: TaskResultReady) -> str:
         """Render a Task Result as an internal history turn.
 
@@ -372,6 +561,27 @@ class ReasoningCoordinator:
         lines = [f"{TASK_RESULT_TURN_PREFIX} status={event.status}"]
         if event.instruction:
             lines.append(f"requested: {event.instruction}")
+
+        if event.status == "waiting_for_input":
+            lines.append(
+                "The execution layer needs more information before it can "
+                "continue. Ask the user this, in your own words, and do not "
+                "answer it yourself:"
+            )
+            lines.append(f"question: {event.question}")
+            if event.missing_fields:
+                lines.append(f"missing: {', '.join(event.missing_fields)}")
+            return "\n".join(lines)
+
+        if event.status == "waiting_for_confirmation":
+            lines.append(
+                "This changes something, so it needs the user's approval "
+                "before it runs. Tell them plainly what will happen and ask "
+                "whether to go ahead:"
+            )
+            lines.append(f"about to: {event.description}")
+            return "\n".join(lines)
+
         for entry in event.results or []:
             tool = str(entry.get("tool", "")).strip() or "tool"
             output = str(entry.get("result", "")).strip()
@@ -406,8 +616,18 @@ class ReasoningCoordinator:
 
         parameters = task.get("parameters")
         context = task.get("context")
+
+        # Resuming reuses the open task's id, so the Orchestrator's state,
+        # this class's in-flight map and any pending acknowledgement all
+        # keep talking about the same task across turns.
+        mode = str(task.get("mode") or "new").strip().lower()
+        record = self._last_task.get(session_id) or {}
+        open_task_id = str(record.get("task_id") or "")
+        resuming = mode in RESUME_MODES and bool(open_task_id)
+        task_id = open_task_id if resuming else f"task-{uuid.uuid4().hex[:8]}"
+
         request = TaskRequested(
-            task_id=f"task-{uuid.uuid4().hex[:8]}",
+            task_id=task_id,
             task_type=task_type,
             instruction=instruction,
             parameters=dict(parameters) if isinstance(parameters, dict) else {},
@@ -415,6 +635,8 @@ class ReasoningCoordinator:
             context=dict(context) if isinstance(context, dict) else {},
             follow_up=bool(task.get("follow_up", False)),
             user_request=user_request,
+            mode=mode if resuming else "new",
+            resume_task_id=open_task_id if resuming else "",
             session_id=session_id,
         )
 
@@ -652,27 +874,33 @@ class ReasoningCoordinator:
         payload = parse_memory_response(raw_response)
         response_text = payload.get("message", "").strip()
 
-        # Decide if the parsed message is *actually* the message or a
-        # raw-text fallback that ``parse_memory_response`` substitutes
-        # when the JSON envelope is missing or broken. We treat the
-        # message as suspicious only if:
-        #   - it is empty
-        #   - OR it equals the raw text AND the raw text looks like a
-        #     partial/whole JSON envelope (``{...}`` shape), which means
-        #     parse_memory_response gave us back the literal JSON it
-        #     couldn't decode.
-        # We deliberately do NOT fall back when the raw text is plain
-        # English (e.g. the streaming LLM client yielded a single fallback
-        # chunk like "I'm having trouble thinking right now. Could you
-        # try again?" on an upstream exception).
-        raw_stripped = raw_response.strip()
-        looks_like_json = raw_stripped.startswith("{") and raw_stripped.endswith("}")
-        raw_text_fallback = response_text == raw_stripped and looks_like_json
-        # The third condition (`response_text.startswith("{")`) catches the
-        # case where the parse succeeded but returned a dict-as-message
-        # (which shouldn't happen but historically did on schema drift).
-        if not response_text or raw_text_fallback or response_text.startswith("{"):
-            response_text = prev_visible
+        # Decide whether the parsed message is *actually* the message, or
+        # scaffolding that leaked through because the envelope did not
+        # parse. Reading `{"task": {"task_type": ...` aloud is the worst
+        # outcome this method has, so the check is deliberately broad:
+        # anything that still smells like the envelope is discarded, even
+        # at the cost of falling back to a blank turn.
+        #
+        # We deliberately do NOT discard plain English — the streaming
+        # client yields a single prose chunk ("I'm having trouble thinking
+        # right now…") on an upstream exception, and that should be said.
+        if looks_like_envelope(response_text):
+            logger.warning(
+                "Discarding envelope scaffolding that reached the response "
+                "text (session=%s, %d chars)",
+                session_id,
+                len(response_text),
+            )
+            response_text = ""
+
+        if not response_text:
+            # Two recoveries before giving up: whatever was already shown
+            # to the user, then a direct scrape of the message field out
+            # of the raw buffer — which works even when the surrounding
+            # JSON is too broken to parse.
+            response_text = prev_visible or extract_streamed_message(raw_response)
+            if looks_like_envelope(response_text):
+                response_text = ""
 
         return response_text, payload, bool(prev_visible)
 
@@ -742,11 +970,36 @@ class ReasoningCoordinator:
         record = self._last_task.get(session_id)
         if not record:
             return ""
+        status = record.get("status", "unknown")
+        if status in WAITING_STATUSES:
+            # An open task changes what the next message probably means,
+            # so it gets a heading the model cannot skim past.
+            lines = [
+                "Task currently in progress — the user's next message is "
+                "most likely about THIS, so set \"mode\" accordingly:",
+                f"- instruction: {record.get('instruction', '')}",
+                f"- waiting for: "
+                + (
+                    "the user's approval"
+                    if status == "waiting_for_confirmation"
+                    else "information from the user"
+                ),
+            ]
+            if record.get("question"):
+                lines.append(f"- you asked: {record['question']}")
+            if record.get("missing_fields"):
+                lines.append(
+                    f"- fields still needed: {', '.join(record['missing_fields'])}"
+                )
+            if record.get("description"):
+                lines.append(f"- about to: {record['description']}")
+            return "\n".join(lines)
+
         lines = [
             "Most recent action you delegated (for resolving follow-ups "
             "like \"try again\" or \"cancel that\"):",
             f"- instruction: {record.get('instruction', '')}",
-            f"- status: {record.get('status', 'unknown')}",
+            f"- status: {status}",
         ]
         task_type = record.get("task_type")
         if task_type:
@@ -754,6 +1007,19 @@ class ReasoningCoordinator:
         error = record.get("error")
         if error:
             lines.append(f"- error: {error}")
+
+        raw = record.get("raw")
+        if raw:
+            lines.append("")
+            lines.append(
+                "Full data it returned — REFERENCE ONLY. The user has "
+                "already been given a short spoken summary of this. Never "
+                "read it back, never recite ids, timestamps or paths from "
+                "it. Use it only to resolve what the user refers to next "
+                "(\"the second one\", \"the GitHub one\") into concrete "
+                "parameters for your next task:"
+            )
+            lines.append(raw)
         return "\n".join(lines)
 
     def _format_rag_context(self, retrieved: list[RetrievedChunk] | None) -> str:

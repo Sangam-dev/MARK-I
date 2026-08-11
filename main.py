@@ -172,7 +172,9 @@ async def _run(args: argparse.Namespace) -> None:
 
     bus.subscribe(ShutdownRequested, _handle_shutdown)
 
-    key_count = len(pipeline.llm.pool._entries) if pipeline.llm.pool else 0
+    # len() over the public surface: `pool` is a KeyLane once lanes are in
+    # use, and a lane shares the pool's keys without owning the list.
+    key_count = len(pipeline.llm.pool) if pipeline.llm.pool else 0
     logger.info("GeminiClient initialised  (%d API key(s) in pool)", key_count)
     logger.info("Memory initialised  (structured facts=SQLite, vector/RAG=disabled)")
     logger.info(

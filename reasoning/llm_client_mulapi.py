@@ -159,15 +159,168 @@ class _KeyEntry:
         return any(m not in self.unsupported_models for m in models)
 
 
+FORWARD = 1
+REVERSE = -1
+
+
+class KeyLane:
+    """One consumer's cursor over a shared :class:`KeyPool`.
+
+    Key *health* — cooldowns, dead flags, per-model capability — is a
+    property of the key itself and stays shared: a key exhausted by one
+    caller is exhausted for everyone, and discovering that twice would
+    waste a request.
+
+    What is **not** shared is where a consumer starts and which way it
+    walks. Two lanes over the same pool let the Conversation LLM and the
+    Task LLM sit on different keys instead of contending for one, which
+    matters because they frequently run in the same turn: the controller
+    is streaming its acknowledgement while the planner is decomposing.
+
+    A lane running ``REVERSE`` from the last key meets a ``FORWARD`` lane
+    in the middle only once the keys between them are cooling or dead —
+    at which point sharing is correct, because there is nothing else left
+    to use.
+    """
+
+    def __init__(
+        self,
+        pool: "KeyPool",
+        name: str,
+        direction: int = FORWARD,
+        start: int | None = None,
+    ) -> None:
+        self._pool = pool
+        self.name = name
+        self._step = FORWARD if direction >= 0 else REVERSE
+        n = len(pool)
+        if start is None:
+            # Forward lanes open on the first key, reverse lanes on the
+            # last, so with one pool and two lanes nothing overlaps until
+            # it has to.
+            start = 0 if self._step == FORWARD else n - 1
+        self._active_index = start % n
+        self._lock = asyncio.Lock()
+
+    def __len__(self) -> int:
+        return len(self._pool)
+
+    @property
+    def active_index(self) -> int:
+        return self._active_index
+
+    def _offset(self, base: int, steps: int) -> int:
+        return (base + self._step * steps) % len(self._pool)
+
+    # ── Sticky active-key selection ──────────────────────────────────────
+
+    async def acquire_active(self) -> _KeyEntry:
+        """Return this lane's active key, waiting if it's cooling.
+
+        If the active key is dead or cooling, step to the next available
+        key *in this lane's direction*. If every key is dead, raise
+        ``RuntimeError`` — there is no recovery. If every key is
+        currently cooling, wait for the soonest (single sleep, no
+        busy-loop).
+        """
+        entries = self._pool.entries()
+        async with self._lock:
+            n = len(entries)
+            for _ in range(n):
+                entry = entries[self._active_index]
+                if entry.is_available:
+                    return entry
+                # Step to the next live key. ``is_available`` is False
+                # for both cooling and dead keys, so a dead key is
+                # naturally skipped. We do NOT step past dead keys
+                # permanently — if every other key is also dead we fall
+                # through to the wait-or-raise branch below.
+                self._active_index = self._offset(self._active_index, 1)
+
+            live = [e for e in entries if not e.dead]
+            if not live:
+                raise RuntimeError(
+                    "All API keys are dead — no recovery possible within "
+                    "this process. Restart to retry."
+                )
+
+            soonest = min(e.secs_until_ready() for e in live)
+            self._active_index = entries.index(
+                min(live, key=lambda e: e.secs_until_ready())
+            )
+            _log(
+                f"  ⏳ [{self.name}] all live keys cooling — waiting "
+                f"{soonest:.1f}s for key[{entries[self._active_index].index}]"
+            )
+
+        # Release the lock while we sleep so other coroutines aren't
+        # blocked. The next acquire_active() call will see the recovered
+        # key and return it without re-sleeping.
+        await asyncio.sleep(soonest + 0.1)
+        return await self.acquire_active()
+
+    async def advance_active(self) -> None:
+        """Step this lane's cursor to the next available key.
+
+        Called by the driver after a key-level failure (quota, auth,
+        timeout, repeated retryable error). If no live key is available
+        the cursor stays put and the next :meth:`acquire_active` either
+        waits for a cooldown or raises.
+        """
+        entries = self._pool.entries()
+        async with self._lock:
+            n = len(entries)
+            for steps in range(1, n):
+                idx = self._offset(self._active_index, steps)
+                if entries[idx].is_available:
+                    self._active_index = idx
+                    return
+            # No other live key — leave the cursor alone. acquire_active
+            # will see this and either wait or raise.
+
+    async def next(self) -> _KeyEntry | None:
+        """Legacy round-robin accessor. New code uses
+        :meth:`acquire_active`."""
+        entries = self._pool.entries()
+        async with self._lock:
+            for _ in range(len(entries)):
+                entry = entries[self._active_index]
+                self._active_index = self._offset(self._active_index, 1)
+                if entry.is_available:
+                    return entry
+            return None
+
+    # ── Key state mutations delegate to the shared pool ──────────────────
+
+    def mark_quota(self, entry: _KeyEntry, exc: Exception) -> None:
+        self._pool.mark_quota(entry, exc)
+
+    def mark_not_found(self, entry: _KeyEntry, model: str) -> None:
+        self._pool.mark_not_found(entry, model)
+
+    def mark_invalid(self, entry: _KeyEntry, exc: Exception) -> None:
+        self._pool.mark_invalid(entry, exc)
+
+    def mark_success(self, entry: _KeyEntry, model: str) -> None:
+        self._pool.mark_success(entry, model)
+
+    def entries(self) -> list[_KeyEntry]:
+        return self._pool.entries()
+
+    def status(self) -> str:
+        return self._pool.status(active_index=self._active_index, lane=self.name)
+
+
 class KeyPool:
     """
     Sticky active-key pool of Gemini API keys.
 
-    Exactly one key is "active" at any moment. All requests use the
-    active key. The active key changes only when it becomes unusable.
+    The pool owns the keys and their health. *Which* key a given consumer
+    is currently on belongs to a :class:`KeyLane` — see :meth:`lane`.
+    Every lane sees the same cooldowns and the same dead keys.
 
-    Thread-safe via ``asyncio.Lock`` (the hot paths run on a single async
-    loop, but the lock keeps active-key changes atomic under any
+    Thread-safe via ``asyncio.Lock`` per lane (the hot paths run on a
+    single async loop, but the locks keep cursor changes atomic under any
     concurrent call pattern).
     """
 
@@ -178,8 +331,10 @@ class KeyPool:
                 "Set GEMINI_API_KEY_1, GEMINI_API_KEY_2, … (or GEMINI_API_KEY) in .env\n"
             )
         self._entries = [_KeyEntry(k, i) for i, k in enumerate(keys)]
-        self._active_index: int = 0  # entry index, not cursor
-        self._lock = asyncio.Lock()
+        self._lanes: dict[str, KeyLane] = {}
+        # Callers that never ask for a lane get the historical behaviour:
+        # start at key 1, walk forward.
+        self._default_lane = self.lane("default", FORWARD)
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -187,88 +342,39 @@ class KeyPool:
     def entries(self) -> list[_KeyEntry]:
         return list(self._entries)
 
-    # ── Sticky active-key selection ──────────────────────────────────────
+    def lane(
+        self, name: str, direction: int = FORWARD, start: int | None = None
+    ) -> KeyLane:
+        """Get (or create) a named cursor over this pool.
+
+        Named rather than positional so two callers asking for
+        ``"conversation"`` share one cursor — the point is to separate
+        *roles*, not every call site.
+        """
+        existing = self._lanes.get(name)
+        if existing is not None:
+            return existing
+        created = KeyLane(self, name, direction=direction, start=start)
+        self._lanes[name] = created
+        _log(
+            f"  ⇢ key lane '{name}' starts at key[{created.active_index}] "
+            f"going {'forward' if direction >= 0 else 'backward'}"
+        )
+        return created
+
+    def lanes(self) -> dict[str, KeyLane]:
+        return dict(self._lanes)
+
+    # ── Sticky active-key selection (default lane) ───────────────────────
 
     async def acquire_active(self) -> _KeyEntry:
-        """Return the current active key, waiting if it's cooling.
-
-        If the active key is dead or cooling, advance to the next
-        available key. If every key is dead, raise ``RuntimeError`` —
-        there is no recovery. If every key is currently cooling, wait
-        for the soonest to recover (single sleep, no busy-loop).
-        """
-        async with self._lock:
-            n = len(self._entries)
-            for _ in range(n):
-                entry = self._entries[self._active_index]
-                if entry.is_available:
-                    return entry
-                # Try the next live key. ``is_available`` is False for
-                # both cooling and dead keys, so a dead key is
-                # naturally skipped. We do NOT advance past dead keys
-                # permanently — if all later keys are also dead we
-                # fall through to the wait-or-raise branch below.
-                self._active_index = (self._active_index + 1) % n
-
-            # Every key is unavailable. Distinguish: if all are dead,
-            # give up; otherwise wait for the soonest cooldown.
-            live = [e for e in self._entries if not e.dead]
-            if not live:
-                raise RuntimeError(
-                    "All API keys are dead — no recovery possible within "
-                    "this process. Restart to retry."
-                )
-
-            soonest = min(e.secs_until_ready() for e in live)
-            self._active_index = self._entries.index(
-                min(live, key=lambda e: e.secs_until_ready())
-            )
-            _log(
-                f"  ⏳ all live keys cooling — waiting {soonest:.1f}s for "
-                f"key[{self._entries[self._active_index].index}]"
-            )
-
-        # Release the lock while we sleep so other coroutines aren't
-        # blocked. The next acquire_active() call will see the recovered
-        # key and return it without re-sleeping.
-        await asyncio.sleep(soonest + 0.1)
-        return await self.acquire_active()
+        return await self._default_lane.acquire_active()
 
     async def advance_active(self) -> None:
-        """Move the active pointer to the next available key.
-
-        Called by the driver after a key-level failure (quota, auth,
-        timeout, repeated retryable error). If no live key is
-        available, the cursor stays put and the next :meth:`acquire_active`
-        will either wait for cooldown recovery or raise if all keys are
-        dead. This is a no-op if the current key is already the only
-        available one — the driver will eventually surface an error
-        through the ``acquire_active`` exception path.
-        """
-        async with self._lock:
-            n = len(self._entries)
-            for offset in range(1, n):
-                idx = (self._active_index + offset) % n
-                if self._entries[idx].is_available:
-                    self._active_index = idx
-                    return
-            # No other live key — leave the cursor alone. acquire_active
-            # will see this and either wait or raise.
-
-    # ── Compatibility shim: legacy round-robin next() ────────────────────
+        await self._default_lane.advance_active()
 
     async def next(self) -> _KeyEntry | None:
-        """Return the next available key, or ``None`` if every key is
-        unavailable. Kept for backward compatibility with any external
-        caller that used the old round-robin API. New code should use
-        :meth:`acquire_active`."""
-        async with self._lock:
-            for _ in range(len(self._entries)):
-                entry = self._entries[self._active_index]
-                self._active_index = (self._active_index + 1) % len(self._entries)
-                if entry.is_available:
-                    return entry
-            return None
+        return await self._default_lane.next()
 
     # ── Key state mutations ──────────────────────────────────────────────
 
@@ -309,13 +415,27 @@ class KeyPool:
     def mark_success(self, entry: _KeyEntry, model: str) -> None:
         entry.mark_supported(model)
 
-    def status(self) -> str:
+    def status(self, active_index: int | None = None, lane: str = "") -> str:
+        """Render key health.
+
+        With no arguments, every lane's position is marked, which is what
+        you want when diagnosing the pool as a whole. Passing
+        ``active_index`` marks just that one — used by
+        :meth:`KeyLane.status`.
+        """
+        if active_index is None:
+            positions = {
+                l.active_index: name for name, l in self._lanes.items()
+                if name != "default" or len(self._lanes) == 1
+            }
+        else:
+            positions = {active_index: lane or "active"}
+
         lines = []
-        marker = " ← active" if self._entries else ""
         for i, e in enumerate(self._entries):
             tag = ""
-            if i == self._active_index and e.is_available:
-                tag = marker
+            if i in positions and e.is_available:
+                tag = f" ← {positions[i]}"
             if e.dead:
                 lines.append(f"  key[{e.index}] 💀 dead{tag}")
             elif e.is_available:
@@ -479,7 +599,7 @@ async def _run_stream(
 
 
 async def _try_with_active_key(
-    pool: KeyPool,
+    pool: KeyPool | KeyLane,
     models: list[str],
     call_kwargs: dict[str, Any],
     timeout: float,
@@ -607,7 +727,7 @@ async def _try_with_active_key(
 
 
 async def hedged_generate(
-    pool: KeyPool,
+    pool: KeyPool | KeyLane,
     models: list[str],
     prompt: str,
     hedge_width: int,  # pyright: ignore[reportArgumentType]
@@ -632,7 +752,7 @@ async def hedged_generate(
 
 
 async def hedged_generate_conv(
-    pool: KeyPool,
+    pool: KeyPool | KeyLane,
     models: list[str],
     contents: list,
     config: Any,
@@ -654,7 +774,7 @@ async def hedged_generate_conv(
 
 
 async def hedged_stream(
-    pool: KeyPool,
+    pool: KeyPool | KeyLane,
     models: list[str],
     prompt: str,
     hedge_width: int,  # pyright: ignore[reportArgumentType]
@@ -687,7 +807,7 @@ async def hedged_stream(
 
 
 async def hedged_stream_conv(
-    pool: KeyPool,
+    pool: KeyPool | KeyLane,
     models: list[str],
     contents: list,
     config: Any,

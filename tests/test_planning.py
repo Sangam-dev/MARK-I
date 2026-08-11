@@ -1,7 +1,7 @@
 """Integration tests for the Planner/Scheduler/Executor subsystem.
 
 These tests use a mocked GeminiClient to produce deterministic plans
-and verify the full event flow from TaskRequested (the Conversation LLM's
+and verify the full event flow from TaskDispatched (the Orchestrator's
 delegation) -> PlanCreated -> TaskStarted -> TaskCompleted -> PlanCompleted
 -> TaskResultReady.
 
@@ -24,7 +24,7 @@ from core.events import (
     ResponseReady,
     TaskCompleted,
     TaskExecutionRequested,
-    TaskRequested,
+    TaskDispatched,
     TaskResultReady,
 )
 from memory.token_log import TokenLog
@@ -32,9 +32,34 @@ from planning.executor import PlanExecutor
 from planning.models import ExecutionPlan, PlannedTask, PlanStatus, TaskStatus
 from planning.planner import Planner
 from planning.scheduler import PlanScheduler
+from reasoning import groq_voice
+from reasoning.groq_voice import GroqVoice
 from reasoning.coordinator import ReasoningCoordinator
 from reasoning.tool_voice import naturalize_single_tool
 from tasks.registry import TASK_REGISTRY
+
+
+@dataclass
+class StubVoice(GroqVoice):
+    """Deterministic stand-in for the Groq phrasing pass — no network."""
+
+    text: str = "All done, sir."
+    calls: list[dict[str, str]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        GroqVoice.__init__(self, client=object())
+
+    async def speak(
+        self,
+        user_request: str,
+        tool_output: str,
+        status: str = "completed",
+        fallback: str = "",
+    ) -> str:
+        self.calls.append({"tool_output": tool_output, "status": status})
+        return self.text
+
+
 
 
 # ── Test helpers ──────────────────────────────────────────────────────
@@ -202,13 +227,13 @@ async def test_plan_decomposition_single_task() -> None:
     scheduler.executor.register()
 
     # Trigger the planner
-    request = TaskRequested(
+    request = TaskDispatched(
         task_id="task-1",
         instruction="open firefox",
         task_type="open_app",
         parameters={"app_name": "firefox"},
     )
-    await planner.on_task_requested(request)
+    await planner.on_task_dispatched(request)
 
     await asyncio.sleep(0.1)  # let events propagate
     await bus.drain()
@@ -271,8 +296,8 @@ async def test_plan_decomposition_multi_task() -> None:
     scheduler.register()
     scheduler.executor.register()
 
-    await planner.on_task_requested(
-        TaskRequested(
+    await planner.on_task_dispatched(
+        TaskDispatched(
             task_id="task-1",
             instruction="Create Test folder, add README.md, and open it",
         )
@@ -351,8 +376,8 @@ async def test_parallel_tasks_run_concurrently() -> None:
     scheduler.register()
     scheduler.executor.register()
 
-    await planner.on_task_requested(
-        TaskRequested(
+    await planner.on_task_dispatched(
+        TaskDispatched(
             task_id="task-1",
             instruction="do two things at once",
         )
@@ -404,8 +429,8 @@ async def test_reference_resolution() -> None:
     scheduler.register()
     scheduler.executor.register()
 
-    await planner.on_task_requested(
-        TaskRequested(
+    await planner.on_task_dispatched(
+        TaskDispatched(
             task_id="task-1",
             instruction="Create folder Test and open it",
         )
@@ -446,8 +471,8 @@ async def test_fast_path_single_task() -> None:
     planner.register()
 
     # Delegation with task_type already resolved
-    await planner.on_task_requested(
-        TaskRequested(
+    await planner.on_task_dispatched(
+        TaskDispatched(
             task_id="task-1",
             instruction="open firefox",
             task_type="open_app",
@@ -483,8 +508,8 @@ async def test_single_tool_with_conjunction_uses_fast_path() -> None:
     planner = Planner(bus=bus, llm=llm, memory=memory)
     planner.register()
 
-    await planner.on_task_requested(
-        TaskRequested(
+    await planner.on_task_dispatched(
+        TaskDispatched(
             task_id="task-1",
             instruction="open firefox and run it",
             task_type="open_app",
@@ -546,8 +571,8 @@ async def test_multistep_request_bypasses_fast_path() -> None:
 
     # Simulate a delegation whose tool hint collapsed a multi-step
     # instruction into a single (garbled) open_app task.
-    await planner.on_task_requested(
-        TaskRequested(
+    await planner.on_task_dispatched(
+        TaskDispatched(
             task_id="task-1",
             instruction="open firefox and create a folder called test",
             task_type="open_app",
@@ -597,8 +622,8 @@ async def test_task_validation_unknown_tool() -> None:
     planner = Planner(bus=bus, llm=llm, memory=memory)
     planner.register()
 
-    await planner.on_task_requested(
-        TaskRequested(
+    await planner.on_task_dispatched(
+        TaskDispatched(
             task_id="task-1",
             instruction="do something",
         )
@@ -647,8 +672,8 @@ async def test_dependency_cycle_detection() -> None:
     planner = Planner(bus=bus, llm=llm, memory=memory)
     planner.register()
 
-    await planner.on_task_requested(
-        TaskRequested(
+    await planner.on_task_dispatched(
+        TaskDispatched(
             task_id="task-1",
             instruction="cycle test",
         )
@@ -792,6 +817,11 @@ async def test_natural_summary_for_multitask_plan() -> None:
     coordinator = ReasoningCoordinator(bus=bus, gemini_client=llm, memory_manager=memory)
     coordinator.register()
 
+    # Combining several results is the voice layer's job now, so stub it
+    # rather than the Gemini client.
+    voice = StubVoice(text="Folder's ready and you've got 2 alarms queued, sir.")
+    groq_voice.set_shared_voice(voice)
+
     bus.emit(
         TaskResultReady(
             task_id="task-test",
@@ -827,14 +857,19 @@ async def test_natural_summary_for_multitask_plan() -> None:
 
     assert len(responses) == 1, responses
     text = responses[0].text
-    # The LLM response must flow through verbatim.
+    # The voice's phrasing must flow through verbatim.
     assert "Folder's ready" in text and "alarms queued" in text, text
-    # The LLM must have been called exactly once with the per-tool inputs.
-    assert len(llm.generate_calls) == 1, llm.generate_calls
-    prompt = llm.generate_calls[0]["prompt"]
-    assert "create a folder called Test" in prompt, prompt
-    assert "file_operation" in prompt, prompt
-    assert "list_alarms" in prompt, prompt
+
+    # The voice must have been called exactly once, with every tool's
+    # output — combining them is the whole point of this path.
+    assert len(voice.calls) == 1, voice.calls
+    tool_output = voice.calls[0]["tool_output"]
+    assert "Created folder: Test" in tool_output, tool_output
+    assert "2 alarms" in tool_output, tool_output
+    assert "file manager" in tool_output, tool_output
+
+    # And the scarce Gemini keys were not spent on phrasing.
+    assert llm.generate_calls == [], llm.generate_calls
 
     await bus.close()
 

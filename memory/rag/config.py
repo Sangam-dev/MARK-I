@@ -50,7 +50,7 @@ logger = logging.getLogger("kancha.memory.rag.config")
 # Provider defaults — keyed by provider name so switching providers does
 # not require also switching the model env var.
 _DEFAULT_EMBEDDING_MODELS = {
-    "gemini": "text-embedding-004",
+    "gemini": "gemini-embedding-001",
     "ollama": "nomic-embed-text",
     "hash": "hash-768",
 }
@@ -128,7 +128,7 @@ class RAGConfig:
 
     # ── Embeddings ───────────────────────────────────────────────────
     embedding_provider: str = "gemini"
-    embedding_model: str = "text-embedding-004"
+    embedding_model: str = "gemini-embedding-001"
     embedding_dimensions: int = 768
     embedding_batch_size: int = 16
     ollama_url: str = "http://localhost:11434"

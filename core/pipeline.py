@@ -12,14 +12,20 @@ The control flow it wires up is a hierarchy, not a fan-out::
         -> ReasoningCoordinator          Conversation LLM — the controller
              |- ResponseReady            -> ResponseFormatter, TTS
              `- TaskRequested            explicit delegation
-                  -> Planner             Task LLM — the executor
-                       -> PlanScheduler -> PlanExecutor -> TaskExecutor
-                       -> TaskResultReady
-                            -> ReasoningCoordinator -> ResponseReady
+                  -> TaskOrchestrator    task state — the mediator
+                       `- TaskDispatched
+                            -> Planner   Task LLM — the executor
+                                 -> PlanScheduler -> PlanExecutor -> TaskExecutor
+                                 -> TaskProtocolResponse
+                                      -> TaskOrchestrator
+                                           -> TaskResultReady
+                                                -> ReasoningCoordinator
 
-The Conversation LLM is the only subscriber to user input; the Task LLM is
-the only consumer of ``TaskRequested``. See ``reasoning/coordinator.py``
-and ``planning/planner.py`` for the two halves.
+The Conversation LLM is the only subscriber to user input; the Orchestrator
+is the only consumer of ``TaskRequested`` and the only emitter of
+``TaskDispatched``, so neither LLM can reach the other directly. See
+``reasoning/coordinator.py``, ``planning/orchestrator.py`` and
+``planning/planner.py`` for the three parts.
 
 ``build_pipeline()`` is now the single source of truth. Anything that needs a
 running KANCHA pipeline (CLI, API server, tests, a future gRPC front door,
@@ -58,10 +64,11 @@ from memory.token_log import TokenLog, jsonl_sink
 from nlu.classifier import NLUClassifier
 from output.response_formatter import ResponseFormatter
 from output.tts import TTSHandler
+from planning.orchestrator import TaskOrchestrator
 from planning.planner import Planner
 from planning.scheduler import PlanScheduler
 from reasoning.coordinator import ReasoningCoordinator
-from reasoning.llm_client import GeminiClient
+from reasoning.llm_client import FORWARD, REVERSE, GeminiClient
 from tasks.executor import (
     TaskExecutor,
     attach_monitor_loop,
@@ -123,9 +130,12 @@ class Pipeline:
     bus: EventBus
     memory: MemoryManager
     llm: GeminiClient
+    #: Second client on the opposite key lane — the Task LLM's.
+    task_llm: GeminiClient
     nlu: NLUClassifier
     coordinator: ReasoningCoordinator
     task_executor: TaskExecutor
+    orchestrator: TaskOrchestrator
     planner: Planner
     plan_scheduler: PlanScheduler
     formatter: ResponseFormatter
@@ -298,8 +308,23 @@ async def build_pipeline(
         session_id=session_id,
         sink=jsonl_sink(data_dir / "token_log.jsonl"),
     )
-    llm = GeminiClient(token_log=token_log)
+    # Two clients over ONE shared key pool, on opposite lanes.
+    #
+    # The Conversation LLM starts at GEMINI_API_KEY_1 and walks forward;
+    # the Task LLM starts at the last key and walks backward. They only
+    # land on the same key once everything between them is cooling or
+    # dead. This matters because both roles routinely run inside one
+    # turn — the controller streams its acknowledgement while the planner
+    # decomposes — and on a single lane that was two requests queued
+    # against one key's per-minute quota.
+    #
+    # Key *health* stays shared: a key one lane exhausts is exhausted for
+    # both, so neither rediscovers it the hard way.
+    llm = GeminiClient(token_log=token_log, lane="conversation", lane_direction=FORWARD)
     await llm.initialize()
+
+    task_llm = GeminiClient(token_log=token_log, lane="task", lane_direction=REVERSE)
+    await task_llm.initialize()
 
     # ── NLU ───────────────────────────────────────────────────────────────
     # Built but deliberately NOT subscribed to the bus. User input goes to
@@ -359,16 +384,25 @@ async def build_pipeline(
     task_executor = TaskExecutor(bus=bus)
     task_executor.register()
 
+    # ── Task Orchestrator ─────────────────────────────────────────────────
+    # Sits between the two LLMs and owns task state. It is the only
+    # consumer of TaskRequested and the only emitter of TaskDispatched, so
+    # a task that needs to ask the user something has somewhere to wait,
+    # and approval can only come from a real user message.
+    orchestrator = TaskOrchestrator(bus=bus)
+    orchestrator.register()
+
     # ── Task LLM (Planner) + Plan Scheduler ───────────────────────────────
     # These run on top of the existing task executor. The Planner subscribes
-    # to TaskRequested — the Conversation LLM's delegation, never raw user
-    # input — and decomposes it; the PlanScheduler walks the dependency graph
-    # and dispatches individual tasks via the existing TaskExecutor (re-using
-    # TaskExecutionRequested). The Planner then reports the outcome back to
-    # the Conversation LLM as TaskResultReady.
+    # to TaskDispatched — the Orchestrator's decision to run something,
+    # never raw user input — and decomposes it; the PlanScheduler walks the
+    # dependency graph and dispatches individual tasks via the existing
+    # TaskExecutor (re-using TaskExecutionRequested). The Planner reports
+    # back through TaskProtocolResponse, which the Orchestrator turns into
+    # the TaskResultReady the Conversation LLM consumes.
     planner = Planner(
         bus=bus,
-        llm=llm,
+        llm=task_llm,
         memory=memory,
         token_log=token_log,
     )
@@ -406,9 +440,11 @@ async def build_pipeline(
         bus=bus,
         memory=memory,
         llm=llm,
+        task_llm=task_llm,
         nlu=nlu,
         coordinator=coordinator,
         task_executor=task_executor,
+        orchestrator=orchestrator,
         planner=planner,
         plan_scheduler=plan_scheduler,
         formatter=formatter,

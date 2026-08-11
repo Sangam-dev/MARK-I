@@ -142,9 +142,13 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
     "system": TaskSpec(
         name="system",
         description=(
-            "Control the Linux system through an allowlist of structured "
-            "actions: open_application (target=app), open_path (target=file "
-            "or folder), wifi (operation=on|off|status), cpu, memory, disk "
+            "Control this computer through an allowlist of structured "
+            "actions — use it for ANY machine control the user asks for: "
+            "open_application (target=app), open_path (target=file "
+            "or folder), brightness (operation=get|set|up|down, level=1..100, "
+            "step=1..50), volume (operation=get|set|up|down|mute|unmute, "
+            "level=0..100, step=1..50), wifi (operation=on|off|status), "
+            "bluetooth (operation=on|off|status), battery, cpu, memory, disk "
             "(target=mount point), processes (operation=cpu|memory, "
             "limit=1..50), kill_process (pid or name), lock_screen, "
             "system_info, service (name, operation=status|start|stop|restart, "
@@ -165,6 +169,8 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
             "pid",
             "scope",
             "limit",
+            "level",
+            "step",
             "confirm",
         ),
         # NOTE: deliberately not `requires_confirmation=True`. That flag
@@ -179,6 +185,55 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
             "pid": int,
             "scope": str,
             "limit": int,
+            "level": int,
+            "step": int,
+            "confirm": bool,
+        },
+    ),
+    "gmail": TaskSpec(
+        name="gmail",
+        description=(
+            "Read and manage the user's Gmail through an allowlist of "
+            "structured actions: list_emails (limit=1..50, offset, optional "
+            "query), search_emails (query in Gmail syntax such as "
+            "'from:alice is:unread newer_than:2d', limit, offset), read_email "
+            "(message_id), send_email (to, subject, body, optional cc/bcc), "
+            "mark_read, mark_unread, star_email, unstar_email, archive_email "
+            "and trash_email (all take message_id). Reading runs immediately. "
+            "Everything that changes the mailbox — sending, trashing, "
+            "archiving, read/star flags — ALWAYS refuses the first time and "
+            "reports that approval is needed: tell the user what will happen, "
+            "ask them, and only after they agree, repeat the same request "
+            "with confirm=true. Setting confirm=true up front does nothing — "
+            "the refusal is enforced by the tool, not by you. Message ids come "
+            "from list_emails or search_emails; never invent one. There are no "
+            "attachments."
+        ),
+        required_params=("action",),
+        optional_params=(
+            "query",
+            "limit",
+            "offset",
+            "message_id",
+            "to",
+            "cc",
+            "bcc",
+            "subject",
+            "body",
+            "confirm",
+        ),
+        # NOTE: deliberately not `requires_confirmation=True`. That flag
+        # blocks a task wholesale in tasks/executor.py, which would take
+        # "read me my latest email" down along with "send this". The
+        # gate lives per-action inside actions/gmail_tool.py instead.
+        param_types={
+            "action": str,
+            "query": str,
+            "limit": int,
+            "offset": int,
+            "message_id": str,
+            "subject": str,
+            "body": str,
             "confirm": bool,
         },
     ),

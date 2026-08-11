@@ -236,8 +236,56 @@ class TaskRequested(BaseEvent):
         The raw user text that triggered the delegation. Logging and
         naturalisation context only — the Task LLM must plan from
         ``instruction``.
+    mode:
+        What this turn is doing to the conversation's task. One of
+        ``"new"``, ``"answer"`` (supplying a field the Task LLM asked
+        for), ``"confirm"``, ``"reject"``, ``"cancel"``, ``"modify"``.
+        The Conversation LLM proposes it; the Orchestrator validates it
+        against the real task state and may override — a "confirm" with
+        nothing awaiting confirmation is not a confirmation.
+    resume_task_id:
+        The task this turn continues, when known. Empty on a new task.
+        The Orchestrator resolves it from session state when the
+        Conversation LLM leaves it blank.
 
     emitted by: reasoning/coordinator.py (Conversation LLM)
+    consumed by: planning/orchestrator.py (Task Orchestrator)
+
+    Note the consumer: this no longer reaches the Task LLM directly.
+    The Orchestrator owns task state and re-emits :class:`TaskDispatched`.
+    """
+
+    task_id: str = ""
+    task_type: str = ""
+    instruction: str = ""
+    parameters: dict[str, Any] = field(default_factory=dict)
+    expected_result: str = ""
+    context: dict[str, Any] = field(default_factory=dict)
+    follow_up: bool = False
+    user_request: str = ""
+    mode: str = "new"
+    resume_task_id: str = ""
+
+
+@dataclass(frozen=True)
+class TaskDispatched(BaseEvent):
+    """The **Orchestrator handing work to the Task LLM**.
+
+    Distinct from :class:`TaskRequested` on purpose: a Task Request is
+    what the *conversation* asked for, while a Dispatch is what the
+    Orchestrator decided to actually run, after merging answers from
+    earlier turns and deciding whether approval exists.
+
+    ``user_confirmed`` is the only channel through which approval
+    reaches execution, and the Orchestrator sets it **only** from a real
+    subsequent user message. Nothing the Task LLM generates can set it —
+    that is what stops a model from approving its own dangerous action.
+
+    ``attempt`` counts how many times this task has been dispatched, so
+    a Task LLM that keeps asking for information it already has can be
+    stopped rather than looped.
+
+    emitted by: planning/orchestrator.py
     consumed by: planning/planner.py (Task LLM)
     """
 
@@ -249,6 +297,34 @@ class TaskRequested(BaseEvent):
     context: dict[str, Any] = field(default_factory=dict)
     follow_up: bool = False
     user_request: str = ""
+    user_confirmed: bool = False
+    attempt: int = 1
+
+
+@dataclass(frozen=True)
+class TaskProtocolResponse(BaseEvent):
+    """The **Task LLM's structured reply** to a dispatch.
+
+    The Task LLM never speaks to the user. Everything it wants to say —
+    "I need the body", "this will send mail, are you sure", "here is the
+    result" — comes back through this one event, in the closed vocabulary
+    of :mod:`planning.protocol`:
+
+    ``input_required`` | ``confirmation_required`` | ``execute`` |
+    ``completed`` | ``failed``
+
+    ``payload`` holds the type-specific fields and is validated by
+    :func:`planning.protocol.parse_task_response` before the Orchestrator
+    acts on it. An unparseable payload fails the task; it never becomes
+    a question to the user.
+
+    emitted by: planning/planner.py (Task LLM)
+    consumed by: planning/orchestrator.py
+    """
+
+    task_id: str = ""
+    type: str = ""
+    payload: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -260,7 +336,11 @@ class TaskResultReady(BaseEvent):
     job (see ``reasoning/coordinator.py:on_task_result``).
 
     ``status`` is one of ``"completed" | "partial" | "failed" |
-    "cancelled"`` — the same vocabulary :class:`PlanCompleted` uses.
+    "cancelled"`` — the same vocabulary :class:`PlanCompleted` uses —
+    plus the two *interactive* states the Orchestrator introduces:
+    ``"waiting_for_input"`` and ``"waiting_for_confirmation"``. Those two
+    are not outcomes; they are the Task LLM asking the user something
+    through the only party allowed to speak to them.
 
     ``results`` carries the per-tool outcomes in
     :class:`PlanCompleted.task_results` shape
@@ -268,7 +348,12 @@ class TaskResultReady(BaseEvent):
     :func:`reasoning.naturalize.naturalize_plan_response` consumes it
     unchanged.
 
-    emitted by: planning/planner.py (Task LLM)
+    ``question``/``missing_fields`` are set on ``waiting_for_input``;
+    ``description``/``confirmation_data`` on
+    ``waiting_for_confirmation``. The Conversation LLM turns whichever
+    is present into natural speech — it must not read them out verbatim.
+
+    emitted by: planning/orchestrator.py
     consumed by: reasoning/coordinator.py (Conversation LLM)
     """
 
@@ -279,6 +364,10 @@ class TaskResultReady(BaseEvent):
     task_type: str = ""
     instruction: str = ""
     user_request: str = ""
+    question: str = ""
+    missing_fields: list[str] = field(default_factory=list)
+    description: str = ""
+    confirmation_data: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

@@ -10,6 +10,7 @@ from actions.alarms import cancel_alarms, list_alarms, set_alarm
 from actions.apps import open_app
 from actions.desktop_control import desktop_control
 from actions.file_controller import file_controller
+from actions.gmail_tool import get_shared_gmail_tool
 from actions.system_commands import SystemCommandExecutor
 from actions.system_monitor import (
     SystemMonitor,
@@ -281,6 +282,16 @@ class TaskExecutor:
             if result.success:
                 return TaskExecutionResult(True, result.output or "Done.")
             return TaskExecutionResult(False, result.error or "System action failed.")
+
+        if task_name == "gmail":
+            # GmailTool is already async (imaplib/smtplib run via
+            # to_thread inside the client), so no to_thread hop here.
+            # The shared instance is required, not incidental: armed
+            # confirmations live on it and must survive between turns.
+            result = await get_shared_gmail_tool().execute(params)
+            if result.success:
+                return TaskExecutionResult(True, result.output or "Done.")
+            return TaskExecutionResult(False, result.error or "Gmail action failed.")
 
         if task_name == "system_monitor":
             return await self._dispatch_system_monitor(params)

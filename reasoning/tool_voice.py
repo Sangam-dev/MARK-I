@@ -337,6 +337,10 @@ TOOL_VOICE: dict[str, ToolVoice] = {
     # "CPU at 42%, 287 processes."), and its listings are multi-line —
     # the default colon-rewrite would mangle those into one blob.
     "system": _passthrough,
+    # GmailTool output is already spoken-shape ("Email sent to …",
+    # "'Invoice' moved to Trash."), and its listings are multi-line —
+    # the default colon-rewrite would mangle those into one blob.
+    "gmail": _passthrough,
     "web_search": _voice_web_search,
 }
 

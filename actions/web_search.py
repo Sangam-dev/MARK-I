@@ -308,11 +308,11 @@ def web_search(query: str) -> SearchResult:
         return SearchResult(True, cached)
 
     # Primary: Gemini with Google Search grounding, rotating across keys.
-    answer = _gemini_search(query)
-    if answer:
-        logger.info("web_search: answered by Gemini (%d chars)", len(answer))
-        _cache_put(query, answer)
-        return SearchResult(True, answer)
+    # answer = _gemini_search(query)
+    # if answer:
+    #     logger.info("web_search: answered by Gemini (%d chars)", len(answer))
+    #     _cache_put(query, answer)
+    #     return SearchResult(True, answer)
 
     # Fallback: Playwright + Groq synthesis.
     answer = _search_playwright(query)

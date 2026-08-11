@@ -105,6 +105,33 @@ ACTIONS: dict[str, ActionSpec] = {
         operations=("on", "off", "status"),
         binaries=("nmcli",),
     ),
+    "brightness": ActionSpec(
+        name="brightness",
+        summary=(
+            "Screen backlight (operation=get|set|up|down, level=1..100 for "
+            "set, step=1..50 for up/down)."
+        ),
+        operations=("get", "set", "up", "down"),
+    ),
+    "volume": ActionSpec(
+        name="volume",
+        summary=(
+            "Audio output (operation=get|set|up|down|mute|unmute, "
+            "level=0..100 for set, step=1..50 for up/down)."
+        ),
+        operations=("get", "set", "up", "down", "mute", "unmute"),
+        binaries=("pactl", "wpctl", "amixer"),
+    ),
+    "bluetooth": ActionSpec(
+        name="bluetooth",
+        summary="Turn Bluetooth on or off, or report its state (operation=on|off|status).",
+        operations=("on", "off", "status"),
+        binaries=("rfkill", "bluetoothctl"),
+    ),
+    "battery": ActionSpec(
+        name="battery",
+        summary="Charge level, and whether the machine is plugged in.",
+    ),
     "cpu": ActionSpec(name="cpu", summary="Current CPU load."),
     "memory": ActionSpec(name="memory", summary="Current RAM usage."),
     "disk": ActionSpec(
@@ -519,6 +546,369 @@ class SystemTool:
             [binary, "radio", "wifi", operation],
             success_output=f"Wi-Fi turned {operation}.",
         )
+
+    # ── display ───────────────────────────────────────────────────────
+
+    # Backlight control has no single Linux answer, so the handler walks a
+    # chain. On this class of machine (GNOME on Wayland) the sysfs node is
+    # root-owned and `xrandr --brightness` only dims XWayland clients, so
+    # the D-Bus route is the one that actually moves the backlight; the
+    # CLI tools are preferred when installed because they work outside
+    # GNOME too.
+    _GNOME_POWER_DBUS = (
+        "--session",
+        "--dest",
+        "org.gnome.SettingsDaemon.Power",
+        "--object-path",
+        "/org/gnome/SettingsDaemon/Power",
+        "--method",
+    )
+
+    async def _handle_brightness(
+        self, spec: ActionSpec, params: dict[str, Any]
+    ) -> SystemToolResult:
+        operation = _require_choice(
+            params.get("operation", "get"), "operation", spec.operations
+        )
+
+        current = await self._read_brightness()
+
+        if operation == "get":
+            if current is None:
+                return SystemToolResult(
+                    success=False,
+                    error="could not read the screen brightness",
+                    action=spec.name,
+                )
+            return SystemToolResult(
+                success=True, output=f"Brightness is at {current}%.", action=spec.name
+            )
+
+        if operation == "set":
+            level = _require_int(params.get("level"), "level", 1, 100)
+        else:
+            step = _require_int(params.get("step", 10), "step", 1, 50)
+            if current is None:
+                raise ArgumentError(
+                    "could not read the current brightness, so it cannot be "
+                    "adjusted relatively — set an explicit level instead"
+                )
+            level = current + step if operation == "up" else current - step
+            # Clamp rather than reject: "dim it" at 5% should go to the
+            # floor, not fail. 1% not 0% — a black screen looks broken.
+            level = max(1, min(100, level))
+
+        applied = await self._write_brightness(level)
+        if applied is None:
+            return SystemToolResult(
+                success=False,
+                error=(
+                    "no working brightness control found (tried GNOME's "
+                    "D-Bus interface, brightnessctl, light and sysfs). "
+                    "Installing brightnessctl would fix this."
+                ),
+                action=spec.name,
+            )
+        return SystemToolResult(
+            success=True, output=f"Brightness set to {applied}%.", action=spec.name
+        )
+
+    async def _read_brightness(self) -> int | None:
+        """Current backlight as a percentage, or None if unreadable."""
+        gdbus = _first_available("gdbus")
+        if gdbus:
+            outcome = await self._run(
+                [
+                    gdbus,
+                    "call",
+                    *self._GNOME_POWER_DBUS,
+                    "org.freedesktop.DBus.Properties.Get",
+                    "org.gnome.SettingsDaemon.Power.Screen",
+                    "Brightness",
+                ],
+                self._timeout,
+            )
+            if outcome.ok:
+                match = re.search(r"-?\d+", outcome.stdout)
+                if match:
+                    value = int(match.group())
+                    # GNOME reports -1 when no backlight is controllable.
+                    if value >= 0:
+                        return value
+
+        brightnessctl = _first_available("brightnessctl")
+        if brightnessctl:
+            outcome = await self._run(
+                [brightnessctl, "--machine-readable", "info"], self._timeout
+            )
+            if outcome.ok:
+                # device,class,current,percent%,max
+                fields = outcome.stdout.split(",")
+                if len(fields) >= 4:
+                    match = re.search(r"\d+", fields[3])
+                    if match:
+                        return int(match.group())
+
+        raw = self._read_sysfs_brightness()
+        if raw is not None:
+            return raw
+
+        return None
+
+    @staticmethod
+    def _read_sysfs_brightness() -> int | None:
+        """Read /sys/class/backlight/*/brightness as a percentage."""
+        root = Path("/sys/class/backlight")
+        if not root.is_dir():
+            return None
+        for device in sorted(root.iterdir()):
+            try:
+                current = int((device / "brightness").read_text().strip())
+                maximum = int((device / "max_brightness").read_text().strip())
+            except (OSError, ValueError):
+                continue
+            if maximum > 0:
+                return round(current * 100 / maximum)
+        return None
+
+    async def _write_brightness(self, level: int) -> int | None:
+        """Apply *level* (1..100). Returns the level set, or None if nothing worked."""
+        brightnessctl = _first_available("brightnessctl")
+        if brightnessctl:
+            outcome = await self._run(
+                [brightnessctl, "set", f"{level}%"], self._timeout
+            )
+            if outcome.ok:
+                return level
+
+        light = _first_available("light")
+        if light:
+            outcome = await self._run([light, "-S", str(level)], self._timeout)
+            if outcome.ok:
+                return level
+
+        gdbus = _first_available("gdbus")
+        if gdbus:
+            outcome = await self._run(
+                [
+                    gdbus,
+                    "call",
+                    *self._GNOME_POWER_DBUS,
+                    "org.freedesktop.DBus.Properties.Set",
+                    "org.gnome.SettingsDaemon.Power.Screen",
+                    "Brightness",
+                    # gdbus needs the variant spelled out. `level` is an
+                    # int validated to 1..100, so this is not user text.
+                    f"<int32 {level}>",
+                ],
+                self._timeout,
+            )
+            if outcome.ok:
+                return level
+
+        return None
+
+    # ── audio ─────────────────────────────────────────────────────────
+
+    async def _handle_volume(
+        self, spec: ActionSpec, params: dict[str, Any]
+    ) -> SystemToolResult:
+        operation = _require_choice(
+            params.get("operation", "get"), "operation", spec.operations
+        )
+        binary = self._resolve_binary(spec)
+        tool_name = Path(binary).name
+
+        if tool_name == "pactl":
+            sink = "@DEFAULT_SINK@"
+            if operation == "get":
+                outcome = await self._run(
+                    [binary, "get-sink-volume", sink], self._timeout
+                )
+                if not outcome.ok:
+                    return SystemToolResult(
+                        success=False,
+                        error=_truncate(outcome.stderr or "could not read the volume"),
+                        action=spec.name,
+                    )
+                match = re.search(r"(\d+)%", outcome.stdout)
+                level = match.group(1) if match else "unknown"
+                return SystemToolResult(
+                    success=True, output=f"Volume is at {level}%.", action=spec.name
+                )
+
+            if operation in {"mute", "unmute"}:
+                argv = [binary, "set-sink-mute", sink, "1" if operation == "mute" else "0"]
+                return await self._exec(
+                    spec, argv, success_output=f"Audio {operation}d."
+                )
+
+            if operation == "set":
+                level = _require_int(params.get("level"), "level", 0, 100)
+                argv = [binary, "set-sink-volume", sink, f"{level}%"]
+                return await self._exec(
+                    spec, argv, success_output=f"Volume set to {level}%."
+                )
+
+            step = _require_int(params.get("step", 10), "step", 1, 50)
+            delta = f"+{step}%" if operation == "up" else f"-{step}%"
+            return await self._exec(
+                spec,
+                [binary, "set-sink-volume", sink, delta],
+                success_output=f"Volume {operation} {step}%.",
+            )
+
+        # wpctl / amixer fallbacks keep the action working on machines
+        # without PulseAudio's CLI.
+        if tool_name == "wpctl":
+            target = "@DEFAULT_AUDIO_SINK@"
+            if operation == "get":
+                outcome = await self._run([binary, "get-volume", target], self._timeout)
+                if not outcome.ok:
+                    return SystemToolResult(
+                        success=False,
+                        error=_truncate(outcome.stderr or "could not read the volume"),
+                        action=spec.name,
+                    )
+                match = re.search(r"([\d.]+)", outcome.stdout)
+                level = round(float(match.group(1)) * 100) if match else "unknown"
+                return SystemToolResult(
+                    success=True, output=f"Volume is at {level}%.", action=spec.name
+                )
+            if operation in {"mute", "unmute"}:
+                argv = [binary, "set-mute", target, "1" if operation == "mute" else "0"]
+                return await self._exec(spec, argv, success_output=f"Audio {operation}d.")
+            if operation == "set":
+                level = _require_int(params.get("level"), "level", 0, 100)
+                return await self._exec(
+                    spec,
+                    [binary, "set-volume", target, f"{level / 100:.2f}"],
+                    success_output=f"Volume set to {level}%.",
+                )
+            step = _require_int(params.get("step", 10), "step", 1, 50)
+            delta = f"{step / 100:.2f}{'+' if operation == 'up' else '-'}"
+            return await self._exec(
+                spec,
+                [binary, "set-volume", target, delta],
+                success_output=f"Volume {operation} {step}%.",
+            )
+
+        # amixer
+        if operation == "get":
+            outcome = await self._run([binary, "get", "Master"], self._timeout)
+            if not outcome.ok:
+                return SystemToolResult(
+                    success=False,
+                    error=_truncate(outcome.stderr or "could not read the volume"),
+                    action=spec.name,
+                )
+            match = re.search(r"(\d+)%", outcome.stdout)
+            level = match.group(1) if match else "unknown"
+            return SystemToolResult(
+                success=True, output=f"Volume is at {level}%.", action=spec.name
+            )
+        if operation in {"mute", "unmute"}:
+            return await self._exec(
+                spec,
+                [binary, "set", "Master", operation],
+                success_output=f"Audio {operation}d.",
+            )
+        if operation == "set":
+            level = _require_int(params.get("level"), "level", 0, 100)
+            return await self._exec(
+                spec,
+                [binary, "set", "Master", f"{level}%"],
+                success_output=f"Volume set to {level}%.",
+            )
+        step = _require_int(params.get("step", 10), "step", 1, 50)
+        return await self._exec(
+            spec,
+            [binary, "set", "Master", f"{step}%{'+' if operation == 'up' else '-'}"],
+            success_output=f"Volume {operation} {step}%.",
+        )
+
+    # ── radios ────────────────────────────────────────────────────────
+
+    async def _handle_bluetooth(
+        self, spec: ActionSpec, params: dict[str, Any]
+    ) -> SystemToolResult:
+        operation = _require_choice(
+            params.get("operation", "status"), "operation", spec.operations
+        )
+        rfkill = _first_available("rfkill")
+
+        if operation == "status":
+            if rfkill:
+                outcome = await self._run(
+                    [rfkill, "list", "bluetooth"], self._timeout
+                )
+                if outcome.ok:
+                    blocked = "yes" in outcome.stdout.lower().split("soft blocked:")[-1][:6]
+                    return SystemToolResult(
+                        success=True,
+                        output=f"Bluetooth is {'off' if blocked else 'on'}.",
+                        action=spec.name,
+                    )
+            bluetoothctl = _first_available("bluetoothctl")
+            if bluetoothctl:
+                outcome = await self._run([bluetoothctl, "show"], self._timeout)
+                if outcome.ok:
+                    powered = "powered: yes" in outcome.stdout.lower()
+                    return SystemToolResult(
+                        success=True,
+                        output=f"Bluetooth is {'on' if powered else 'off'}.",
+                        action=spec.name,
+                    )
+            return SystemToolResult(
+                success=False,
+                error="could not read the Bluetooth state",
+                action=spec.name,
+            )
+
+        if rfkill:
+            return await self._exec(
+                spec,
+                [rfkill, "unblock" if operation == "on" else "block", "bluetooth"],
+                success_output=f"Bluetooth turned {operation}.",
+            )
+
+        bluetoothctl = _first_available("bluetoothctl")
+        if bluetoothctl:
+            return await self._exec(
+                spec,
+                [bluetoothctl, "power", operation],
+                success_output=f"Bluetooth turned {operation}.",
+            )
+
+        raise ArgumentError("no Bluetooth control found (tried rfkill, bluetoothctl)")
+
+    # ── power supply ──────────────────────────────────────────────────
+
+    async def _handle_battery(
+        self, spec: ActionSpec, params: dict[str, Any]
+    ) -> SystemToolResult:
+        def _read() -> str | None:
+            import psutil  # noqa: PLC0415
+
+            battery = psutil.sensors_battery()
+            if battery is None:
+                return None
+            parts = [f"Battery at {battery.percent:.0f}%"]
+            if battery.power_plugged:
+                parts.append("plugged in")
+            elif battery.secsleft and battery.secsleft > 0:
+                hours, minutes = divmod(int(battery.secsleft) // 60, 60)
+                parts.append(f"about {hours}h {minutes}m left")
+            return ", ".join(parts) + "."
+
+        text = await asyncio.to_thread(_read)
+        if text is None:
+            return SystemToolResult(
+                success=False,
+                error="no battery detected on this machine",
+                action=spec.name,
+            )
+        return SystemToolResult(success=True, output=text, action=spec.name)
 
     # ── metrics ───────────────────────────────────────────────────────
 

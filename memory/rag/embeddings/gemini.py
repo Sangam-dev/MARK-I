@@ -68,7 +68,7 @@ class GeminiEmbedder(EmbeddingProvider):
 
     def __init__(
         self,
-        model: str = "text-embedding-004",
+        model: str = "gemini-embedding-001",
         dimensions: int = 768,
         batch_size: int = 16,
         timeout: float = 30.0,

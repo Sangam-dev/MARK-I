@@ -9,6 +9,8 @@ from memory.token_log import TokenLog
 
 from reasoning.llm_client_mulapi import (
     ALL_MODELS,
+    FORWARD,
+    REVERSE,
     get_pool,
     hedged_generate,
     hedged_generate_conv,
@@ -53,6 +55,12 @@ Rules:
   work — which decides whether your acknowledgement is spoken at all.
 
 - "message" is REQUIRED and is the only text shown to the user.
+
+- Long values — an essay, an email body, a report — go inside the JSON
+  string as ONE line using \\n for line breaks. Never a real newline, and
+  never write the content outside the object. The whole reply must still
+  be a single parseable JSON object: no sentence before the "{", nothing
+  after the "}".
 
 - "sql" is OPTIONAL and holds STRUCTURED memory: short key/value facts.
   Use it for preferences, profile details, settings, relationships and
@@ -150,13 +158,134 @@ def extract_streamed_message(buffer: str) -> str:
     return "".join(out)
 
 
+def _strip_fences(text: str) -> str:
+    """Drop a ``` fence wrapper, if the model added one."""
+    if not text.startswith("```"):
+        return text
+    lines = text.splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _extract_object(text: str) -> str:
+    """The outermost ``{...}`` span, ignoring prose around it.
+
+    Models prepend "Certainly, sir." to the envelope often enough that
+    treating the whole reply as unparseable — and therefore as something
+    to read out — is not an acceptable response to it.
+    """
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end <= start:
+        return ""
+    return text[start : end + 1]
+
+
+def _escape_raw_control_chars(text: str) -> str:
+    """Escape literal newlines and tabs *inside* JSON string values.
+
+    This is the repair that matters for long content. Asked for an essay,
+    a model will happily emit a body containing real newlines rather than
+    ``\\n``, which is invalid JSON — and losing the parse means losing
+    the delegation, so the email never gets sent at all.
+
+    Walks the text tracking string/escape state so only characters inside
+    a string literal are touched; the structural whitespace between keys
+    is left exactly as it is.
+    """
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in text:
+        if escaped:
+            out.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            out.append(ch)
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+            continue
+        if in_string and ch in _RAW_CONTROL_ESCAPES:
+            out.append(_RAW_CONTROL_ESCAPES[ch])
+            continue
+        if in_string and ord(ch) < 0x20:
+            out.append(f"\\u{ord(ch):04x}")
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+_RAW_CONTROL_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _candidate_payloads(text: str) -> list[str]:
+    """Progressively more aggressive repairs of a malformed envelope.
+
+    Ordered cheapest-and-most-faithful first, so a well-formed reply is
+    parsed as-is and only genuinely broken ones get rewritten.
+    """
+    cleaned = _strip_fences(text)
+    candidates = [text, cleaned]
+    for base in (text, cleaned):
+        extracted = _extract_object(base)
+        if extracted:
+            candidates.append(extracted)
+            candidates.append(_escape_raw_control_chars(extracted))
+        candidates.append(_escape_raw_control_chars(base))
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            ordered.append(candidate)
+    return ordered
+
+
+def looks_like_envelope(text: str) -> bool:
+    """True if *text* is (or contains) the raw JSON scaffolding.
+
+    Used as a last line of defence: whatever else goes wrong, the
+    assistant must not read ``{"task": {"task_type": ...`` out loud.
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if stripped.startswith(("{", "```")):
+        return True
+    return any(
+        key in stripped
+        for key in ('"task_type"', '"instruction"', '"parameters"', '"message":')
+    )
+
+
 def parse_memory_response(raw: str) -> dict[str, Any]:
     """Parse the model's JSON envelope into ``{message, task?, sql?, rag?}``.
 
-    Tolerant parser — never raises. Falls back to ``{"message": <raw>}``
-    when the model returns plain text or malformed JSON. ``task``/``sql``/
-    ``rag`` are omitted (never empty, never null) so callers can safely
-    test ``if "task" in response``.
+    Tolerant parser — never raises. ``task``/``sql``/``rag`` are omitted
+    (never empty, never null) so callers can safely test
+    ``if "task" in response``.
+
+    Malformed input is *repaired* rather than surrendered to: fences are
+    stripped, prose around the object is discarded, and raw control
+    characters inside string values are escaped (see
+    :func:`_candidate_payloads`). That matters because the common way to
+    break this envelope is to ask for something long — an essay, a
+    report — and a failed parse would otherwise drop the delegation on
+    the floor.
+
+    When nothing parses, the fallback message is the raw text **only if
+    it is plain prose**. Text that is recognisably a broken envelope
+    yields an empty message instead, because the alternative is the
+    assistant reading JSON aloud.
 
     ``task`` is the Conversation LLM's delegation to the Task LLM; the
     coordinator turns it into a :class:`core.events.TaskRequested`. It is
@@ -168,26 +297,31 @@ def parse_memory_response(raw: str) -> dict[str, Any]:
     if not text:
         return {"message": ""}
 
-    cleaned = text
-    if cleaned.startswith("```"):
-        lines = cleaned.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        cleaned = "\n".join(lines).strip()
+    data: Any = None
+    for candidate in _candidate_payloads(text):
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            data = parsed
+            break
 
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        return {"message": text}
-
-    if not isinstance(data, dict):
+    if data is None:
+        # Never hand back scaffolding to be spoken. An empty message
+        # sends the caller down its retry/fallback path instead.
+        if looks_like_envelope(text):
+            logger.warning(
+                "Unparseable response envelope (%d chars) — suppressing it "
+                "rather than surfacing raw JSON",
+                len(text),
+            )
+            return {"message": ""}
         return {"message": text}
 
     message = data.get("message")
     if not isinstance(message, str):
-        message = text
+        message = "" if looks_like_envelope(text) else text
 
     payload: dict[str, Any] = {"message": message}
 
@@ -220,18 +354,43 @@ class GeminiClient:
         timeout: float = 12.0,
         default_hedge_width: int = 1,
         token_log: TokenLog | None = None,
+        lane: str = "",
+        lane_direction: int = FORWARD,
     ) -> None:
+        """
+        ``lane``/``lane_direction`` pick which cursor over the shared key
+        pool this client uses. Two clients on different lanes sit on
+        different keys, so the Conversation LLM and the Task LLM stop
+        competing for one key's quota when they run in the same turn.
+
+        Left unset, the client uses the pool's default lane — key 1,
+        walking forward — which is the behaviour every existing caller
+        already had.
+        """
         self.model = model or ALL_MODELS[0]
         self.timeout = timeout
         self.max_retries = max_retries
         self.default_hedge_width = default_hedge_width
         self.token_log = token_log
+        self.lane_name = lane
+        self.lane_direction = lane_direction
         self.pool = None
 
     async def initialize(self) -> None:
-        """Initialize the client by loading the key pool."""
-        self.pool = get_pool()
-        logger.info("GeminiClient initialized successfully.")
+        """Bind this client to its lane over the shared key pool."""
+        pool = get_pool()
+        if self.lane_name:
+            self.pool = pool.lane(self.lane_name, self.lane_direction)
+            logger.info(
+                "GeminiClient initialized on key lane '%s' (starting at key[%d], "
+                "going %s)",
+                self.lane_name,
+                self.pool.active_index,
+                "forward" if self.lane_direction >= 0 else "backward",
+            )
+        else:
+            self.pool = pool
+            logger.info("GeminiClient initialized successfully.")
 
     async def generate(
         self,
@@ -530,4 +689,4 @@ class GeminiClient:
         """Return True if the key pool has available keys."""
         if not self.pool:
             return False
-        return any(e.is_available for e in self.pool._entries)
+        return any(e.is_available for e in self.pool.entries())

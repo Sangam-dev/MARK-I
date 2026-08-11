@@ -1,12 +1,26 @@
 """Planner — the Task LLM. Converts a delegated task into an :class:`ExecutionPlan`.
 
 The Planner is a **subordinate executor**. It subscribes to
-:class:`TaskRequested` — the explicit delegation emitted by the
-Conversation LLM (``reasoning/coordinator.py``) — and never to raw user
-input. It therefore never decides *whether* something is a task; that
-decision belongs to the Conversation LLM alone. Its job starts once the
-work has already been decided, and is limited to: pick the tool(s),
-order them, get them run, report back.
+:class:`TaskDispatched` — the work the Task Orchestrator
+(``planning/orchestrator.py``) decided to run — and never to raw user
+input, nor even to the Conversation LLM's :class:`TaskRequested`. It
+therefore never decides *whether* something is a task; that decision
+belongs to the Conversation LLM alone. Its job starts once the work has
+already been decided, and is limited to: pick the tool(s), order them,
+get them run, report back.
+
+It also never speaks to the user. When it needs a value it does not
+have, or the work turns out to be sensitive, it says so through
+:class:`TaskProtocolResponse` in the closed vocabulary of
+:mod:`planning.protocol` — ``input_required``,
+``confirmation_required``, ``execute``, ``completed``, ``failed`` — and
+the Orchestrator decides what reaches the conversation.
+
+Approval never originates here. A plan runs a sensitive tool only when
+:attr:`TaskDispatched.user_confirmed` is set, which only the
+Orchestrator sets, and only from a real subsequent user message. Any
+``confirm`` flag the planning LLM invents is stripped
+(:func:`_sanitise_confirm`).
 
 It asks the LLM to decompose the delegated instruction into atomic tool
 tasks. Each task is validated against
@@ -19,10 +33,10 @@ permanent task failure the Scheduler emits
 new plan starting from the remaining work.
 
 When the plan reaches a terminal state the Planner correlates the
-:class:`PlanCompleted` back to the originating :class:`TaskRequested`
-and emits a :class:`TaskResultReady` — structured execution data, never
-a user-facing sentence. Phrasing the outcome (including failures) is the
-Conversation LLM's job.
+:class:`PlanCompleted` back to the originating :class:`TaskDispatched`
+and reports it as a ``completed``/``failed`` protocol response —
+structured execution data, never a user-facing sentence. Phrasing the
+outcome (including failures) is the Conversation LLM's job.
 """
 
 from __future__ import annotations
@@ -38,8 +52,8 @@ from core.events import (
     PlanCompleted,
     PlanCreated,
     PlanReplanRequested,
-    TaskRequested,
-    TaskResultReady,
+    TaskDispatched,
+    TaskProtocolResponse,
 )
 from memory.manager import MemoryManager
 from memory.token_log import TokenLog
@@ -53,6 +67,11 @@ from planning.models import (
 from planning.prompts import REPLANNER_SYSTEM_PROMPT, build_planner_prompt
 from planning.reference import ReferenceResolver, TaskArtifact
 from reasoning.llm_client import GeminiClient
+from tasks.policy import (
+    describe_sensitive_action,
+    missing_required_fields,
+    question_for_fields,
+)
 from tasks.registry import TASK_REGISTRY, validate_task
 
 logger = logging.getLogger("kancha.planning.planner")
@@ -107,14 +126,14 @@ def _looks_multistep(text: str) -> bool:
     return False
 
 
-def _strip_session_default(request: TaskRequested) -> str:
-    """The TaskRequested.session_id is set by the Conversation LLM; if the
+def _strip_session_default(request: TaskDispatched) -> str:
+    """The TaskDispatched.session_id is set by the Conversation LLM; if the
     planner is invoked directly (e.g. from tests), fall back to
     'default'."""
     return request.session_id or "default"
 
 
-def _format_delegation_context(request: TaskRequested) -> str:
+def _format_delegation_context(request: TaskDispatched) -> str:
     """Render the delegation's extra fields for the decomposition prompt.
 
     Everything here is a hint from the Conversation LLM — the expected
@@ -137,6 +156,28 @@ def _format_delegation_context(request: TaskRequested) -> str:
         "Delegated task details (the suggested tool is a hint, not an "
         "instruction — use the catalog):\n" + "\n".join(lines)
     )
+
+
+def _strip_confirm_flag(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Arguments minus any ``confirm`` flag."""
+    return {k: v for k, v in (arguments or {}).items() if k != "confirm"}
+
+
+def _sanitise_confirm(
+    tool: str, arguments: dict[str, Any], user_confirmed: bool
+) -> dict[str, Any]:
+    """Apply approval to a tool's arguments — or remove it.
+
+    The planning LLM is perfectly capable of writing ``"confirm": true``
+    into the arguments it invents, and a tool that trusted it would
+    execute a destructive action nobody approved. So the flag is always
+    stripped first, then re-added only when the Orchestrator says a real
+    user approved this task, and only for a step that actually needs it.
+    """
+    clean = _strip_confirm_flag(arguments)
+    if user_confirmed and describe_sensitive_action(tool, clean) is not None:
+        clean["confirm"] = True
+    return clean
 
 
 def _plan_to_dict(plan: ExecutionPlan) -> dict[str, Any]:
@@ -195,7 +236,7 @@ def _one_task_plan(
 
 
 def _build_single_task_plan(
-    request: TaskRequested,
+    request: TaskDispatched,
     session_id: str,
 ) -> ExecutionPlan | None:
     """Fast path: build a one-task plan without an LLM call.
@@ -283,11 +324,11 @@ class Planner:
         self._max_tasks = max_tasks_per_plan
         self._token_log = token_log
         self._resolver = ReferenceResolver()
-        # plan_id -> the TaskRequested that produced it. This is what lets
+        # plan_id -> the TaskDispatched that produced it. This is what lets
         # a PlanCompleted find its way back to the Conversation LLM as a
         # TaskResultReady. A replan re-registers the same request under
         # the new plan id.
-        self._delegations: dict[str, TaskRequested] = {}
+        self._delegations: dict[str, TaskDispatched] = {}
         # Plans whose replan is being built. Their completion is held back
         # until we know whether a replacement plan exists, so one
         # delegation never produces two results (and the user never hears
@@ -298,52 +339,183 @@ class Planner:
     # ── registration ──────────────────────────────────────────────
 
     def register(self) -> None:
-        """Subscribe the Task LLM to delegations — and nothing else.
+        """Subscribe the Task LLM to dispatches — and nothing else.
 
         Deliberately absent: any subscription to ``TextInputReceived``,
-        ``TranscriptReady`` or ``IntentIdentified``. Raw user input must
-        reach the Conversation LLM only; this layer acts on explicit
-        :class:`TaskRequested` events.
+        ``TranscriptReady``, ``IntentIdentified`` **or**
+        ``TaskRequested``. Raw user input must reach the Conversation
+        LLM only, and conversational delegations must pass through the
+        Orchestrator, which is the only emitter of
+        :class:`TaskDispatched`.
         """
-        self._bus.subscribe(TaskRequested, self.on_task_requested)
+        self._bus.subscribe(TaskDispatched, self.on_task_dispatched)
         self._bus.subscribe(PlanReplanRequested, self.on_replan_requested)
         self._bus.subscribe(PlanCompleted, self.on_plan_completed)
 
     # ── public handlers ───────────────────────────────────────────
 
-    async def on_task_requested(self, event: TaskRequested) -> None:
-        """Plan and dispatch one task delegated by the Conversation LLM."""
+    async def on_task_dispatched(self, event: TaskDispatched) -> None:
+        """Plan one dispatched task, or report what stands in the way.
+
+        Three outcomes, in the order they are checked:
+
+        1. Something required is missing → ``input_required``. Checked
+           before anything runs, so "send an email to john" asks what to
+           write rather than sending an empty message.
+        2. The work is sensitive and unapproved → ``confirmation_required``.
+        3. Otherwise the plan is dispatched to the Scheduler.
+        """
         session_id = _strip_session_default(event)
         logger.info(
-            "Task delegated | task_id=%s type=%s | %r",
+            "Task dispatched to the Task LLM | task_id=%s type=%s attempt=%d | %r",
             event.task_id,
             event.task_type or "(unspecified)",
+            event.attempt,
             event.instruction,
         )
 
         plan = await self.plan_from_request(event, session_id)
         if plan is None:
-            # Report the failure as data. Explaining it to the user is
-            # the Conversation LLM's call, not ours.
-            self._emit_result(
-                event,
-                status="failed",
-                results=[],
-                error="could not decompose the instruction into known tools",
-                session_id=session_id,
+            self._report_unplannable(event)
+            return
+
+        # Ask before doing: a plan whose arguments are incomplete must
+        # not be half-run and then abandoned.
+        missing = self._missing_across_plan(plan)
+        if missing:
+            self._emit_protocol(
+                event.task_id,
+                "input_required",
+                {
+                    "task_id": event.task_id,
+                    "missing_fields": missing,
+                    "question": question_for_fields(missing, event.task_type),
+                },
+                session_id,
             )
             return
+
+        sensitive = self._sensitive_in_plan(plan)
+        if sensitive and not event.user_confirmed:
+            action, description, data = sensitive
+            self._emit_protocol(
+                event.task_id,
+                "confirmation_required",
+                {
+                    "task_id": event.task_id,
+                    "action": action,
+                    "description": description,
+                    "confirmation_data": data,
+                },
+                session_id,
+            )
+            return
+
+        # Approval, where it exists, is applied here and nowhere else.
+        for task in plan.tasks:
+            task.arguments = _sanitise_confirm(
+                task.tool, task.arguments, event.user_confirmed
+            )
 
         # Apply reference resolution pass.
         self._apply_references(plan)
 
         self._delegations[plan.id] = event
+        self._emit_protocol(
+            event.task_id,
+            "execute",
+            {
+                "task_id": event.task_id,
+                "action": plan.tasks[0].tool if plan.tasks else event.task_type,
+                "params": dict(plan.tasks[0].arguments) if plan.tasks else {},
+            },
+            session_id,
+        )
         self._bus.emit(
             PlanCreated(
                 plan=_plan_to_dict(plan),
                 session_id=session_id,
             )
         )
+
+    def _report_unplannable(self, event: TaskDispatched) -> None:
+        """No plan could be built — ask, if asking would help.
+
+        A delegation naming a known tool but lacking a required argument
+        is answerable ("which city?"); one we simply could not decompose
+        is not.
+        """
+        task_type = (event.task_type or "").strip()
+        if task_type in TASK_REGISTRY:
+            missing = missing_required_fields(task_type, dict(event.parameters or {}))
+            if missing:
+                self._emit_protocol(
+                    event.task_id,
+                    "input_required",
+                    {
+                        "task_id": event.task_id,
+                        "missing_fields": missing,
+                        "question": question_for_fields(missing, task_type),
+                    },
+                    event.session_id,
+                )
+                return
+
+        self._emit_protocol(
+            event.task_id,
+            "failed",
+            {
+                "task_id": event.task_id,
+                "error": "could not decompose the instruction into known tools",
+            },
+            event.session_id,
+        )
+
+    @staticmethod
+    def _missing_across_plan(plan: ExecutionPlan) -> list[str]:
+        """Required arguments absent from any task in the plan.
+
+        Arguments filled by a ``<<task:result>>`` reference are not
+        missing — they arrive when the task they depend on runs.
+        """
+        missing: list[str] = []
+        for task in plan.tasks:
+            resolved = {
+                key: value
+                for key, value in task.arguments.items()
+                if key not in task.output_refs
+            }
+            for name in missing_required_fields(task.tool, resolved):
+                if name not in missing and name not in task.output_refs:
+                    missing.append(name)
+        return missing
+
+    @staticmethod
+    def _sensitive_in_plan(
+        plan: ExecutionPlan,
+    ) -> tuple[str, str, dict[str, Any]] | None:
+        """The first sensitive step, as (action, description, data)."""
+        descriptions: list[str] = []
+        first_tool = ""
+        data: dict[str, Any] = {}
+        for task in plan.tasks:
+            described = describe_sensitive_action(task.tool, task.arguments)
+            if described is None:
+                continue
+            if not first_tool:
+                first_tool = task.tool
+                data = {
+                    "tool": task.tool,
+                    "arguments": _strip_confirm_flag(task.arguments),
+                }
+            descriptions.append(described)
+
+        if not descriptions:
+            return None
+        if len(descriptions) == 1:
+            return first_tool, descriptions[0], data
+        joined = ", ".join(descriptions[:-1]) + f" and {descriptions[-1]}"
+        return first_tool, joined, data
 
     async def on_plan_completed(self, event: PlanCompleted) -> None:
         """Return the finished plan to the Conversation LLM as a Task Result.
@@ -388,13 +560,13 @@ class Planner:
 
     def _emit_result(
         self,
-        request: TaskRequested,
+        request: TaskDispatched,
         status: str,
         results: list[dict[str, Any]],
         error: str,
         session_id: str,
     ) -> None:
-        """Emit the structured Task Result. Execution data only — no prose."""
+        """Report an outcome to the Orchestrator. Execution data, no prose."""
         logger.info(
             "Task result | task_id=%s status=%s tools=%d%s",
             request.task_id,
@@ -402,16 +574,51 @@ class Planner:
             len(results),
             f" error={error!r}" if error else "",
         )
+        if status == "failed" and not results:
+            self._emit_protocol(
+                request.task_id,
+                "failed",
+                {"task_id": request.task_id, "error": error or "the task failed"},
+                session_id,
+            )
+            return
+
+        self._emit_protocol(
+            request.task_id,
+            "completed",
+            {
+                "task_id": request.task_id,
+                "result": {
+                    "status": status,
+                    "results": results,
+                    "error": error,
+                },
+            },
+            session_id,
+        )
+
+    def _emit_protocol(
+        self,
+        task_id: str,
+        response_type: str,
+        payload: dict[str, Any],
+        session_id: str,
+    ) -> None:
+        """Emit one structured Task LLM response.
+
+        Everything this layer has to say goes out through here, which is
+        what keeps "the Task LLM never addresses the user" checkable
+        rather than aspirational.
+        """
+        logger.info(
+            "task_protocol_response | task_id=%s type=%s", task_id, response_type
+        )
         self._bus.emit(
-            TaskResultReady(
-                task_id=request.task_id,
-                status=status,
-                results=results,
-                error=error,
-                task_type=request.task_type,
-                instruction=request.instruction,
-                user_request=request.user_request,
-                session_id=session_id,
+            TaskProtocolResponse(
+                task_id=task_id,
+                type=response_type,
+                payload=payload,
+                session_id=session_id or "default",
             )
         )
 
@@ -481,9 +688,9 @@ class Planner:
     # ── public helpers (also used by tests) ───────────────────────
 
     async def plan_from_request(
-        self, request: TaskRequested, session_id: str
+        self, request: TaskDispatched, session_id: str
     ) -> ExecutionPlan | None:
-        """Build an ExecutionPlan for a delegated :class:`TaskRequested`."""
+        """Build an ExecutionPlan for a delegated :class:`TaskDispatched`."""
         # Fast path: a single atomic action we can map without an LLM.
         fast = _build_single_task_plan(request, session_id)
         if fast is not None:
