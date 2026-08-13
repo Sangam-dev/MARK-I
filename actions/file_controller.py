@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import platform
 from pathlib import Path
@@ -70,8 +71,42 @@ def _get_videos() -> Path:
     return Path.home() / "Videos"
 
 
-def _resolve_path(raw: str) -> Path:
-    shortcuts: dict[str, Path] = {
+# Spoken names for the standard user directories. Matched
+# case-insensitively against a whole path segment, so "Documents/projects"
+# and "documents/projects" both land in the same place.
+_SHORTCUT_ALIASES: dict[str, str] = {
+    "desktop": "desktop",
+    "my desktop": "desktop",
+    "downloads": "downloads",
+    "download": "downloads",
+    "documents": "documents",
+    "document": "documents",
+    "docs": "documents",
+    "pictures": "pictures",
+    "picture": "pictures",
+    "photos": "pictures",
+    "images": "pictures",
+    "music": "music",
+    "songs": "music",
+    "videos": "videos",
+    "video": "videos",
+    "movies": "videos",
+    "home": "home",
+    "~": "home",
+    "home folder": "home",
+    "home directory": "home",
+    "my home": "home",
+}
+
+# Words a speaker tacks onto a directory name ("the kancha folder") that
+# are never part of the name itself.
+_PATH_NOISE_RE = re.compile(
+    r"^(?:the|my)\s+|\s+(?:folder|directory|dir)$", re.IGNORECASE
+)
+
+
+def _shortcut_bases() -> dict[str, Path]:
+    return {
         "desktop":   _get_desktop(),
         "downloads": _get_downloads(),
         "documents": _get_documents(),
@@ -80,10 +115,127 @@ def _resolve_path(raw: str) -> Path:
         "videos":    _get_videos(),
         "home":      Path.home(),
     }
-    lower = raw.strip().lower()
-    if lower in shortcuts:
-        return shortcuts[lower]
-    return Path(raw).expanduser()
+
+
+def _shortcut_for(segment: str) -> Path | None:
+    """The standard directory *segment* names, or None if it names none."""
+    key = _PATH_NOISE_RE.sub("", segment.strip()).strip().lower()
+    canonical = _SHORTCUT_ALIASES.get(key)
+    if canonical is None:
+        return None
+    return _shortcut_bases()[canonical]
+
+
+def _split_segments(text: str) -> list[str]:
+    """Path text to segments, tolerating either slash and dropping noise."""
+    parts = []
+    for segment in re.split(r"[\\/]+", text):
+        segment = _PATH_NOISE_RE.sub("", segment.strip()).strip()
+        if segment and segment != ".":
+            parts.append(segment)
+    return parts
+
+
+def _walk_case_insensitively(base: Path, segments: list[str]) -> Path | None:
+    """Follow *segments* under *base*, matching names ignoring case.
+
+    Speech and LLMs both hand us "Kancha" for a directory called "kancha";
+    an exact-case lookup misses it, and the caller then falls back to its
+    default location — which is how "create it in kancha" ended up on the
+    Desktop.
+    """
+    current = base
+    for segment in segments:
+        direct = current / segment
+        if direct.exists():
+            current = direct
+            continue
+        if not current.is_dir():
+            return None
+        match = None
+        lowered = segment.lower()
+        try:
+            for child in current.iterdir():
+                if child.name.lower() == lowered:
+                    match = child
+                    break
+        except (OSError, PermissionError):
+            return None
+        if match is None:
+            return None
+        current = match
+    return current
+
+
+def _resolve_path(raw: str) -> Path:
+    """Turn whatever the caller said into a concrete absolute path.
+
+    Accepts a standard-directory name ("downloads"), a nested one
+    ("documents/projects/notes"), an absolute path, a ``~`` path, and a
+    bare directory name ("kancha"). A bare or relative name is anchored
+    at the home directory — never at the process's working directory,
+    which is wherever the assistant happened to be started from.
+    """
+    text = str(raw or "").strip().strip("\"'")
+    if not text:
+        return Path.home()
+
+    text = os.path.expandvars(text)
+
+    if text.startswith("~"):
+        return Path(text).expanduser()
+
+    if Path(text).is_absolute():
+        return Path(text)
+
+    # A multi-word shortcut ("my home", "home folder") before segmenting,
+    # since those contain spaces rather than separators.
+    whole = _shortcut_for(text)
+    if whole is not None:
+        return whole
+
+    segments = _split_segments(text)
+    if not segments:
+        return Path.home()
+
+    base = _shortcut_for(segments[0])
+    if base is not None:
+        rest = segments[1:]
+        if not rest:
+            return base
+        found = _walk_case_insensitively(base, rest)
+        return found if found is not None else base.joinpath(*rest)
+
+    # Relative to home, then to the standard directories — so "projects/api"
+    # finds ~/Documents/projects/api when that is where it actually lives.
+    for root in (Path.home(), *_shortcut_bases().values()):
+        found = _walk_case_insensitively(root, segments)
+        if found is not None:
+            return found
+
+    # Nothing there yet (a folder about to be created): anchor at home.
+    return Path.home().joinpath(*segments)
+
+
+def _join_name(base: Path, name: str) -> Path:
+    """``base / name`` where *name* may itself be nested or absolute."""
+    text = str(name or "").strip().strip("\"'")
+    if not text:
+        return base
+    if text.startswith("~") or Path(text).is_absolute():
+        return _resolve_path(text)
+    segments = [seg for seg in re.split(r"[\\/]+", text) if seg and seg != "."]
+    if not segments:
+        return base
+    return base.joinpath(*segments)
+
+def _pretty(target: Path) -> str:
+    """A short, speakable form of *target* — "~/kancha/notes"."""
+    try:
+        return "~/" + str(target.resolve().relative_to(Path.home()))
+    except ValueError:
+        return str(target)
+
 
 def _format_size(b: int) -> str:
     for unit in ["B", "KB", "MB", "GB", "TB"]:
@@ -125,9 +277,9 @@ def list_files(path: str = "desktop", show_hidden: bool = False) -> str:
                 items.append(f"📄 {item.name} ({size})")
 
         if not items:
-            return f"Directory is empty: {target.name}/"
+            return f"Directory is empty: {_pretty(target)}"
 
-        return f"Contents of {target.name}/ ({len(items)} items):\n" + "\n".join(items)
+        return f"Contents of {_pretty(target)} ({len(items)} items):\n" + "\n".join(items)
 
     except PermissionError:
         return f"Permission denied: {path}"
@@ -138,12 +290,12 @@ def list_files(path: str = "desktop", show_hidden: bool = False) -> str:
 def create_file(path: str, name: str = "", content: str = "") -> str:
     try:
         base   = _resolve_path(path)
-        target = (base / name) if name else base
+        target = _join_name(base, name)
         if not _is_safe_path(target):
             return f"Access denied: {target}"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-        return f"File created: {target.name}"
+        return f"File created: {target.name} in {_pretty(target.parent)}"
     except Exception as e:
         return f"Could not create file: {e}"
 
@@ -151,11 +303,15 @@ def create_file(path: str, name: str = "", content: str = "") -> str:
 def create_folder(path: str, name: str = "") -> str:
     try:
         base   = _resolve_path(path)
-        target = (base / name) if name else base
+        target = _join_name(base, name)
         if not _is_safe_path(target):
             return f"Access denied: {target}"
+        if target.is_dir():
+            return f"Folder already exists: {_pretty(target)}"
         target.mkdir(parents=True, exist_ok=True)
-        return f"Folder created: {target.name}"
+        # Report the location, not just the leaf name — "Folder created:
+        # Test" gave no way to notice it had landed somewhere unintended.
+        return f"Folder created: {target.name} in {_pretty(target.parent)}"
     except Exception as e:
         return f"Could not create folder: {e}"
 
@@ -163,7 +319,7 @@ def create_folder(path: str, name: str = "") -> str:
 def delete_file(path: str, name: str = "") -> str:
     try:
         base   = _resolve_path(path)
-        target = (base / name) if name else base
+        target = _join_name(base, name)
         if not _is_safe_path(target):
             return f"Access denied: {target}"
         if not target.exists():
@@ -188,7 +344,7 @@ def delete_file(path: str, name: str = "") -> str:
 def move_file(path: str, name: str = "", destination: str = "") -> str:
     try:
         base   = _resolve_path(path)
-        src    = (base / name) if name else base
+        src    = _join_name(base, name)
         dst    = _resolve_path(destination) if destination else None
 
         if not src.exists():
@@ -214,7 +370,7 @@ def move_file(path: str, name: str = "", destination: str = "") -> str:
 def copy_file(path: str, name: str = "", destination: str = "") -> str:
     try:
         base = _resolve_path(path)
-        src  = (base / name) if name else base
+        src  = _join_name(base, name)
         dst  = _resolve_path(destination) if destination else None
 
         if not src.exists():
@@ -245,7 +401,7 @@ def copy_file(path: str, name: str = "", destination: str = "") -> str:
 def rename_file(path: str, name: str = "", new_name: str = "") -> str:
     try:
         base     = _resolve_path(path)
-        target   = (base / name) if name else base
+        target   = _join_name(base, name)
         if not _is_safe_path(target):
             return f"Access denied: {target}"
         if not target.exists():
@@ -267,7 +423,7 @@ def rename_file(path: str, name: str = "", new_name: str = "") -> str:
 def read_file(path: str, name: str = "", max_chars: int = 4000) -> str:
     try:
         base   = _resolve_path(path)
-        target = (base / name) if name else base
+        target = _join_name(base, name)
         if not _is_safe_path(target):
             return f"Access denied: {target}"
         if not target.exists():
@@ -288,7 +444,7 @@ def write_file(path: str, name: str = "", content: str = "",
                append: bool = False) -> str:
     try:
         base   = _resolve_path(path)
-        target = (base / name) if name else base
+        target = _join_name(base, name)
         if not _is_safe_path(target):
             return f"Access denied: {target}"
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -446,7 +602,7 @@ def organize_desktop() -> str:
 def get_file_info(path: str, name: str = "") -> str:
     try:
         base   = _resolve_path(path)
-        target = (base / name) if name else base
+        target = _join_name(base, name)
         if not _is_safe_path(target):
             return f"Access denied: {target}"
         if not target.exists():

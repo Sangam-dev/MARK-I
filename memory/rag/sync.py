@@ -177,12 +177,23 @@ def parse_rag_file(text: str) -> tuple[list[RagFileEntry], int]:
                 body_start = index + 1
                 break
             key, separator, value = stripped.partition(":")
-            if not separator or key.strip().lower() not in _KNOWN_HEADERS:
-                # Not a header — this block has no header section at all,
-                # so treat the whole thing as content.
-                body_start = index
-                break
-            headers[key.strip().lower()] = value.strip()
+            name = key.strip().lower()
+            if separator and (name in _KNOWN_HEADERS or headers):
+                # A recognised header, or an unrecognised one sitting in a
+                # header block we have already started reading.
+                #
+                # Bailing out on the first unknown key used to lose every
+                # header after it: entries written as
+                # ``Timestamp/Type/Category/Title`` stopped at ``Category``
+                # and indexed as "Untitled note", because Title came last.
+                # An unfamiliar key is not a reason to distrust the block —
+                # it is just a field we do not use.
+                headers[name] = value.strip()
+                continue
+            # Nothing header-shaped at the very first line: this block has
+            # no header section at all, so it is content from the top.
+            body_start = index
+            break
         else:
             # Ran off the end with no body.
             body_start = len(block)

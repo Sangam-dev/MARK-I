@@ -81,7 +81,9 @@ no code fences.
 1. Each task MUST map to exactly ONE tool from the catalog above.
 2. Use the EXACT argument names and value types from the catalog.
 3. Tasks with no dependencies run in parallel. Use depends_on to express ordering.
-4. If the user asks to "open" a file or folder that was just created, add an explicit `open_app` task (the planner resolves to the file's path) AFTER the creation task, with depends_on pointing at it.
+4. If the user asks to "open" a file or folder that was just created, add an explicit `open_app` task AFTER the creation task, with depends_on pointing at it, and put the location in `target`.
+4b. "Open X in APP" is ONE task: `open_app` with `app_name`=APP and `target`=X — e.g. "open the kancha folder in vs code" is `{{{{"app_name": "vscode", "target": "kancha"}}}}`. Never fold the location into `app_name`, and never emit `open_app` with only the app when the user named something to open in it.
+4c. `path`/`target` accept any location the user names, not just the standard folders: "kancha", "documents/projects", "~/work" and absolute paths all work. Only fall back to "desktop" when the user named no location at all.
 5. Use `"<<task_id:result>>"` inside an argument string to reference another task's output. The Executor binds it at runtime.
 6. Conversational references like "it", "that folder", "the file" must be rewritten to explicit values or `<<task_id:result>>` references.
 7. If the request is a single atomic action (e.g. "open firefox"), produce a single task with empty depends_on.

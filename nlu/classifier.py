@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,13 +25,49 @@ class ToolDecision:
 # prevents "open firefox and file explorer" from being captured as one app
 # ("firefox and file explorer") — those must fall through to the NLU LLM
 # so the planner can decompose them into two separate open_app tasks.
+# The second lookahead keeps "open readme.md in documents" out of the app
+# name: a phrase with "in"/"with" names a target and a place, and belongs
+# to _classify_open_in_app or the file classifier, not to a bare launch.
 _OPEN_RE = re.compile(
-    r"^\s*(?:open|launch|start|run)\s+(?:the\s+)?(?P<app>(?!.*\band\b)[\w .+-]+?)\s*$",
+    r"^\s*(?:open|launch|start|run)\s+(?:the\s+)?"
+    r"(?P<app>(?!.*\band\b)(?!.*\b(?:in|with|using|inside)\b)[\w .+-]+?)\s*$",
     re.IGNORECASE,
 )
 
+# A location is not only one of the six standard directories: "in kancha",
+# "in documents/projects" and "in ~/work" are all places a user asks for,
+# and treating them as unrecognised is what silently sent every folder to
+# the Desktop. actions.file_controller._resolve_path does the resolving;
+# this only has to capture the phrase.
 _FILE_LOCATION_RE = re.compile(
-    r"\b(?:in|from|inside|on)\s+(?P<path>desktop|downloads|documents|pictures|music|videos|home)\b",
+    r"\b(?:in|into|inside|from|under|on)\s+(?:the\s+|my\s+)?"
+    r"(?P<path>~?[\w.+$-]+(?:[/\\][\w.+$ -]+?)*)"
+    r"(?:\s+(?:folder|directory|dir))?\b",
+    re.IGNORECASE,
+)
+
+# Words that follow "in" without naming anywhere ("put it in there").
+_LOCATION_STOPWORDS = frozenset(
+    {
+        "it", "there", "here", "that", "this", "them", "one", "order",
+        "case", "fact", "front", "general", "particular", "total", "time",
+        "me", "you", "us", "him", "her", "which", "what", "and", "or",
+    }
+)
+
+# "open <something> in <app>" — the target of the sentence is a path or
+# URL, and the app is what should receive it.
+_OPEN_IN_APP_RE = re.compile(
+    r"^\s*(?:open|launch|start|run|show|load|view|edit)\s+(?:the\s+|my\s+)?"
+    r"(?P<target>.+?)"
+    r"\s+(?:in|with|using|inside)\s+(?:the\s+|my\s+)?"
+    r"(?P<app>[\w .+-]+?)\s*$",
+    re.IGNORECASE,
+)
+
+# Nouns a speaker appends to the thing being opened: "the kancha directory".
+_TARGET_NOISE_RE = re.compile(
+    r"\s+(?:folder|directory|dir|project|repo|repository|codebase|workspace)\s*$",
     re.IGNORECASE,
 )
 
@@ -90,11 +127,56 @@ _FACTUAL_WEB_RE = re.compile(
 
 def _extract_file_location(text: str, default: str = "desktop") -> str:
     match = _FILE_LOCATION_RE.search(text)
-    return match.group("path").lower() if match else default
+    if not match:
+        return default
+    path = match.group("path").strip(" .")
+    if not path or path.lower() in _LOCATION_STOPWORDS:
+        return default
+    return path
 
 
 def _strip_file_location(text: str) -> str:
     return _FILE_LOCATION_RE.sub("", text).strip(" .")
+
+
+def _is_known_app(name: str) -> bool:
+    """True if *name* plausibly names an application on this machine.
+
+    Guards the "open X in Y" split: without it, "open the report in
+    documents" would be read as launching an app called "documents".
+    """
+    key = " ".join(name.lower().split())
+    if not key:
+        return False
+
+    from actions.apps import _APP_ALIASES  # local: keeps import cost off startup
+
+    if key in _APP_ALIASES:
+        return True
+    if any(re.search(rf"\b{re.escape(alias)}\b", key) for alias in _APP_ALIASES):
+        return True
+    # An installed binary the alias table has never heard of (ghostty,
+    # zed, kate…). Only single words — a phrase is never a command name.
+    if " " not in key:
+        return shutil.which(key) is not None
+    return False
+
+
+def _classify_open_in_app(cleaned: str) -> ToolDecision | None:
+    """"open kancha in vs code" → launch the app *with* that target."""
+    match = _OPEN_IN_APP_RE.match(cleaned)
+    if not match:
+        return None
+
+    app = match.group("app").strip().rstrip(".?!")
+    target = _TARGET_NOISE_RE.sub("", match.group("target").strip()).strip(" .")
+    if not app or not target or not _is_known_app(app):
+        return None
+
+    return ToolDecision(
+        task_name="open_app",
+        parameters={"app_name": app, "target": target},
+    )
 
 
 def _classify_file_request(cleaned: str) -> ToolDecision | None:
@@ -199,6 +281,31 @@ def _classify_file_request(cleaned: str) -> ToolDecision | None:
         )
 
     return None
+
+
+# "how's the coding agent doing", "check the progress", "is it done yet".
+# A delegated run is watched continuously, so this is answered from local
+# state — routing it deterministically keeps the answer instant and stops
+# it being mistaken for a web search or a system-monitor query.
+_AGENT_PROGRESS_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:can\s+you\s+|please\s+)?(?:check|show|give\s+me|what'?s|what\s+is)?\s*"
+    r"(?:the\s+|its\s+|his\s+|her\s+|their\s+)?"
+    r"(?:progress|status)(?:\s+(?:of|on|for)\s+.+)?|"
+    r"how(?:'s|\s+is|\s+are)\s+(?:the\s+|it|that|things)?\s*"
+    r"(?:coding\s+agent|agent|opencode|build|task|work|going|coming\s+along).*|"
+    r"is\s+(?:it|the\s+(?:agent|build|task|work))\s+(?:done|finished|ready|complete).*|"
+    r"(?:what'?s\s+|what\s+is\s+)?(?:the\s+)?(?:coding\s+)?agent\s+"
+    r"(?:status|progress|doing|up\s+to).*"
+    r")\s*[?.!]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _classify_agent_progress_request(cleaned: str) -> ToolDecision | None:
+    if not _AGENT_PROGRESS_RE.match(cleaned):
+        return None
+    return ToolDecision(task_name="agent_task", parameters={"action": "progress"})
 
 
 def _classify_protocol_request(cleaned: str) -> ToolDecision | None:
@@ -638,6 +745,13 @@ def classify_tool_request(text: str) -> ToolDecision | None:
                 parameters={"action": "focus", "app": focus_app},
             )
 
+    # "open <target> in <app>" before the bare open matcher, which would
+    # otherwise swallow the whole phrase as one app name and launch an
+    # empty window.
+    open_in_app = _classify_open_in_app(cleaned)
+    if open_in_app is not None:
+        return open_in_app
+
     open_match = _OPEN_RE.match(cleaned)
     if open_match:
         return ToolDecision(
@@ -648,6 +762,12 @@ def classify_tool_request(text: str) -> ToolDecision | None:
     file_decision = _classify_file_request(cleaned)
     if file_decision is not None:
         return file_decision
+
+    # "how's it going" about the coding agent, before the desktop and
+    # web-search matchers get a chance at the same words.
+    agent_decision = _classify_agent_progress_request(cleaned)
+    if agent_decision is not None:
+        return agent_decision
 
     # Check for desktop automation requests (wallpaper, windows, workspaces, etc.)
     desktop_decision = _classify_desktop_control_request(cleaned)
@@ -747,12 +867,12 @@ Your job is to classify the user's input intent and extract parameters if a task
 Classify intent into one of:
 - "query": User is asking a question or seeking information (e.g., "what is the capital of France?", "who is the president?").
 - "task": User is asking to perform a device action/tool. Allowed tasks:
-  * "open_app" (params: app_name)
+  * "open_app" (params: app_name; optional: target — what to open INSIDE that app: a folder ("kancha", "documents/projects"), a file, or a URL. "open kancha in vs code" is app_name="vscode", target="kancha", NOT app_name="kancha in vs code".)
   * "set_alarm" (params: description, delay_seconds)
   * "list_alarms" (no params)
   * "cancel_alarms" (no params)
   * "get_weather" (params: city, optional: date, units)
-  * "file_operation" (params: action (required), path, name, content, destination, new_name, extension (optional). Action values: list, create_file, create_folder, delete, move, copy, rename, read, write, find, largest, disk_usage, organize_desktop, info)- "execute_protocol" (params: protocol_name (required), original_request (optional))- "conversational": Casual greetings, chitchat, or social statements (e.g., "hi", "how are you?", "nice to meet you").
+  * "file_operation" (params: action (required), path, name, content, destination, new_name, extension (optional). Action values: list, create_file, create_folder, delete, move, copy, rename, read, write, find, largest, disk_usage, organize_desktop, info. "path" is WHERE the operation happens and is not limited to the standard folders — pass whatever location the user named ("kancha", "documents/projects", "~/work"); only default to "desktop" when they named nowhere. "name" is just the item, never the location.)- "execute_protocol" (params: protocol_name (required), original_request (optional))- "conversational": Casual greetings, chitchat, or social statements (e.g., "hi", "how are you?", "nice to meet you").
 - "desktop_control" (params: action (required), plus action-specific optional params). Action values: wallpaper, wallpaper_url, current_wallpaper, organize, clean, list, stats, list_windows, focus, close_window, minimize, maximize, list_workspaces, switch_workspace, move_to_workspace, window_workspace, task. For action="task" the natural-language description goes in the "task" param. For action="focus"/"close_window"/"minimize"/"maximize" the app name goes in "app". For action="switch_workspace" the desktop/workspace name or number goes in "target". For action="wallpaper" the image path goes in "path"; for "wallpaper_url" the URL goes in "url".
 - "system_monitor" (params: action (required); optional: metric, threshold, enabled). Action values: status (one-shot CPU/RAM/temp/GPU/uptime snapshot), check_alerts (run a single threshold check), set_threshold (needs metric ∈ {cpu,ram,temp,gpu} and threshold ∈ 1..99), enable/disable (toggle the background alert loop using enabled=true|false).
 - "web_search" (params: query (required)). Use for any request that needs live or current information from the web: news, prices, scores, events, documentation, research, public figures, recent announcements, etc. The query should be the user's question or search phrase as-is.

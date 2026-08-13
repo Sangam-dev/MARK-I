@@ -20,10 +20,17 @@ class TaskSpec:
 TASK_REGISTRY: dict[str, TaskSpec] = {
     "open_app": TaskSpec(
         name="open_app",
-        description="Open an installed application by name.",
+        description=(
+            "Open an installed application by name (app_name). To open "
+            "something *in* that application — a project folder in an "
+            "editor, a directory in the file manager, a file, or a URL in "
+            "a browser — pass it as 'target' (e.g. app_name='vscode', "
+            "target='kancha'). Without a target the application just "
+            "opens empty."
+        ),
         required_params=("app_name",),
-        optional_params=(),
-        param_types={"app_name": str},
+        optional_params=("target",),
+        param_types={"app_name": str, "target": str},
     ),
     "set_alarm": TaskSpec(
         name="set_alarm",
@@ -69,7 +76,13 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
         name="file_operation",
         description=(
             "Perform file system operations: list, create_file, create_folder, delete, "
-            "move, copy, rename, read, write, find, largest, disk_usage, organize_desktop, info."
+            "move, copy, rename, read, write, find, largest, disk_usage, "
+            "organize_desktop, info. 'path' is WHERE it happens and takes any "
+            "location the user named — a standard folder ('downloads'), a "
+            "nested one ('documents/projects'), a project directory by name "
+            "('kancha'), '~/work', or an absolute path. Only use 'desktop' "
+            "when the user named no location. 'name' is the item itself and "
+            "must never carry the location."
         ),
         required_params=("action",),
         optional_params=(
@@ -144,7 +157,9 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
         description=(
             "Control this computer through an allowlist of structured "
             "actions — use it for ANY machine control the user asks for: "
-            "open_application (target=app), open_path (target=file "
+            "open_application (target=app, plus path=<file, folder or URL> "
+            "to open that inside it, e.g. target=vscode path=kancha), "
+            "open_path (target=file "
             "or folder), brightness (operation=get|set|up|down, level=1..100, "
             "step=1..50), volume (operation=get|set|up|down|mute|unmute, "
             "level=0..100, step=1..50), wifi (operation=on|off|status), "
@@ -165,6 +180,7 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
         optional_params=(
             "operation",
             "target",
+            "path",
             "name",
             "pid",
             "scope",
@@ -181,6 +197,7 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
             "action": str,
             "operation": str,
             "target": str,
+            "path": str,
             "name": str,
             "pid": int,
             "scope": str,
@@ -251,6 +268,68 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
             "subject": str,
             "body": str,
             "confirm": bool,
+        },
+    ),
+    "agent_task": TaskSpec(
+        name="agent_task",
+        description=(
+            "Delegate a large piece of work to the OpenCode coding agent — "
+            "use it for anything that needs many steps, a working "
+            "directory, or real code: building or modifying a project, "
+            "writing and running tests, analysing and fixing a codebase, "
+            "or in-depth research and comparison. Actions: 'delegate' "
+            "(task=the user's full objective, in their own words; "
+            "directory=where to build it if the user named a place, e.g. "
+            "'projects' or '~/projects/jarvis_frontend'; optional label) "
+            "starts a NEW piece of work; 'follow_up' "
+            "(instruction=what to change or add; optional label) "
+            "continues work already in progress and is what you use when "
+            "the user refines something the agent just built; 'status' "
+            "lists the delegated tasks and how each is doing; 'progress' "
+            "(optional label) reports in detail how the running task is "
+            "going — use it for ANY 'how's it going', 'check the "
+            "progress', 'is it done yet' question. A delegated task can "
+            "STOP and wait — for permission to touch something outside "
+            "its working directory, or for the answer to a clarifying "
+            "question it asked — and it does nothing at all until you "
+            "respond: 'approve' grants the permission (only after the "
+            "user agrees; scope='always' stops it asking again), "
+            "'answer' (answer=what the user said, ';'-separated if it "
+            "asked several things) replies to a question, and 'deny' "
+            "refuses either. 'progress' tells you which of the two it is "
+            "waiting on and what it asked. Finally, 'end_session' "
+            "(optional label) stops one. "
+            "IMPORTANT: 'delegate' and 'follow_up' return IMMEDIATELY, "
+            "while the agent is still working — they start the job, they "
+            "do not finish it. Never tell the user the work is done off "
+            "the back of one; say it has started, and that they can ask "
+            "how it is going. The assistant announces completion by "
+            "itself when the agent actually finishes. "
+            "Delegate the whole objective in one go "
+            "and let the agent work — do not decompose it into steps "
+            "yourself, and do not use this for things the other tools "
+            "already do (opening apps, email, alarms, weather, machine "
+            "control, playing videos)."
+        ),
+        required_params=("action",),
+        optional_params=(
+            "task",
+            "instruction",
+            "label",
+            "session_id",
+            "directory",
+            "scope",
+            "answer",
+        ),
+        param_types={
+            "action": str,
+            "task": str,
+            "instruction": str,
+            "label": str,
+            "session_id": str,
+            "directory": str,
+            "scope": str,
+            "answer": str,
         },
     ),
     "system_monitor": TaskSpec(

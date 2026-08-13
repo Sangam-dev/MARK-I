@@ -213,10 +213,15 @@ def _default_voice(message: str, _args: dict[str, Any]) -> str:
 def _voice_open_app(message: str, args: dict[str, Any]) -> str:
     text = (message or "").strip()
     app = (args.get("app_name") or "").strip()
+    target = (args.get("target") or "").strip()
     # Already in JARVIS shape?
     if text.lower().startswith(("opening ", "could not confirm")):
         return text
     if text.lower().startswith("launch command sent for"):
+        if app and target:
+            # Speak the name the user used, not the absolute path the
+            # launcher resolved it to.
+            return f"Opening {target} in {app} for you, sir."
         # Re-extract the app name from the message if we have one.
         # Format: "Launch command sent for firefox."
         rest = text.split("for", 1)[-1].strip().rstrip(".")
@@ -261,14 +266,22 @@ def _voice_file_operation(message: str, args: dict[str, Any]) -> str:
     name = (args.get("name") or "").strip()
     path = (args.get("path") or "").strip()
 
+    # Where it landed is worth saying out loud — it is the one detail the
+    # user can't otherwise check without going and looking.
+    where = f" in {path}" if path else ""
+
     if action == "create_folder":
+        if "already exists" in text.lower() or "access denied" in text.lower():
+            return text
         if name:
-            return f"Done — folder '{name}' created, sir."
-        return "Folder created, sir."
+            return f"Done — folder '{name}' created{where}, sir."
+        return f"Folder created{where}, sir."
     if action == "create_file":
+        if "could not" in text.lower() or "access denied" in text.lower():
+            return text
         if name:
-            return f"File '{name}' saved, sir."
-        return "File saved, sir."
+            return f"File '{name}' saved{where}, sir."
+        return f"File saved{where}, sir."
     if action == "delete":
         return f"Removed, sir." if "moved to trash" in text.lower() else text
     if action in ("move", "copy"):
@@ -315,6 +328,35 @@ def _voice_web_search(message: str, _args: dict[str, Any]) -> str:
     return text
 
 
+def _voice_agent_task(message: str, args: dict[str, Any]) -> str:
+    """Voice for the delegated coding agent.
+
+    Two things must survive intact: that a delegation has *started* and
+    is not finished, and the progress report itself, which is already
+    written to be read aloud (see agent/progress.py). The default
+    colon-rewrite would turn both into something shorter and wrong.
+    """
+    text = (message or "").strip()
+    if not text:
+        return "Done, sir."
+
+    action = (args.get("action") or "").lower().strip()
+
+    if action in {"delegate", "follow_up"}:
+        # The tool's output is written for the LLM ("it is NOT finished")
+        # rather than for the user; say the short human version instead.
+        label = (args.get("label") or "").strip()
+        if text.lower().startswith("the coding agent has started"):
+            what = f"'{label}'" if label else "it"
+            return (
+                f"The coding agent is on it, sir — I'll let you know when "
+                f"{what} is done. Ask me for the progress any time."
+            )
+        return text
+
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Registry + dispatcher
 # ---------------------------------------------------------------------------
@@ -345,6 +387,7 @@ TOOL_VOICE: dict[str, ToolVoice] = {
     # sentence to say — the colon-rewrite would mangle the quoted title.
     "youtube_video": _passthrough,
     "web_search": _voice_web_search,
+    "agent_task": _voice_agent_task,
 }
 
 

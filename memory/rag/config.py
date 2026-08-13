@@ -157,7 +157,17 @@ class RAGConfig:
     # This is a *voice* assistant: a slow lookup is worse than no lookup,
     # because the user hears silence. Retrieval is therefore hard-capped
     # and degrades to "answer without context" when it overruns.
-    retrieval_timeout_ms: int = 600
+    #
+    # 600ms was too tight to be a safety net — it was a coin flip. A cold
+    # Gemini embedding round trip measures 470–600ms on this machine, so
+    # queries were landing at 601ms and 602ms and returning nothing, which
+    # reads as "RAG just doesn't work" rather than as a timeout. 1500ms
+    # keeps a real bound while clearing the measured worst case ~2.5x.
+    #
+    # The user rarely waits for this in practice: the pipeline prefetches
+    # on TranscriptReady/TextInputReceived, so by the time the coordinator
+    # asks, the embedding is usually already in flight or cached.
+    retrieval_timeout_ms: int = 1500
     query_cache_size: int = 256
     warm_on_boot: bool = True
 
@@ -308,7 +318,7 @@ class RAGConfig:
             ),
             router_strategy=router,
             retrieval_timeout_ms=_env_int(
-                "KANCHA_RAG_RETRIEVAL_TIMEOUT_MS", 600, minimum=50
+                "KANCHA_RAG_RETRIEVAL_TIMEOUT_MS", 1500, minimum=50
             ),
             query_cache_size=_env_int("KANCHA_RAG_QUERY_CACHE", 256, minimum=0),
             warm_on_boot=_env_bool("KANCHA_RAG_WARM_ON_BOOT", True),

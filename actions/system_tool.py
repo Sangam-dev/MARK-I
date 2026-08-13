@@ -92,7 +92,11 @@ class ActionSpec:
 ACTIONS: dict[str, ActionSpec] = {
     "open_application": ActionSpec(
         name="open_application",
-        summary="Launch an installed application by name (target=app name).",
+        summary=(
+            "Launch an installed application by name (target=app name). "
+            "Add path=<file, folder or URL> to open that in the "
+            "application — e.g. target=vscode, path=kancha."
+        ),
     ),
     "open_path": ActionSpec(
         name="open_path",
@@ -280,7 +284,17 @@ def _require_existing_path(value: Any, field_name: str) -> Path:
     text = str(value or "").strip()
     if not text:
         raise ArgumentError(f"'{field_name}' is required")
-    path = Path(os.path.expanduser(text)).resolve()
+
+    # Share the file tools' resolver so a spoken location ("downloads",
+    # "kancha", "documents/notes") means the same thing here as it does
+    # there, instead of resolving against the process's working directory.
+    try:
+        from actions.file_controller import _resolve_path  # noqa: PLC0415
+
+        path = _resolve_path(text).resolve()
+    except Exception:  # noqa: BLE001 — fall back to plain expansion
+        path = Path(os.path.expanduser(text)).resolve()
+
     if not path.exists():
         raise ArgumentError(f"path does not exist: {path}")
     return path
@@ -487,6 +501,11 @@ class SystemTool:
         if not target:
             raise ArgumentError("'target' is required (the application name)")
 
+        # What to open *inside* the application, if anything.
+        location = str(
+            params.get("path") or params.get("location") or params.get("url") or ""
+        ).strip()
+
         # Reuse the existing launcher: it already owns the alias table
         # (vscode -> code), the platform split and the launch verification.
         opener = self._app_opener
@@ -495,7 +514,12 @@ class SystemTool:
 
             opener = open_app
 
-        result = await asyncio.to_thread(opener, target)
+        # A bare string when there's nothing to open with it, so simple
+        # openers (and the tests' fakes) keep their one-argument shape.
+        request: Any = (
+            {"app_name": target, "target": location} if location else target
+        )
+        result = await asyncio.to_thread(opener, request)
         return SystemToolResult(
             success=bool(result.success),
             output=result.message if result.success else "",

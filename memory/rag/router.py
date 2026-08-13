@@ -90,12 +90,36 @@ _DOCUMENT_RE = re.compile(
 )
 
 # Reference to shared history: "we discussed", "last week", "you told me".
+#
+# The verb list is deliberately broad. A false positive costs one
+# embedding call; a false negative makes the assistant look like it has
+# amnesia about work the user knows it recorded, which is far worse.
 _PAST_REFERENCE_RE = re.compile(
-    r"\b(?:we\s+(?:discussed|talked|decided|used|did|solved|tried|agreed|built|found)|"
+    r"\b(?:(?:we|i)\s+(?:discussed|talked|decided|used|did|solved|tried|agreed|"
+    r"built|found|made|created|added|wrote|chose|picked|fixed|changed|planned|"
+    r"implemented|integrated|designed|set\s+up|finished|completed|started)|"
     r"you\s+(?:told|said|mentioned|suggested|showed|explained)|"
     r"i\s+(?:told|said|mentioned|asked|showed)\s+you|"
     r"last\s+(?:week|month|time|night|session)|earlier|previously|before|"
-    r"the\s+other\s+day|remember|recall|back\s+then|we'?d|we'?ve)\b",
+    r"the\s+other\s+day|remember|recall|back\s+then|we'?d|we'?ve|i'?ve)\b",
+    re.IGNORECASE,
+)
+
+# The natural way to ask about your own history is an inverted question:
+# "what did we do…", "how did we integrate…", "did I finish…", "what have
+# I been working on". Auxiliary inversion puts the verb *before* the
+# pronoun, so :data:`_PAST_REFERENCE_RE`, which expects "we|i" followed by
+# a verb, never matched any of them. That single gap silently blocked most
+# episodic questions — including the retrieval prefetch, which is gated by
+# the same decision.
+_EPISODIC_QUESTION_RE = re.compile(
+    r"\b(?:"
+    r"(?:what|when|where|why|how|which|who)\s+(?:did|have|has|had|was|were)\s+"
+    r"(?:i|we|you)\b"
+    r"|(?:did|have|has|had)\s+(?:i|we|you)\s+\w+"
+    r"|(?:i|we)\s+(?:have\s+|had\s+)?been\s+\w+ing"
+    r"|what\s+(?:i|we|you)\s+(?:did|have|said|built|made)"
+    r")",
     re.IGNORECASE,
 )
 
@@ -137,6 +161,9 @@ _WORD_RE = re.compile(r"[A-Za-z0-9'-]+")
 _SIGNALS: tuple[tuple[re.Pattern[str], float, str], ...] = (
     (_DOCUMENT_RE, 1.0, "document-reference"),
     (_PAST_REFERENCE_RE, 1.0, "past-reference"),
+    # Same weight as an explicit past reference: "what did we do about X"
+    # is asking about shared history just as plainly as "we discussed X".
+    (_EPISODIC_QUESTION_RE, 1.0, "episodic-question"),
     (_CONTINUITY_RE, 0.8, "continuity"),
     (_POSSESSIVE_TOPIC_RE, 0.8, "possessive-topic"),
     (_KNOWLEDGE_NOUN_RE, 0.4, "knowledge-noun"),

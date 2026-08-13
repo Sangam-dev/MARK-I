@@ -72,11 +72,26 @@ _FILE_REQUIRED: dict[str, tuple[str, ...]] = {
     "find": ("name",),
 }
 
+_AGENT_REQUIRED: dict[str, tuple[str, ...]] = {
+    "delegate": ("task",),
+    "follow_up": ("instruction",),
+    "status": (),
+    # These read live state or answer a pending question, and all default
+    # to the active run, so none has anything the user must be asked for.
+    "progress": (),
+    "approve": (),
+    "deny": (),
+    "end_session": (),
+    # The one exception: there is no answering without an answer.
+    "answer": ("answer",),
+}
+
 _ACTION_REQUIRED: dict[str, tuple[str, dict[str, tuple[str, ...]]]] = {
     # tool -> (name of the dispatch argument, action -> required fields)
     "gmail": ("action", _GMAIL_REQUIRED),
     "system": ("action", _SYSTEM_REQUIRED),
     "file_operation": ("action", _FILE_REQUIRED),
+    "agent_task": ("action", _AGENT_REQUIRED),
 }
 
 # ── Sensitive actions ─────────────────────────────────────────────────
@@ -204,6 +219,9 @@ _FIELD_QUESTIONS: dict[str, str] = {
     "app_name": "Which application?",
     "action": "What should I do exactly?",
     "request": "What would you like me to play?",
+    "task": "What would you like the coding agent to build?",
+    "instruction": "What should the agent change or add?",
+    "answer": "What should I tell the coding agent?",
 }
 
 

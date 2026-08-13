@@ -42,6 +42,10 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from agent.client import OpenCodeClient, close_shared_opencode, set_shared_opencode_client
+from agent.config import OpenCodeConfig
+from agent.progress import RunProgress
+from agent.tool import get_shared_opencode_tool
 from core.bus import EventBus
 from core.events import (
     ResponseReady,
@@ -152,6 +156,11 @@ class Pipeline:
     rag_router: MemoryRouter | None = None
     rag_ingest: IngestService | None = None
     rag_enabled: bool = False
+    # ── OpenCode (delegated execution layer) ──────────────────────────
+    # Config only. The server is started lazily on the first delegation,
+    # so an assistant that is never asked to build anything never pays
+    # for a process it will not use.
+    opencode: OpenCodeConfig | None = None
 
 
 async def build_pipeline(
@@ -302,6 +311,64 @@ async def build_pipeline(
             rag_ingest = None
     else:
         logger.info("RAG disabled (KANCHA_RAG_ENABLED=0 or enable_rag=False)")
+
+    # ── OpenCode: delegated execution layer ─────────────────────────────
+    # Coding, research and multi-step work go to OpenCode rather than to
+    # the assistant's own action system — see agent/__init__.py. Only the
+    # config is resolved here; ``OpenCodeClient.ensure_ready`` starts the
+    # server on first use and ``shutdown_pipeline`` stops it.
+    #
+    # The client is installed as the process-wide instance so the session
+    # map (and the server it owns) is shared by every turn.
+    opencode_config = OpenCodeConfig.from_env()
+    set_shared_opencode_client(OpenCodeClient(opencode_config))
+
+    # A delegated run reports minutes after the turn that started it, by
+    # which point nobody is waiting on a return value. Announce it the
+    # same way the system monitor announces an alert — through
+    # ResponseReady, which TTS and the console formatter already serve.
+    #
+    # Fires both while the agent works (an interval heartbeat, only when
+    # something changed — see agent/tool.py) and once when it stops.
+    async def _announce_agent_update(label: str, progress: RunProgress) -> None:
+        if progress.state == "cancelled":
+            return
+        if progress.blocked_kind == "question":
+            # The question itself, so it can be answered in one breath —
+            # but only the first of a batch. Telling someone a question
+            # exists costs a round trip; reciting six costs their
+            # patience.
+            text = (
+                f"Sir, '{label}' needs an answer before it can carry on. "
+                f"{progress.question_prompt(first_only=True)}"
+            )
+        elif progress.blocked_on:
+            # A question to the user, not a status line — the run is
+            # stopped until it is answered.
+            text = (
+                f"Sir, '{label}' wants to {progress.permission_request()}. "
+                "Shall I let it?"
+            )
+        # These arrive unprompted, so they are kept to a sentence — the
+        # full report is what the `progress` action is for, and reading
+        # it out uninvited buries the one fact that matters.
+        elif progress.running:
+            text = f"Still working on '{label}', sir — {progress.brief()}"
+        elif progress.state == "failed":
+            text = f"Sir, the coding agent could not finish '{label}'. {progress.brief()}"
+        else:
+            text = (
+                f"Sir, the coding agent has finished '{label}' — "
+                f"{progress.brief()} Ask me for the details if you want them."
+            )
+        bus.emit(ResponseReady(text=text))
+
+    get_shared_opencode_tool().set_notifier(_announce_agent_update)
+
+    if opencode_config.enabled:
+        logger.info("OpenCode delegation enabled — %s", opencode_config.describe())
+    else:
+        logger.info("OpenCode delegation disabled (KANCHA_OPENCODE_ENABLED=0)")
 
     # ── LLM + token logging ─────────────────────────────────────────────
     token_log = TokenLog(
@@ -457,6 +524,7 @@ async def build_pipeline(
         rag_router=rag_router,
         rag_ingest=rag_ingest,
         rag_enabled=rag_manager is not None,
+        opencode=opencode_config,
     )
 
 
@@ -488,5 +556,19 @@ async def shutdown_pipeline(pipeline: Pipeline, drain_timeout: float = 3.0) -> N
             await pipeline.rag.close()
         except Exception as exc:
             logger.warning("RAG close error (non-fatal): %s", exc)
+
+    # Stop delegated runs and the event pump before the transport they
+    # both use goes away, then the server subprocess itself. The latter
+    # is a no-op if no client was ever built — it never constructs one
+    # just to close it.
+    try:
+        await get_shared_opencode_tool().aclose()
+    except Exception as exc:
+        logger.warning("OpenCode tool close error (non-fatal): %s", exc)
+
+    try:
+        await close_shared_opencode()
+    except Exception as exc:
+        logger.warning("OpenCode close error (non-fatal): %s", exc)
 
     logger.info("Pipeline shut down (session=%s)", pipeline.session_id)

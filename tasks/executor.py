@@ -21,6 +21,7 @@ from actions.system_tool import get_shared_system_tool
 from actions.weather import get_weather
 from actions.web_search import web_search
 from actions.youtube_video import youtube_video
+from agent.tool import get_shared_opencode_tool
 from core.bus import EventBus
 from core.events import TaskCompleted, TaskExecutionRequested
 from tasks.registry import TASK_REGISTRY, validate_task
@@ -185,8 +186,10 @@ class TaskExecutor:
         """Route task to the appropriate action function (all blocking calls run in thread)."""
 
         if task_name == "open_app":
-            app_name = params.get("app_name", "")
-            result = await asyncio.to_thread(open_app, app_name)
+            # Pass the whole param dict, not just the name: `target` is
+            # what makes "open kancha in vscode" open the project rather
+            # than an empty editor window.
+            result = await asyncio.to_thread(open_app, params)
             return TaskExecutionResult(result.success, result.message)
 
         if task_name == "set_alarm":
@@ -310,10 +313,67 @@ class TaskExecutor:
                 return TaskExecutionResult(True, result.output or "Done.")
             return TaskExecutionResult(False, result.error or "Gmail action failed.")
 
+        if task_name == "agent_task":
+            # The OpenCode layer is already async and owns its own
+            # transport, so no to_thread hop. The shared instance is
+            # required, not incidental: the session map lives on it, and
+            # a follow-up needs the session its predecessor opened.
+            #
+            # Delegated work runs for minutes, not milliseconds — that is
+            # the point of it — so `delegate` starts it in the background
+            # and returns; the run is watched via OpenCode's event stream
+            # and reported through the `progress` action.
+            result = await get_shared_opencode_tool().execute(
+                self._with_resolved_directory(params)
+            )
+            if result.success:
+                return TaskExecutionResult(True, result.output or "Done.")
+            return TaskExecutionResult(False, result.error or "Delegation failed.")
+
         if task_name == "system_monitor":
             return await self._dispatch_system_monitor(params)
 
         return TaskExecutionResult(False, f"No handler found for task: {task_name}")
+
+    # ── agent_task helpers ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _with_resolved_directory(params: dict[str, Any]) -> dict[str, Any]:
+        """Turn a spoken working directory into an absolute path.
+
+        "Build me a site in the projects folder" has to reach OpenCode as
+        a real directory, because OpenCode resolves every relative path
+        in the task against its own working directory — get it wrong and
+        the work lands in the default workspace, which is exactly the
+        "it created kancha-workspace and nothing else" failure.
+
+        Resolution happens *here* rather than in ``agent/`` on purpose:
+        that package is deliberately isolated from ``actions/`` (see
+        agent/tool.py), and the resolver lives in the file controller.
+        """
+        raw = str(
+            params.get("directory") or params.get("workspace") or params.get("path") or ""
+        ).strip()
+        if not raw:
+            return params
+
+        from actions.file_controller import _resolve_path  # noqa: PLC0415
+
+        resolved = _resolve_path(raw)
+        if not resolved.is_dir():
+            # Creating it is the right call: "build me a site in
+            # ~/projects/jarvis_frontend" names where it should go, not
+            # somewhere that must already exist.
+            try:
+                resolved.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                logger.warning("Could not create agent directory %s: %s", resolved, exc)
+                return params
+
+        updated = dict(params)
+        updated["directory"] = str(resolved)
+        logger.info("agent_task will work in %s (from %r)", resolved, raw)
+        return updated
 
     # ── system_monitor handler ──────────────────────────────────────────────
 
