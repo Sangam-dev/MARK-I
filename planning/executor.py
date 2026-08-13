@@ -45,7 +45,7 @@ from core.events import (
 )
 from tasks.registry import validate_task
 
-from planning.models import ExecutionPlan, PlannedTask
+from planning.models import ExecutionPlan, PlannedTask, TaskStatus
 
 logger = logging.getLogger("kancha.planning.executor")
 
@@ -67,6 +67,9 @@ class ExecutionOutcome:
     success: bool
     result: str
     error: str
+    #: Structured failure class (see :mod:`core.failures`). None on
+    #: success or when the failure is transient/unknown (retryable).
+    error_type: str | None = None
 
 
 class PlanExecutor:
@@ -109,7 +112,9 @@ class PlanExecutor:
         bound_args = self._bind_references(task.arguments, plan)
         ok, reason = validate_task(task.tool, bound_args)
         if not ok:
-            return ExecutionOutcome(False, "", reason)
+            # A plan-level validation failure is a permanent bad-argument
+            # failure, not a transient condition — never retried.
+            return ExecutionOutcome(False, "", reason, "invalid_argument")
 
         # ── 2. Register correlation future ─────────────────────────
         loop = asyncio.get_running_loop()
@@ -153,6 +158,7 @@ class PlanExecutor:
             success=completed.success,
             result=completed.result if completed.success else "",
             error="" if completed.success else (completed.error or completed.result or "task failed"),
+            error_type=None if completed.success else completed.error_type,
         )
 
     async def on_task_completed(self, event: TaskCompleted) -> None:
@@ -221,7 +227,19 @@ def _resolve_ref(match: re.Match[str], plan: ExecutionPlan) -> str:
         logger.warning("Plan %s references unknown task %s", plan.id, task_id)
         return ""
     if key == "result":
-        return target.result
+        if target.status == TaskStatus.COMPLETED:
+            return target.result
+        # Never bind a failure's text (or a not-yet-completed task's
+        # empty result) into another task's arguments. Dependents of a
+        # failed task are cascade-skipped anyway; this is the guarantee
+        # that a natural-language error message can never become a path.
+        logger.warning(
+            "Plan %s task %s: ref target %s is not completed — not binding",
+            plan.id,
+            task_id,
+            target.id,
+        )
+        return ""
     logger.warning(
         "Plan %s task %s: unknown ref key %s", plan.id, task_id, key
     )

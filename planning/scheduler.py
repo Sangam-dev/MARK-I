@@ -35,6 +35,7 @@ from core.events import (
     PlanCreated,
     PlanReplanRequested,
 )
+from core.failures import TERMINAL_ERROR_TYPES
 from planning.executor import PlanExecutor
 from planning.models import ExecutionPlan, PlannedTask, PlanStatus, TaskStatus
 
@@ -291,6 +292,46 @@ class PlanScheduler:
                 else task.error or "task failed"
             )
             task.error = err
+            error_type = outcome.error_type if outcome is not None else None
+
+            # Permanent failures never improve on retry. Stop immediately
+            # instead of burning attempts. A multi-task plan may still have
+            # a genuinely different continuation, so offer a *terminal*
+            # replan — the Planner's identical-plan guard and budget then
+            # guarantee that only genuinely different plans run again.
+            if error_type in TERMINAL_ERROR_TYPES:
+                task.status = TaskStatus.FAILED
+                self._cascade_skip_dependents(plan)
+                if len(plan.tasks) > 1:
+                    logger.warning(
+                        "Plan %s task %s failed permanently (%s) — "
+                        "offering a terminal replan: %s",
+                        plan.id,
+                        task.id,
+                        error_type,
+                        err,
+                    )
+                    self._bus.emit(
+                        PlanReplanRequested(
+                            plan_id=plan.id,
+                            failed_task_id=task.id,
+                            reason=task.error,
+                            session_id=plan.session_id,
+                            terminal=True,
+                            error_type=error_type,
+                        )
+                    )
+                else:
+                    logger.warning(
+                        "Plan %s task %s failed permanently (%s) — "
+                        "terminating, no replan: %s",
+                        plan.id,
+                        task.id,
+                        error_type,
+                        err,
+                    )
+                return
+
             logger.warning(
                 "Plan %s task %s failed (attempt %d/%d): %s",
                 plan.id,
@@ -300,7 +341,9 @@ class PlanScheduler:
                 err,
             )
 
-        # Out of attempts. Mark failed and ask the Planner to replan.
+        # Out of attempts on a retryable/unknown failure. Mark failed and
+        # ask the Planner to replan (still guarded by the replan budget
+        # and identical-plan detection on the Planner side).
         task.status = TaskStatus.FAILED
         self._cascade_skip_dependents(plan)
         self._bus.emit(
@@ -332,10 +375,16 @@ class PlanScheduler:
     def _finalize(self, plan: ExecutionPlan) -> None:
         plan.completed_at = datetime.utcnow()
         if plan.any_failed():
+            # A plan where nothing completed is a *failed* plan, not a
+            # partial one, so the Orchestrator marks the user-level task
+            # FAILED and the user hears a clean failure.
+            completed_any = any(
+                t.status == TaskStatus.COMPLETED for t in plan.tasks
+            )
             plan.status = PlanStatus.PARTIAL
             self._emit_plan_completed(
                 plan,
-                status="partial",
+                status="partial" if completed_any else "failed",
                 summary=_natural_summary(plan),
             )
         else:

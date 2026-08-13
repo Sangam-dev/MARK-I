@@ -55,6 +55,7 @@ from core.events import (
     TaskDispatched,
     TaskProtocolResponse,
 )
+from core.failures import MAX_REPLANS_PER_DELEGATION
 from memory.manager import MemoryManager
 from memory.token_log import TokenLog
 from nlu.classifier import classify_tool_request
@@ -335,6 +336,16 @@ class Planner:
         # two answers for one request).
         self._replanning: set[str] = set()
         self._deferred_completions: dict[str, PlanCompleted] = {}
+        # plan_id -> content fingerprint of the plan's executable steps.
+        # Used by the identical-plan guard to refuse re-running a strategy
+        # that already failed for the same delegation.
+        self._plan_fingerprints: dict[str, str] = {}
+        # (task_id, attempt) -> plan_ids generated for that delegation,
+        # so a replan can be compared against every earlier plan.
+        self._delegation_plans: dict[tuple[str, int], set[str]] = {}
+        # (task_id, attempt) -> number of replacement plans emitted, capped
+        # by :data:`core.failures.MAX_REPLANS_PER_DELEGATION`.
+        self._replan_count: dict[tuple[str, int], int] = {}
 
     # ── registration ──────────────────────────────────────────────
 
@@ -421,6 +432,7 @@ class Planner:
         self._apply_references(plan)
 
         self._delegations[plan.id] = event
+        self._register_plan(plan, event.task_id, event.attempt)
         self._emit_protocol(
             event.task_id,
             "execute",
@@ -622,8 +634,53 @@ class Planner:
             )
         )
 
+    @staticmethod
+    def _plan_fingerprint(plan: ExecutionPlan) -> str:
+        """Content hash of a plan's executable steps (tool + arguments).
+
+        Task ids, descriptions and dependency edges are intentionally left
+        out: two plans are "the same strategy" when they run the same tools
+        with the same arguments, even if the LLM renumbered the steps.
+        """
+        steps = sorted(
+            json.dumps(
+                [
+                    t.tool,
+                    {
+                        k: v
+                        for k, v in t.arguments.items()
+                        if not k.startswith("_")
+                    },
+                ],
+                sort_keys=True,
+                default=str,
+            )
+            for t in plan.tasks
+        )
+        return json.dumps(steps)
+
+    def _register_plan(
+        self, plan: ExecutionPlan, task_id: str, attempt: int
+    ) -> None:
+        """Record a plan's fingerprint under its delegation.
+
+        This is what lets a later replan prove that it is not the same
+        executable strategy as an earlier, already-failed plan.
+        """
+        self._plan_fingerprints[plan.id] = self._plan_fingerprint(plan)
+        self._delegation_plans.setdefault((task_id, attempt), set()).add(
+            plan.id
+        )
+
     async def on_replan_requested(self, event: PlanReplanRequested) -> None:
-        """Build a new plan starting from a previously-failed task."""
+        """Build a new plan starting from a previously-failed task.
+
+        Every path through here either produces a replacement plan or
+        terminates the delegation with the original failure. A replan can
+        never be re-triggered indefinitely because (a) each delegation has a
+        hard replan budget and (b) a replacement plan whose executable steps
+        duplicate any earlier plan for the same delegation is rejected.
+        """
         # We don't have the original ExecutionPlan in memory (the
         # Scheduler keeps it private), so the replan prompt is built
         # from the failed-task context the caller passes in.
@@ -649,15 +706,45 @@ class Planner:
         if not user_request and request is not None:
             user_request = request.instruction
 
+        # Replan budget: even a run of *different* still-failing plans must
+        # terminate. Keyed by (task_id, attempt) so a resumed task (the user
+        # answered a question) starts with a fresh budget.
+        key = (
+            (request.task_id, request.attempt)
+            if request is not None
+            else (event.plan_id, 0)
+        )
+        if self._replan_count.get(key, 0) >= MAX_REPLANS_PER_DELEGATION:
+            logger.warning(
+                "Replan budget exhausted for delegation %s — terminating",
+                key,
+            )
+            # Nothing replaces the failed plan, so its outcome is the
+            # answer; it is reported when the Scheduler completes the plan.
+            self._flush_deferred_completion(event.plan_id)
+            return
+
         if request is not None:
             self._replanning.add(event.plan_id)
         try:
-            new_plan = await self._ask_llm_for_plan(
-                user_request=user_request,
-                extra_context=(
+            if event.terminal:
+                # A permanent failure must only be re-planned into a
+                # genuinely different strategy; an empty plan terminates.
+                extra_context = (
+                    f"Previously failed task: {event.failed_task_id} ({event.reason}). "
+                    f"This is a permanent failure ({event.error_type or 'terminal'}) — "
+                    "repeating the same operation cannot succeed. Only produce a NEW plan "
+                    "that uses a genuinely different strategy; otherwise return an empty "
+                    "\"tasks\" list."
+                )
+            else:
+                extra_context = (
                     f"Previously failed task: {event.failed_task_id} ({event.reason}). "
                     "Skip it and continue with the rest of the request."
-                ),
+                )
+            new_plan = await self._ask_llm_for_plan(
+                user_request=user_request,
+                extra_context=extra_context,
             )
         finally:
             self._replanning.discard(event.plan_id)
@@ -670,6 +757,24 @@ class Planner:
             # Nothing replaces it, so the original outcome is the answer.
             self._flush_deferred_completion(event.plan_id)
             return
+
+        # Identical-plan guard: never re-run an executable plan that already
+        # failed for this delegation — that is the retry/replan loop. This
+        # applies to every failure class, terminal or not.
+        prior_fps = {
+            self._plan_fingerprints[pid]
+            for pid in self._delegation_plans.get(key, ())
+            if pid in self._plan_fingerprints
+        }
+        if self._plan_fingerprint(new_plan) in prior_fps:
+            logger.warning(
+                "Replan for plan %s duplicates a previously failed plan — "
+                "terminating instead of looping",
+                event.plan_id,
+            )
+            self._flush_deferred_completion(event.plan_id)
+            return
+
         self._apply_references(new_plan)
         if request is not None:
             # The retry now owns the delegation. The original plan's
@@ -678,6 +783,8 @@ class Planner:
             self._delegations.pop(event.plan_id, None)
             self._deferred_completions.pop(event.plan_id, None)
             self._delegations[new_plan.id] = request
+            self._replan_count[key] = self._replan_count.get(key, 0) + 1
+            self._register_plan(new_plan, request.task_id, request.attempt)
         self._bus.emit(
             PlanCreated(
                 plan=_plan_to_dict(new_plan),

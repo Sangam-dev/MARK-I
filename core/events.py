@@ -396,6 +396,10 @@ class TaskCompleted(BaseEvent):
     success: bool = True
     result: str = ""
     error: str = ""
+    #: Structured failure class (see :mod:`core.failures`). ``None`` on
+    #: success or when the failure is transient/unknown and therefore
+    #: retryable. Never a user-facing sentence.
+    error_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -496,6 +500,11 @@ class PlanReplanRequested(BaseEvent):
     failed_task_id: str = ""
     reason: str = ""
     remaining_tasks: list[dict[str, Any]] = field(default_factory=list)
+    #: True when the failed task's failure class is permanent (see
+    #: :mod:`core.failures`). The replanner then only proceeds with a
+    #: genuinely different strategy — never the same plan again.
+    terminal: bool = False
+    error_type: str | None = None
 
 
 @dataclass(frozen=True)

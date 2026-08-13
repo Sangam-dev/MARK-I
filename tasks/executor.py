@@ -32,7 +32,8 @@ _FILE_FAILURE_RE = re.compile(
     r"^(?:access denied|path not found|not a directory|permission denied|"
     r"could not|not found|source not found|no destination specified|"
     r"file not found|not a file|search path not found|search error|"
-    r"error|unknown action|file controller error|protected directory)",
+    r"error|unknown action|file controller error|protected directory|"
+    r"no\s+[^\n]+?\s+found\b)",  # "No sss.pdf found in Desktop" is a negative result
     re.IGNORECASE,
 )
 
@@ -115,6 +116,93 @@ def detach_monitor_loop() -> None:
 class TaskExecutionResult:
     success: bool
     message: str
+    #: Structured failure class (see :mod:`core.failures`). None on success
+    #: or when the failure is transient/unknown (retryable).
+    error_type: str | None = None
+
+
+def classify_failure(message: str) -> str | None:
+    """Map a failure message to a permanent failure class, or ``None`` when
+    the failure looks transient/unknown (and therefore may be retried).
+
+    Conservative by design: a false *negative* (permanent failure treated as
+    retryable) is bounded by the scheduler's retry cap and the planner's
+    replan guards; a false *positive* (transient failure treated as terminal)
+    would skip a legitimate retry, so only clearly-permanent wording is
+    classified.
+    """
+    text = (message or "").strip()
+    if not text:
+        return None
+    low = text.lower()
+
+    if any(
+        m in low
+        for m in (
+            "does not exist",
+            "file not found",
+            "path not found",
+            "search path not found",
+            "source not found",
+            "not a directory",
+            "not a file",
+            "no such file",
+            "no open window",
+            "no windows found",
+            "no files found",
+        )
+    ):
+        return "not_found"
+    # "No sss.pdf found in Desktop" — the search-miss shape.
+    if re.search(r"\bno\s+[\w ._+-]+?\s+found\b", low):
+        return "not_found"
+
+    if any(
+        m in low
+        for m in (
+            "is required",
+            "must be one of",
+            "must be a ",
+            "must be between",
+            "use one of",
+            "unknown action",
+            "unknown system action",
+            "unknown metric",
+            "unknown protocol",
+            "numeric threshold",
+            "invalid threshold",
+            "missing required param",
+            "not in the registry",
+            "no handler found for task",
+        )
+    ):
+        return "invalid_argument"
+
+    if any(
+        m in low
+        for m in (
+            "not supported",
+            "unsupported",
+            "none is installed",
+            "is not installed",
+            "this action cannot",
+        )
+    ):
+        return "unsupported"
+
+    if any(
+        m in low
+        for m in (
+            "access denied",
+            "permission denied",
+            "protected directory",
+            "requires confirmation",
+            "rejected the credentials",
+        )
+    ):
+        return "permission"
+
+    return None
 
 
 class TaskExecutor:
@@ -134,6 +222,9 @@ class TaskExecutor:
                     task_name=event.task_name,
                     success=False,
                     error=reason,
+                    # A plan-level validation failure is a bad argument,
+                    # not a transient condition — never retried.
+                    error_type="invalid_argument",
                     session_id=event.session_id,
                 )
             )
@@ -149,6 +240,7 @@ class TaskExecutor:
                         f"Action '{event.task_name}' requires confirmation. "
                         f"Please say 'confirm {event.task_name}' to proceed."
                     ),
+                    error_type="permission",
                     session_id=event.session_id,
                 )
             )
@@ -163,6 +255,7 @@ class TaskExecutor:
                     task_name=event.task_name,
                     success=False,
                     error=str(exc),
+                    error_type=classify_failure(str(exc)),
                     session_id=event.session_id,
                 )
             )
@@ -176,6 +269,9 @@ class TaskExecutor:
                 success=result.success,
                 result=result.message if result.success else "",
                 error="" if result.success else result.message,
+                error_type=(
+                    None if result.success else classify_failure(result.message)
+                ),
                 session_id=event.session_id,
             )
         )
