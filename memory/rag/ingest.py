@@ -130,24 +130,34 @@ class IngestService:
     # ── temporary storage ────────────────────────────────────────────
 
     async def _stage(self, filename: str, data: bytes) -> Path:
-        """Write *data* to the staging directory and return its path.
+        """Write *data* to a uniquely-named staging subdirectory and return its path.
 
-        Staged under a unique id so two concurrent uploads of the same
-        filename cannot overwrite one another.
+        Each upload gets its own subdirectory (named with a unique id)
+        rather than a prefixed filename, so the staged path's ``name`` and
+        ``stem`` match the real upload exactly. Loaders fall back to
+        ``path.stem``/``path.name`` for the document title and filename
+        metadata when the caller and the file itself supply nothing more
+        specific — a prefixed staging id previously leaked straight into
+        both (e.g. a document titled ``up-56c2614e1f9b_notes`` instead of
+        ``notes``).
         """
-        staging_dir = self._config.upload_dir
+        staging_dir = self._config.upload_dir / new_id("up")
         staging_dir.mkdir(parents=True, exist_ok=True)
-        staged = staging_dir / f"{new_id('up')}_{sanitize_filename(filename)}"
+        staged = staging_dir / sanitize_filename(filename)
         await asyncio.to_thread(staged.write_bytes, data)
-        logger.debug("Staged upload %s (%d bytes)", staged.name, len(data))
+        logger.debug("Staged upload %s (%d bytes)", staged, len(data))
         return staged
 
     @staticmethod
     async def _discard(path: Path) -> None:
-        """Remove a staged file. Never raises — cleanup must not mask errors."""
+        """Remove a staged file and its unique parent directory.
+
+        Never raises — cleanup must not mask errors.
+        """
         try:
             await asyncio.to_thread(path.unlink, True)
-        except Exception as exc:  # noqa: BLE001
+            await asyncio.to_thread(path.parent.rmdir)
+        except OSError as exc:
             logger.warning("Could not remove staged upload %s: %s", path, exc)
 
     # ── public API ───────────────────────────────────────────────────
@@ -258,9 +268,7 @@ class IngestService:
 
         # ── Text extraction ──────────────────────────────────────────
         try:
-            document = await loader.load(
-                path, title=title, metadata=merged_metadata
-            )
+            document = await loader.load(path, title=title, metadata=merged_metadata)
         except LoaderError as exc:
             logger.warning("Loader failed for %s: %s", display_name, exc)
             return IngestReport(

@@ -16,6 +16,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
 
@@ -34,6 +35,9 @@ from api.ws_manager import manager
 from core.events import AssistantState, AssistantStateChanged, TextInputReceived
 from core.pipeline import Pipeline, build_pipeline, shutdown_pipeline
 from core.project_logging import setup_logging
+
+if TYPE_CHECKING:
+    from input.gated_session import WakeWordGatedSession
 
 setup_logging()
 logger = logging.getLogger("kancha.api.server")
@@ -76,13 +80,21 @@ def _voice_input_enabled_from_env() -> bool:
     }
 
 
-def _start_gated_voice_session(pipeline: Pipeline) -> asyncio.Task | None:
+def _start_gated_voice_session(
+    pipeline: Pipeline,
+) -> tuple[WakeWordGatedSession, asyncio.Task] | None:
     """Start the wake-word gated voice session.
 
     The session begins in SLEEPING state. Saying "hey jarvis" wakes it up
     (continuous mic listening for 2 minutes of activity), then it locks
     again automatically. Requires GROQ_API_KEY (for STT transcription) —
     TFLite wake word detection itself needs no API key.
+
+    Returns the session alongside its task (rather than just the task) so
+    the caller can stash it on ``app.state`` — the ``/ws`` handler uses it
+    to service "toggle_listen" messages (the spacebar manual wake/sleep
+    fallback), which needs a live reference to the running session, not
+    just its asyncio.Task.
     """
     if not _voice_input_enabled_from_env():
         logger.info("Voice input disabled via KANCHA_VOICE_ENABLED=0")
@@ -115,7 +127,7 @@ def _start_gated_voice_session(pipeline: Pipeline) -> asyncio.Task | None:
         "(session=%s, idle_timeout=2min)",
         pipeline.session_id,
     )
-    return task
+    return session, task
 
 
 @asynccontextmanager
@@ -129,11 +141,15 @@ async def lifespan(app: FastAPI):
     )
     attach_bridge(pipeline)
 
-    mic_task = _start_gated_voice_session(pipeline)
+    voice = _start_gated_voice_session(pipeline)
+    voice_session, mic_task = voice if voice is not None else (None, None)
 
     app.state.pipeline = pipeline
     app.state.voice_available = mic_task is not None
     app.state.mic_task = mic_task
+    # Used by the /ws "toggle_listen" handler (spacebar manual wake/sleep) —
+    # None whenever voice input is disabled or unavailable.
+    app.state.voice_session = voice_session
 
     logger.info(
         "KANCHA API server ready (session=%s, tts=%s, voice=%s, rag=%s)",
@@ -233,6 +249,33 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 pipeline.bus.emit(
                     TextInputReceived(text="retry", session_id=session_id)
                 )
+                continue
+
+            if message.type == "toggle_listen":
+                # Manual wake/sleep fallback for when the wake word isn't
+                # heard (spacebar in the frontend, outside chat mode). The
+                # resulting AssistantStateChanged (emitted from inside
+                # WakeWordGatedSession.run()) reaches the UI the normal way,
+                # through the "state" broadcast in api/bridge.py — no ack
+                # needed here beyond a clean error when voice isn't running.
+                session = websocket.app.state.voice_session
+                if session is None:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "payload": {
+                                "message": (
+                                    "Voice input is not running, so there is "
+                                    "nothing to wake or sleep."
+                                ),
+                                "recoverable": True,
+                            },
+                            "session_id": session_id,
+                        }
+                    )
+                    continue
+                outcome = session.toggle_manual()
+                logger.info("Manual wake/sleep toggle (spacebar): %s", outcome)
                 continue
 
     except WebSocketDisconnect:

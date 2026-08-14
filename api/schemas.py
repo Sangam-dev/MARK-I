@@ -17,15 +17,21 @@ class WSIncoming(BaseModel):
     """Envelope for messages sent from the frontend to the backend over `/ws`.
 
     type:
-        "user_text"   -> payload: {"text": str}. Injected onto the bus as a
-                         TextInputReceived event (same as CLI --text mode).
-        "retry_last"  -> payload: {} (re-runs the last task; coordinator's
-                         retry-phrase regex already understands "retry it").
-        "ping"        -> payload: {}. Server replies with "pong" (used by the
-                         frontend for a crude WS round-trip latency reading).
+        "user_text"     -> payload: {"text": str}. Injected onto the bus as a
+                           TextInputReceived event (same as CLI --text mode).
+        "retry_last"    -> payload: {} (re-runs the last task; coordinator's
+                           retry-phrase regex already understands "retry it").
+        "ping"          -> payload: {}. Server replies with "pong" (used by
+                           the frontend for a crude WS round-trip latency
+                           reading).
+        "toggle_listen" -> payload: {}. Manual wake/sleep fallback for when
+                           the wake word isn't heard (spacebar in the
+                           frontend, outside chat mode). Wakes the assistant
+                           if it is SLEEPING, or sends it back to sleep if it
+                           is ACTIVE. See input/gated_session.py:toggle_manual.
     """
 
-    type: Literal["user_text", "retry_last", "ping"]
+    type: Literal["user_text", "retry_last", "ping", "toggle_listen"]
     payload: dict[str, Any] = Field(default_factory=dict)
     session_id: str = "default"
 

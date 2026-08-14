@@ -341,6 +341,20 @@ class ReasoningCoordinator:
 
         try:
             self.memory_manager.short_term.add("user", text)
+
+            # A task genuinely awaiting confirmation is resolved here,
+            # before either LLM sees this turn. The Conversation LLM's
+            # own judgement of "is this a confirmation or a fresh
+            # instruction" is not trustworthy enough to gate a Gmail
+            # send on: "Yeah, send it." reads to it like a new request to
+            # send an email, so it can attach a brand-new task instead of
+            # ``mode: "confirm"``. That mints a second task_id, which is
+            # exactly what used to produce a duplicate task_created and a
+            # "sending…" acknowledgement for a task nothing ever executed.
+            # See _maybe_settle_pending_confirmation.
+            if self._maybe_settle_pending_confirmation(text, session_id):
+                return
+
             payload = await self._run_conversation_turn(
                 session_id=session_id,
                 retrieval_query=text,
@@ -351,10 +365,99 @@ class ReasoningCoordinator:
 
         # Delegation happens after the acknowledgement is out of the door,
         # so a long-running task never delays the immediate response.
-        if not self._maybe_delegate(
-            payload, session_id=session_id, user_request=text
-        ):
+        if not self._maybe_delegate(payload, session_id=session_id, user_request=text):
             self._maybe_resume_open_task(text, session_id)
+
+    def _maybe_settle_pending_confirmation(self, text: str, session_id: str) -> bool:
+        """Resolve a reply to an open confirmation before anything else runs.
+
+        A task in ``waiting_for_confirmation`` is a yes/no question the
+        user is answering. That answer is classified from session state
+        alone, *before* the Conversation LLM is asked to judge it and
+        long before the Task LLM could ever be reached again for it:
+
+        - Assent  -> resume the SAME task_id with ``mode: "confirm"``.
+          No new task, no second Task LLM decomposition; the existing
+          Orchestrator/tool-execution path takes it from there.
+        - Refusal -> resume the same task_id with ``mode: "reject"``,
+          which the Orchestrator turns into a cancellation.
+        - Anything else -> genuinely ambiguous. State does not move and
+          neither LLM is consulted; the pending question is simply
+          repeated so the task keeps waiting instead of silently
+          spawning a duplicate.
+
+        Returns True if this turn was fully handled here — the caller
+        must not also run the normal conversational/delegation path for
+        it this turn.
+        """
+        record = self._last_task.get(session_id) or {}
+        if record.get("status") != "waiting_for_confirmation":
+            return False
+
+        task_id = str(record.get("task_id") or "")
+        if not task_id:
+            return False
+
+        if looks_like_assent(text):
+            mode = "confirm"
+        elif looks_like_refusal(text):
+            mode = "reject"
+        else:
+            logger.info(
+                "Ambiguous reply %r to the pending confirmation for task %s — "
+                "re-asking instead of guessing",
+                text,
+                task_id,
+            )
+            self._reask_pending_confirmation(record, session_id)
+            return True
+
+        logger.info(
+            "Confirmation reply %r for task %s resolved as %s — resuming the "
+            "existing task rather than delegating a new one",
+            text,
+            task_id,
+            mode,
+        )
+        # Transitional marker only: cleared the moment the real result
+        # (confirmed/running, then completed/failed/cancelled) arrives via
+        # on_task_result. Not a WAITING_STATUS, so a second confirmation
+        # arriving before that result lands falls through to the
+        # Orchestrator's own duplicate guard rather than being treated as
+        # still-waiting here.
+        record["status"] = "running"
+        self.bus.emit(
+            TaskRequested(
+                task_id=task_id,
+                task_type=str(record.get("task_type") or ""),
+                instruction=str(record.get("instruction") or ""),
+                user_request=text,
+                mode=mode,
+                resume_task_id=task_id,
+                session_id=session_id,
+            )
+        )
+        return True
+
+    def _reask_pending_confirmation(
+        self, record: dict[str, Any], session_id: str
+    ) -> None:
+        """Repeat the pending confirmation instead of guessing at a reply.
+
+        Neither LLM is called: the question the user is being asked
+        again is the exact one already recorded when the task first
+        asked for approval, so nothing here can invent a new task.
+        """
+        description = str(record.get("description") or "").strip()
+        if description:
+            text = (
+                f"Sorry, I didn't catch that — should I go ahead and "
+                f"{description}, or not?"
+            )
+        else:
+            text = "Sorry, should I go ahead with that, or not?"
+        self.memory_manager.short_term.add("assistant", text)
+        self._emit_ack(session_id, text)
 
     def _maybe_resume_open_task(self, text: str, session_id: str) -> None:
         """Route a bare yes/no to the open task the controller forgot.
@@ -484,9 +587,7 @@ class ReasoningCoordinator:
         """
         self._response_stream_finished.clear()
         try:
-            self.memory_manager.short_term.add(
-                "user", self._format_result_turn(event)
-            )
+            self.memory_manager.short_term.add("user", self._format_result_turn(event))
             payload = await self._run_conversation_turn(
                 session_id=event.session_id,
                 retrieval_query=request.instruction or event.instruction,
@@ -976,9 +1077,9 @@ class ReasoningCoordinator:
             # so it gets a heading the model cannot skim past.
             lines = [
                 "Task currently in progress — the user's next message is "
-                "most likely about THIS, so set \"mode\" accordingly:",
+                'most likely about THIS, so set "mode" accordingly:',
                 f"- instruction: {record.get('instruction', '')}",
-                f"- waiting for: "
+                "- waiting for: "
                 + (
                     "the user's approval"
                     if status == "waiting_for_confirmation"
@@ -997,7 +1098,7 @@ class ReasoningCoordinator:
 
         lines = [
             "Most recent action you delegated (for resolving follow-ups "
-            "like \"try again\" or \"cancel that\"):",
+            'like "try again" or "cancel that"):',
             f"- instruction: {record.get('instruction', '')}",
             f"- status: {status}",
         ]
@@ -1016,7 +1117,7 @@ class ReasoningCoordinator:
                 "already been given a short spoken summary of this. Never "
                 "read it back, never recite ids, timestamps or paths from "
                 "it. Use it only to resolve what the user refers to next "
-                "(\"the second one\", \"the GitHub one\") into concrete "
+                '("the second one", "the GitHub one") into concrete '
                 "parameters for your next task:"
             )
             lines.append(raw)

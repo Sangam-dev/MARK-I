@@ -1194,6 +1194,28 @@ export default function App() {
         return () => window.removeEventListener("keydown", fn);
     }, []);
 
+    // SPACE wakes/sleeps the assistant (fallback for when the wake word
+    // doesn't get heard) — except while chat mode is open, or while any
+    // other text field is focused, where it must behave like a normal
+    // space keystroke.
+    useEffect(() => {
+        const isTypingTarget = (target: EventTarget | null): boolean => {
+            const el = target as HTMLElement | null;
+            if (!el) return false;
+            const tag = el.tagName;
+            return tag === "INPUT" || tag === "TEXTAREA" || el.isContentEditable;
+        };
+        const fn = (e: KeyboardEvent) => {
+            if (e.code !== "Space" && e.key !== " ") return;
+            if (chatOpen || isTypingTarget(e.target)) return;
+            if (e.repeat) return; // ignore key-repeat while held down
+            e.preventDefault(); // stop the page from scrolling
+            wsClient.send("toggle_listen", {});
+        };
+        window.addEventListener("keydown", fn);
+        return () => window.removeEventListener("keydown", fn);
+    }, [chatOpen]);
+
     // ── Backend WebSocket connection ────────────────────────────────────────
     // Drives `astate` from real pipeline events (see core/events.py:
     // AssistantStateChanged) instead of only the manual debug buttons below.

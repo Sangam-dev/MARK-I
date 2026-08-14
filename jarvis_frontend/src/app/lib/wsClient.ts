@@ -4,7 +4,7 @@
  * Wire format (see answers/integration_plan.md section 3.4 and
  * answers/guide.md):
  *
- *   Client -> Server: { type: "user_text" | "retry_last" | "ping", payload, session_id }
+ *   Client -> Server: { type: "user_text" | "retry_last" | "ping" | "toggle_listen", payload, session_id }
  *   Server -> Client: { type: "state" | "transcript" | "response" | "response_partial" | "task_update" | "error" | "pong", payload, session_id }
  *
  * This module is intentionally the ONLY place in the frontend that touches
@@ -135,7 +135,7 @@ class WsClient {
     });
   }
 
-  send(type: "user_text" | "retry_last" | "ping", payload: Record<string, unknown> = {}, sessionId = "default"): boolean {
+  send(type: "user_text" | "retry_last" | "ping" | "toggle_listen", payload: Record<string, unknown> = {}, sessionId = "default"): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       console.warn(`[wsClient] not connected, dropped "${type}"`);
       return false;

@@ -76,6 +76,13 @@ MODE_REJECT = "reject"
 MODE_CANCEL = "cancel"
 MODE_MODIFY = "modify"
 
+# Internal only — never proposed by an LLM, only resolved here. A
+# confirm/reject that no longer has anything to apply to (the task it
+# names has already moved past WAITING_FOR_CONFIRMATION) but is clearly
+# a repeat of one that did. Falling through to MODE_NEW here is exactly
+# what let a second "yes" start a second, duplicate task.
+MODE_DUPLICATE = "duplicate"
+
 _RESUME_MODES = frozenset({MODE_ANSWER, MODE_CONFIRM, MODE_REJECT, MODE_MODIFY})
 
 # Deterministic safety net for the two cases where getting it wrong is
@@ -84,24 +91,43 @@ _RESUME_MODES = frozenset({MODE_ANSWER, MODE_CONFIRM, MODE_REJECT, MODE_MODIFY})
 # confirmation, and only for messages that are *nothing but* assent or
 # refusal — "yes, but send it to Bob instead" is not matched here and is
 # left to the Conversation LLM, which can see what "but" changed.
+#
+# Each side is a bare interjection ( "yes" ), a bare action phrase
+# ("send it"), or the two combined with ordinary punctuation between
+# them ("yeah, send it.", "no, don't send it") — which is how people
+# actually answer a yes/no question, not just the single-word case.
+_YES_WORD = (
+    r"(?:yes|yeah|yep|yup|ok|okay|sure|alright|certainly|definitely|"
+    r"affirmative|confirmed?)"
+)
+_YES_ACTION = (
+    r"(?:go\s*ahead(?:\s+and\s+(?:do|send)\s+it)?|do\s+it|do\s+that|"
+    r"send\s+it|proceed|please\s+do(?:\s+it)?|go\s+for\s+it|go\s+on)"
+)
 _BARE_YES_RE = re.compile(
-    r"^(?:yes|yeah|yep|yup|ok|okay|sure|please\s+do|go\s+ahead|do\s+it|"
-    r"confirm(?:ed)?|affirmative|send\s+it|proceed)[.!]?$",
+    rf"^(?:{_YES_WORD}(?:[,!.\s]+{_YES_ACTION})?|{_YES_ACTION})"
+    rf"(?:[,\s]+(?:now|please))?[.!]?$",
     re.IGNORECASE,
 )
+_NO_WORD = r"(?:no|nope|nah|negative)"
+_NO_ACTION = (
+    r"(?:don'?t(?:\s+send\s+it)?|do\s+not(?:\s+send\s+it)?|stop|"
+    r"cancel(?:\s+(?:it|that))?|never\s*mind|forget\s+it|abort|hold\s+off)"
+)
 _BARE_NO_RE = re.compile(
-    r"^(?:no|nope|nah|don'?t|do\s+not|stop|cancel(?:\s+(?:it|that))?|"
-    r"never\s*mind|forget\s+it|abort)[.!]?$",
+    rf"^(?:{_NO_WORD}(?:[,!.\s]+{_NO_ACTION})?|{_NO_ACTION})[.!]?$",
     re.IGNORECASE,
 )
 
 
 def looks_like_assent(text: str) -> bool:
-    """True if *text* is nothing but agreement.
+    """True if *text* is nothing but agreement — "yes", "go ahead", "do it",
+    or a natural combination like "yeah, send it."
 
     Public because the Conversation LLM side needs the same answer: a
-    bare "yes" must reach the open task even if the controller replied
-    conversationally and attached no task object.
+    plain confirmation must reach the open task even if the controller
+    replied conversationally (or attached a stray task of its own)
+    instead of proposing ``mode: "confirm"``.
     """
     return bool(_BARE_YES_RE.match((text or "").strip()))
 
@@ -146,6 +172,10 @@ class TaskOrchestrator:
         mode = self._resolve_mode(event, session_id)
         active = self.store.active(session_id)
 
+        if mode == MODE_DUPLICATE:
+            self._report_duplicate(event)
+            return
+
         if mode == MODE_CANCEL or mode == MODE_REJECT:
             self._cancel(active, session_id, mode)
             return
@@ -174,18 +204,28 @@ class TaskOrchestrator:
             return MODE_CANCEL
 
         if proposed in (MODE_CONFIRM, MODE_REJECT):
-            if awaiting is None or awaiting.status is not TaskPhase.WAITING_FOR_CONFIRMATION:
+            if (
+                awaiting is None
+                or awaiting.status is not TaskPhase.WAITING_FOR_CONFIRMATION
+            ):
                 logger.info(
-                    "Ignoring proposed mode %r — no task is awaiting confirmation "
-                    "in session %s",
+                    "Ignoring duplicate %r for task %s — already %s",
                     proposed,
-                    session_id,
+                    duplicate.task_id,
+                    duplicate.status.value,
                 )
-                # A stray "no" must not become a task either. A stray
-                # "yes" may legitimately carry a fresh instruction, so it
-                # falls through to being treated as new.
-                return MODE_CANCEL if proposed == MODE_REJECT else MODE_NEW
-            return proposed
+                return MODE_DUPLICATE
+
+            logger.info(
+                "Ignoring proposed mode %r — no task is awaiting confirmation "
+                "in session %s",
+                proposed,
+                session_id,
+            )
+            # A stray "no" must not become a task either. A stray
+            # "yes" may legitimately carry a fresh instruction, so it
+            # falls through to being treated as new.
+            return MODE_CANCEL if proposed == MODE_REJECT else MODE_NEW
 
         if proposed == MODE_ANSWER:
             if awaiting is None or awaiting.status is not TaskPhase.WAITING_FOR_INPUT:
@@ -202,7 +242,10 @@ class TaskOrchestrator:
 
         # Proposed "new". If something is waiting on a yes/no and the
         # user said exactly that, believe the user over the classifier.
-        if awaiting is not None and awaiting.status is TaskPhase.WAITING_FOR_CONFIRMATION:
+        if (
+            awaiting is not None
+            and awaiting.status is TaskPhase.WAITING_FOR_CONFIRMATION
+        ):
             text = (event.user_request or "").strip()
             if _BARE_YES_RE.match(text):
                 logger.info(
@@ -291,15 +334,39 @@ class TaskOrchestrator:
         )
         self._emit_result(state, status="cancelled", error=reason)
 
+    def _report_duplicate(self, event: TaskRequested) -> None:
+        """A confirm/reject arrived again for a task already settled.
+
+        The first one already dispatched, cancelled, or completed it.
+        Re-running any of that here — in particular re-dispatching —
+        would risk a second Gmail send for one user approval. The only
+        correct response is to report the task's current, unchanged
+        state; nothing is transitioned and nothing is re-emitted to the
+        Task LLM.
+        """
+        target_id = (event.resume_task_id or event.task_id or "").strip()
+        state = self.store.get(target_id)
+        if state is None:
+            return
+        logger.info(
+            "task_confirmation_duplicate | task_id=%s status=%s",
+            state.task_id,
+            state.status.value,
+        )
+        self._emit_result(
+            state,
+            status=state.status.value,
+            results=list(state.result),
+            error=state.error,
+        )
+
     # ── Orchestrator ─► Task LLM ──────────────────────────────────────
 
     def _dispatch(self, state: TaskState) -> None:
         """Hand the task to the Task LLM with everything known so far."""
         state.attempts += 1
         if state.attempts > MAX_ATTEMPTS:
-            error = (
-                f"gave up after {MAX_ATTEMPTS} attempts without completing the task"
-            )
+            error = f"gave up after {MAX_ATTEMPTS} attempts without completing the task"
             logger.warning("task_failed | task_id=%s %s", state.task_id, error)
             self.store.transition(
                 state, TaskPhase.FAILED, event="task_failed", error=error

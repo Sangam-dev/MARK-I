@@ -43,6 +43,12 @@ class WakeWordGatedSession:
         self._running = False
         self._last_activity = 0.0
         self._stop_wakeword: threading.Event | None = None
+        # Set by toggle_manual() (spacebar in the frontend) to distinguish a
+        # deliberate manual trigger from listen_for_wake_word() returning
+        # False because of a real shutdown, and to break out of the ACTIVE
+        # idle-timer loop early.
+        self._manual_wake_requested = False
+        self._manual_sleep_requested = False
 
     # ── Activity tracking ──────────────────────────────────────────────────
 
@@ -83,6 +89,34 @@ class WakeWordGatedSession:
         self._bus.unsubscribe(TextInputReceived, self._on_text_input)
         self._bus.unsubscribe(ResponseReady, self._on_response_ready)
         self._bus.unsubscribe(ShutdownRequested, self._on_shutdown)
+
+    # ── Manual override (spacebar) ──────────────────────────────────────────
+    #
+    # openwakeword occasionally mishears or just doesn't catch "hey jarvis"
+    # in a noisy room. This gives the frontend a deterministic fallback: one
+    # key toggles between SLEEPING and ACTIVE, independent of the mic.
+
+    def toggle_manual(self) -> str:
+        """Manually wake or sleep, mirroring whatever the mic would have done.
+
+        Returns ``"waking"`` if we were SLEEPING and are now being woken,
+        ``"sleeping"`` if we were ACTIVE and are now being sent back to
+        sleep, or ``"ignored"`` if the session is mid-transition and there
+        is nothing sensible to do.
+        """
+        if self._stop_wakeword is not None:
+            # Blocked inside listen_for_wake_word() — interrupt it exactly
+            # like a real detection, but flag it as manual so run() doesn't
+            # mistake this for an external shutdown.
+            self._manual_wake_requested = True
+            self._stop_wakeword.set()
+            return "waking"
+        if self._running:
+            # ACTIVE (idle/listening/thinking/speaking) — end the idle-timer
+            # loop early and fall back to SLEEPING, same as an idle timeout.
+            self._manual_sleep_requested = True
+            return "sleeping"
+        return "ignored"
 
     # ── Mic lifecycle helpers ───────────────────────────────────────────────
 
@@ -134,20 +168,28 @@ class WakeWordGatedSession:
                 detected = await self._detector.listen_for_wake_word(stop_wakeword)
 
                 self._stop_wakeword = None
+                manual_wake = self._manual_wake_requested
+                self._manual_wake_requested = False
 
                 if not self._running:
                     break
 
                 if not detected:
-                    # stop_event was set externally (shutdown)
-                    break
+                    if not manual_wake:
+                        # stop_event was set externally (shutdown)
+                        break
+                    # Spacebar (toggle_manual()) interrupted the detector —
+                    # treat it exactly like a real wake word.
 
                 # ── Transition to ACTIVE ──────────────────────────────────
-                logger.info("Wake word detected — entering ACTIVE state")
+                logger.info(
+                    "%s — entering ACTIVE state",
+                    "Manual wake requested" if manual_wake else "Wake word detected",
+                )
                 self._bus.emit(
                     WakeWordDetected(
                         session_id=self._session_id,
-                        confidence=1.0,
+                        confidence=1.0 if not manual_wake else 0.0,
                     )
                 )
                 self._bus.emit(
@@ -160,10 +202,14 @@ class WakeWordGatedSession:
 
                 mic, mic_task = await self._start_mic()
 
-                # ── ACTIVE phase: idle-timer loop ────────────────────────
+                # ── ACTIVE phase: idle-timer loop ──────────────────
                 try:
                     while self._running:
                         await asyncio.sleep(1.0)
+                        if self._manual_sleep_requested:
+                            self._manual_sleep_requested = False
+                            logger.info("Manual sleep requested — returning to sleep")
+                            break
                         idle = self._idle_for()
                         if idle >= self._idle_timeout:
                             logger.info(
