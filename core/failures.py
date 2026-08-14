@@ -13,4 +13,5 @@ TERMINAL_ERROR_TYPES = frozenset({NOT_FOUND, INVALID_ARGUMENT, UNSUPPORTED, PERM
 # Hard cap on replacement plans generated for one delegation. Belt-and-braces
 # behind the identical-plan guard: even a sequence of *different* still-failing
 # plans must terminate instead of looping forever.
-MAX_REPLANS_PER_DELEGATION = 3
+MAX_REPLANS_PER_DELEGATION = 5
+
