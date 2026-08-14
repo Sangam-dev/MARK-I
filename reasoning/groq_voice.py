@@ -8,9 +8,9 @@ from typing import Any
 
 logger = logging.getLogger("kancha.reasoning.groq_voice")
 
-DEFAULT_MODEL = os.getenv("KANCHA_GROQ_VOICE_MODEL", "llama-3.1-8b-instant")
+DEFAULT_MODEL = os.getenv("KANCHA_GROQ_VOICE_MODEL", "openai/gpt-oss-20b")
 
-# Measured round trip on llama-3.1-8b-instant is 0.2–0.45s, so this is
+# Measured round trip on llama-3.1-8b-instant was 0.2–0.45s, so this is
 # not a latency budget — it is a stall guard. It sits well above the
 # normal case because the cost of tripping it is the thing the user
 # complained about in the first place: the raw listing, ids and all,
@@ -50,8 +50,10 @@ SYSTEM_PROMPT = (
     "user explicitly asked to hear something in full, such as the contents of "
     "an email or a document.\n"
     "2. Never speak machine identifiers: message ids, pids, uids, hashes, "
-    "byte counts, absolute file paths, raw timestamps or timezone offsets. "
-    "They are handled elsewhere. Say 'the one from Rajad', not an id.\n"
+    "hex addresses (0x...), byte counts, absolute file paths, raw timestamps "
+    "or timezone offsets. They are handled elsewhere. Replace them with "
+    "'the process', 'it', or 'the one you asked about' — never read them "
+    "out loud.\n"
     "3. Never enumerate a long list. Give the count, then the one or two that "
     "matter. 'Fourteen unread — the newest is from GitHub about your token.'\n"
     "4. Round and humanise numbers: 'about 40 percent', 'just under 8 gigs', "
@@ -184,6 +186,11 @@ class GroqVoice:
                     ),
                 },
             ],
+            # gpt-oss models reason by default; "low" keeps the reasoning
+            # tokens small so MAX_TOKENS is spent on the spoken answer, not
+            # the thinking (medium/high can return empty content and trip
+            # the raw-output fallback). "none" is qwen3-only.
+            reasoning_effort="low",
             max_tokens=MAX_TOKENS,
             temperature=0.3,
         )

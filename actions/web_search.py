@@ -100,7 +100,7 @@ def _synthesize_with_groq(query: str, results: list[dict[str, str]] | str) -> st
     context = "\n".join(lines)
     try:
         resp = _groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model=os.getenv("KANCHA_WEB_SEARCH_MODEL", "openai/gpt-oss-20b"),
             messages=[
                 {"role": "system", "content": _GROQ_SYSTEM},
                 {
@@ -110,7 +110,12 @@ def _synthesize_with_groq(query: str, results: list[dict[str, str]] | str) -> st
                     ),
                 },
             ],
-            max_tokens=120,
+            # gpt-oss models reason by default; "low" keeps the reasoning
+            # tokens small so max_tokens is spent on the answer, not the
+            # thinking (medium/high can return empty content on a 120-token
+            # budget). "none" is only supported by qwen3 models.
+            reasoning_effort="low",
+            max_tokens=200,
             temperature=0.0,
         )
         answer = resp.choices[0].message.content.strip()
