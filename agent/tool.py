@@ -683,7 +683,7 @@ class OpenCodeTool:
             success=True,
             action=action,
             output=(
-                f"The coding agent has started working on '{session.label}'{where}. "
+                f"The agent has started working on '{session.label}'{where}. "
                 "It is running in the background — it is NOT finished. Tell the "
                 "user it is under way and that they can ask how it is going at "
                 "any time; I will report back when it completes."
@@ -763,7 +763,7 @@ class OpenCodeTool:
             return AgentToolResult(
                 success=True,
                 action="status",
-                output="Nothing has been delegated to the coding agent yet.",
+                output="Nothing has been delegated to the agent yet.",
                 data={"sessions": [], "active": ""},
             )
 
@@ -804,7 +804,7 @@ class OpenCodeTool:
             return AgentToolResult(
                 success=True,
                 action="progress",
-                output="Nothing has been delegated to the coding agent yet.",
+                output="Nothing has been delegated to the agent yet.",
                 data={"sessions": []},
             )
 
@@ -1098,13 +1098,13 @@ class OpenCodeTool:
     ) -> AgentToolResult:
         """Turn a client error into something the LLM can act on."""
         hints = {
-            "disabled": "The coding agent is turned off (KANCHA_OPENCODE_ENABLED=0).",
+            "disabled": "The agent is turned off (KANCHA_OPENCODE_ENABLED=0).",
             "not_installed": "OpenCode is not installed on this machine.",
             "unavailable": "The OpenCode server could not be reached.",
-            "timeout": "The coding agent ran out of time.",
-            "agent_error": "The coding agent could not complete the task.",
+            "timeout": "The agent ran out of time.",
+            "agent_error": "The agent could not complete the task.",
             "not_found": "That delegated session no longer exists on the server.",
-            "network_error": "The connection to the coding agent failed.",
+            "network_error": "The connection to the agent failed."
         }
         prefix = hints.get(result.error_kind or "", "")
         message = f"{prefix} {result.error}".strip() if prefix else (result.error or "")

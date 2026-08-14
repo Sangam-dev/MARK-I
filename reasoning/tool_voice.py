@@ -329,7 +329,7 @@ def _voice_web_search(message: str, _args: dict[str, Any]) -> str:
 
 
 def _voice_agent_task(message: str, args: dict[str, Any]) -> str:
-    """Voice for the delegated coding agent.
+    """Voice for the delegated agent.
 
     Two things must survive intact: that a delegation has *started* and
     is not finished, and the progress report itself, which is already
@@ -346,10 +346,10 @@ def _voice_agent_task(message: str, args: dict[str, Any]) -> str:
         # The tool's output is written for the LLM ("it is NOT finished")
         # rather than for the user; say the short human version instead.
         label = (args.get("label") or "").strip()
-        if text.lower().startswith("the coding agent has started"):
+        if text.lower().startswith("the agent has started"):
             what = f"'{label}'" if label else "it"
             return (
-                f"The coding agent is on it, sir — I'll let you know when "
+                f"The agent is on it, sir — I'll let you know when "
                 f"{what} is done. Ask me for the progress any time."
             )
         return text

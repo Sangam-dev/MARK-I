@@ -355,10 +355,10 @@ async def build_pipeline(
         elif progress.running:
             text = f"Still working on '{label}', sir — {progress.brief()}"
         elif progress.state == "failed":
-            text = f"Sir, the coding agent could not finish '{label}'. {progress.brief()}"
+            text = f"Sir, the agent could not finish '{label}'. {progress.brief()}"
         else:
             text = (
-                f"Sir, the coding agent has finished '{label}' — "
+                f"Sir, the agent has finished '{label}' — "
                 f"{progress.brief()} Ask me for the details if you want them."
             )
         bus.emit(ResponseReady(text=text))

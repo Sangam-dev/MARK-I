@@ -84,30 +84,50 @@ _RESUME_MODES = frozenset({MODE_ANSWER, MODE_CONFIRM, MODE_REJECT, MODE_MODIFY})
 # confirmation, and only for messages that are *nothing but* assent or
 # refusal — "yes, but send it to Bob instead" is not matched here and is
 # left to the Conversation LLM, which can see what "but" changed.
+#
+# Each side is a bare interjection ("yes"), a bare action phrase
+# ("send it"), or the two combined with ordinary punctuation between
+# them ("yeah, send it.", "no, don't send it") — which is how people
+# actually answer a yes/no question, not just the single-word case.
+_YES_WORD = (
+    r"(?:yes|yeah|yep|yup|ok|okay|sure|alright|certainly|definitely|"
+    r"affirmative|confirmed?)"
+)
+_YES_ACTION = (
+    r"(?:go\s*ahead(?:\s+and\s+(?:do|send)\s+it)?|do\s+it|do\s+that|"
+    r"send\s+it|proceed|please\s+do(?:\s+it)?|go\s+for\s+it|go\s+on)"
+)
 _BARE_YES_RE = re.compile(
-    r"^(?:yes|yeah|yep|yup|ok|okay|sure|please\s+do|go\s+ahead|do\s+it|"
-    r"confirm(?:ed)?|affirmative|send\s+it|proceed)[.!]?$",
+    rf"^(?:{_YES_WORD}(?:[,!.\s]+{_YES_ACTION})?|{_YES_ACTION})"
+    rf"(?:[,\s]+(?:now|please))?[.!]?$",
     re.IGNORECASE,
 )
+_NO_WORD = r"(?:no|nope|nah|negative)"
+_NO_ACTION = (
+    r"(?:don'?t(?:\s+send\s+it)?|do\s+not(?:\s+send\s+it)?|stop|"
+    r"cancel(?:\s+(?:it|that))?|never\s*mind|forget\s+it|abort|hold\s+off)"
+)
 _BARE_NO_RE = re.compile(
-    r"^(?:no|nope|nah|don'?t|do\s+not|stop|cancel(?:\s+(?:it|that))?|"
-    r"never\s*mind|forget\s+it|abort)[.!]?$",
+    rf"^(?:{_NO_WORD}(?:[,!.\s]+{_NO_ACTION})?|{_NO_ACTION})[.!]?$",
     re.IGNORECASE,
 )
 
 
 def looks_like_assent(text: str) -> bool:
-    """True if *text* is nothing but agreement.
+    """True if *text* is nothing but agreement — "yes", "go ahead", "do it",
+    or a natural combination like "yeah, send it."
 
     Public because the Conversation LLM side needs the same answer: a
-    bare "yes" must reach the open task even if the controller replied
-    conversationally and attached no task object.
+    plain confirmation must reach the open task even if the controller
+    replied conversationally (or attached a stray task of its own)
+    instead of proposing ``mode: "confirm"``.
     """
     return bool(_BARE_YES_RE.match((text or "").strip()))
 
 
 def looks_like_refusal(text: str) -> bool:
-    """True if *text* is nothing but refusal or cancellation."""
+    """True if *text* is nothing but refusal or cancellation — "no", "stop",
+    or a natural combination like "no, don't send it"."""
     return bool(_BARE_NO_RE.match((text or "").strip()))
 
 

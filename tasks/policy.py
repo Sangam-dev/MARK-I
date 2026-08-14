@@ -219,9 +219,9 @@ _FIELD_QUESTIONS: dict[str, str] = {
     "app_name": "Which application?",
     "action": "What should I do exactly?",
     "request": "What would you like me to play?",
-    "task": "What would you like the coding agent to build?",
+    "task": "What would you like the agent to build?",
     "instruction": "What should the agent change or add?",
-    "answer": "What should I tell the coding agent?",
+    "answer": "What should I tell the agent?"
 }
 
 

@@ -411,12 +411,17 @@ class SystemTool:
     ) -> SystemToolResult | None:
         """Two-phase gate. Returns a refusal, or None to let the action run.
 
-        The first request for a destructive action **never** executes,
-        no matter what ``confirm`` says — it arms the confirmation and
-        asks. Only a later request, carrying ``confirm=true`` and coming
-        from a different plan (so: after the user spoke again), is let
-        through. That makes "reboot the machine" impossible to satisfy
-        in one turn even if the model sets the flag itself.
+        The first request for a destructive action **never** executes on
+        a bare ``confirm`` — it arms the confirmation and asks, and only
+        a later request carrying ``confirm=true`` from a different plan
+        (so: after the user spoke again) is let through. That makes
+        "reboot the machine" impossible to satisfy in one turn even if
+        the model sets the flag itself.
+
+        The one exception is the Orchestrator's own stamp: the planner
+        adds ``_user_confirmed`` only after a real user message approved
+        this exact work, so a request carrying it IS the user's approval
+        and runs immediately.
         """
         now = time.monotonic()
         # Drop expired arms so a stale approval can never be redeemed.
@@ -428,6 +433,15 @@ class SystemTool:
         plan_id = str(params.get("_plan_id") or "")
         confirmed = bool(params.get("confirm", False))
         armed = self._armed.get(fingerprint)
+
+        # The Orchestrator's approval. The planner stamps ``_user_confirmed``
+        # only after a real user message approved this exact work, so a
+        # request carrying it IS the confirmation — it runs immediately
+        # instead of being refused once and only succeeding through a
+        # fail-and-replan cycle.
+        if params.get("_user_confirmed"):
+            logger.info("SystemTool: '%s' confirmed by the user — executing", action)
+            return None
 
         if confirmed and armed is not None:
             _, armed_plan_id = armed

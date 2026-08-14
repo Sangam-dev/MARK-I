@@ -171,13 +171,24 @@ def _sanitise_confirm(
 
     The planning LLM is perfectly capable of writing ``"confirm": true``
     into the arguments it invents, and a tool that trusted it would
-    execute a destructive action nobody approved. So the flag is always
+    execute a destructive action nobody approved. So the flags are always
     stripped first, then re-added only when the Orchestrator says a real
     user approved this task, and only for a step that actually needs it.
+
+    ``_user_confirmed`` is the same approval expressed for the tool's own
+    gate. Only this function may stamp it, so a tool can trust it on the
+    first call — without it, an approved action would be refused once by
+    the tool's two-phase gate and then fail-and-replan before ever
+    running, which is the long, confusing loop after every confirmation.
     """
-    clean = _strip_confirm_flag(arguments)
+    clean = {
+        key: value
+        for key, value in (arguments or {}).items()
+        if key not in ("confirm", "_user_confirmed")
+    }
     if user_confirmed and describe_sensitive_action(tool, clean) is not None:
         clean["confirm"] = True
+        clean["_user_confirmed"] = True
     return clean
 
 
@@ -776,6 +787,18 @@ class Planner:
             return
 
         self._apply_references(new_plan)
+
+        # Approval is re-applied exactly as on the original dispatch. The
+        # replanner may echo the tool's "repeat with confirm=true" refusal
+        # text back into its plan — that invented flag must never reach a
+        # tool. Strip both flags and re-add them only when the Orchestrator
+        # recorded a real user confirmation for this delegation.
+        user_confirmed = request.user_confirmed if request is not None else False
+        for task in new_plan.tasks:
+            task.arguments = _sanitise_confirm(
+                task.tool, task.arguments, user_confirmed
+            )
+
         if request is not None:
             # The retry now owns the delegation. The original plan's
             # completion — already in hand or still to arrive — is

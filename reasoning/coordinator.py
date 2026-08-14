@@ -545,11 +545,38 @@ class ReasoningCoordinator:
                 "that task is already open and awaiting the user",
                 event.task_id,
             )
-        # A withheld acknowledgement would otherwise never be spoken:
-        # this turn's message IS the question, so deliver it.
-        ack = str(payload.get("_ack") or "").strip()
-        if ack:
-            self._emit_ack(session_id, ack)
+            # The controller broke the question-turn contract: it
+            # re-delegated instead of asking. Its message is an
+            # acknowledgement, not a question — speaking it would tell
+            # the user the work is starting while the task is actually
+            # parked awaiting approval. Re-ask deterministically.
+            self._reask_on_behalf_of_task(session_id)
+            return
+
+        # A well-behaved question turn carries no task, so
+        # _run_conversation_turn already delivered its message (the
+        # question) to the user. Nothing more to say here.
+
+    def _reask_on_behalf_of_task(self, session_id: str) -> None:
+        """Repeat the pending question, deterministically — no LLM call.
+
+        The controller is not allowed to re-delegate on a question turn,
+        but it sometimes does anyway. When it does, its message is an
+        acknowledgement rather than the question, so this asks the exact
+        question the execution layer already recorded instead of speaking
+        a false "starting now" while the task waits.
+        """
+        record = self._last_task.get(session_id) or {}
+        question = str(record.get("question") or "").strip()
+        description = str(record.get("description") or "").strip()
+        if question:
+            text = f"Sorry — {question}"
+        elif description:
+            text = f"Sorry, should I go ahead and {description}, or not?"
+        else:
+            text = "Sorry, should I go ahead with that, or not?"
+        self.memory_manager.short_term.add("assistant", text)
+        self._emit_ack(session_id, text)
 
     def _format_result_turn(self, event: TaskResultReady) -> str:
         """Render a Task Result as an internal history turn.
@@ -749,7 +776,7 @@ class ReasoningCoordinator:
             len(retrieved),
         )
 
-        response_text, payload, streamed = await self._stream_once(
+        response_text, payload, _ = await self._stream_once(
             history=history,
             system=system,
             session_id=session_id,
@@ -764,7 +791,7 @@ class ReasoningCoordinator:
         # "ignore" their question.
         if not response_text:
             logger.info("Empty LLM stream (session=%s); retrying once", session_id)
-            response_text, payload, streamed = await self._stream_once(
+            response_text, payload, _ = await self._stream_once(
                 history=history,
                 system=system,
                 session_id=session_id,
@@ -791,10 +818,14 @@ class ReasoningCoordinator:
         await self._persist_response_memory(payload, session_id=session_id)
 
         # 7. Deliver — unless this turn is an acknowledgement of work that
-        # is about to start and nothing has been shown yet. In that case
-        # the text is handed to _schedule_ack, which speaks it only if the
-        # task outlives the grace period.
-        if payload.get("task") and not streamed:
+        # is about to start. In that case the text is handed to
+        # _schedule_ack, which speaks it only if the task outlives the
+        # grace period. This must hold even when the model streams the
+        # message before the "task" key (violating the format rules): an
+        # acknowledgement is never spoken directly, or a misbehaving model
+        # could claim the work is starting while the task is actually
+        # parked awaiting confirmation.
+        if payload.get("task"):
             payload["_ack"] = response_text
             return payload
 

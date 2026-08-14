@@ -16,20 +16,22 @@ without any notion of confirmation, plans, or turns.
 The confirmation gate
 ---------------------
 Reads run immediately. Everything that changes mailbox state — sending,
-trashing, archiving, flag edits — is *two-phase*, and deliberately
-cannot be satisfied within a single turn:
+trashing, archiving, flag edits — is gated on the user's approval:
 
-1. The first request for a mutating action **never executes**, whatever
-   ``confirm`` is set to. It arms an approval and returns a refusal that
-   tells the model to ask the user.
-2. Only a later request carrying ``confirm=true``, with the same
-   arguments, from a **different plan**, runs.
+1. A mutating action **never runs unapproved**. A request without
+   approval arms the two-phase gate and returns a refusal that tells the
+   model to ask the user; only a later request carrying ``confirm=true``
+   with the same arguments, from a **different plan**, runs.
+2. The Orchestrator's approval is *stamped*, not asserted: the planner
+   adds ``_user_confirmed`` to the arguments only after a real user
+   message approved this work (model-invented flags are stripped
+   upstream), so a request carrying it IS the confirmation and runs
+   immediately.
 
-Step 1 ignoring ``confirm`` is the load-bearing part. If the flag alone
-were enough, a model that decided on its own to set ``confirm: true``
-would have sent the email — the user would be told about it afterwards,
-which is not consent. Requiring a different ``_plan_id`` proves a
-separate turn happened, and a turn only happens when the user speaks.
+A bare ``confirm=true`` invented by a model is still refused — approval
+is something the Orchestrator grants after asking, never something the
+caller can assert. Such a request arms the two-phase path, so a genuine
+later confirmation can still go through.
 
 Approvals are fingerprinted over the arguments, so agreeing to
 "trash the newsletter" does not also approve trashing anything else,
@@ -279,6 +281,15 @@ class GmailTool:
         plan_id = str(params.get("_plan_id") or "")
         confirmed = bool(params.get("confirm", False))
         armed = self._armed.get(fingerprint)
+
+        # The Orchestrator's approval. The planner stamps ``_user_confirmed``
+        # only after a real user message approved this exact work, so a
+        # request carrying it IS the confirmation — it runs immediately
+        # instead of being refused once and only succeeding through a
+        # fail-and-replan cycle.
+        if params.get("_user_confirmed"):
+            logger.info("GmailTool: '%s' confirmed by the user — executing", action)
+            return None
 
         if confirmed and armed is not None:
             _, armed_plan_id = armed

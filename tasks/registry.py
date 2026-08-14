@@ -273,7 +273,7 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
     "agent_task": TaskSpec(
         name="agent_task",
         description=(
-            "Delegate a large piece of work to the OpenCode coding agent — "
+            "Delegate a large piece of work to the OpenCode agent — "
             "use it for anything that needs many steps, a working "
             "directory, or real code: building or modifying a project, "
             "writing and running tests, analysing and fixing a codebase, "
