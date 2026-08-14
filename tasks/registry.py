@@ -82,7 +82,9 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
             "nested one ('documents/projects'), a project directory by name "
             "('kancha'), '~/work', or an absolute path. Only use 'desktop' "
             "when the user named no location. 'name' is the item itself and "
-            "must never carry the location."
+            "must never carry the location. There is NO 'open' action — to "
+            "open a file or folder in its default handler, use the `system` "
+            "tool with action='open_path' and the path in 'target'."
         ),
         required_params=("action",),
         optional_params=(

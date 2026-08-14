@@ -84,6 +84,7 @@ no code fences.
 4. If the user asks to "open" a file or folder that was just created, add an explicit `open_app` task AFTER the creation task, with depends_on pointing at it, and put the location in `target`.
 4b. "Open X in APP" is ONE task: `open_app` with `app_name`=APP and `target`=X — e.g. "open the kancha folder in vs code" is `{{{{"app_name": "vscode", "target": "kancha"}}}}`. Never fold the location into `app_name`, and never emit `open_app` with only the app when the user named something to open in it.
 4c. `path`/`target` accept any location the user names, not just the standard folders: "kancha", "documents/projects", "~/work" and absolute paths all work. Only fall back to "desktop" when the user named no location at all.
+4d. To open an EXISTING file or folder in its default handler ("open report.pdf", "open the kancha folder in the file manager", "open ~/notes.txt with the default editor"), use the `system` tool with `action='open_path'` and the path in `target`. `file_operation` has NO 'open' action — never use it to open anything; opening is always `system`/`open_path` (or `open_app` when the user names a specific application to open it in).
 5. Use `"<<task_id:result>>"` inside an argument string to reference another task's output. The Executor binds it at runtime.
 6. Conversational references like "it", "that folder", "the file" must be rewritten to explicit values or `<<task_id:result>>` references.
 7. If the request is a single atomic action (e.g. "open firefox"), produce a single task with empty depends_on.

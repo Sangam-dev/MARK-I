@@ -13,7 +13,7 @@ Environment variables (all optional, all prefixed ``KANCHA_OPENCODE_``)::
     KANCHA_OPENCODE_PORT             int    (default 0 — let the OS pick)
     KANCHA_OPENCODE_BINARY           path   (default opencode)
     KANCHA_OPENCODE_PROVIDER         str    (default opencode)
-    KANCHA_OPENCODE_MODEL            str    (default big-pickle)
+    KANCHA_OPENCODE_MODEL            str    (default deepseek-v4-flash-free)
     KANCHA_OPENCODE_AGENT            str    (default build)
     KANCHA_OPENCODE_WORKSPACE        path   (default ~/kancha-workspace)
     KANCHA_OPENCODE_TIMEOUT_S        s      (default 1800)
@@ -31,7 +31,7 @@ delegated task could rewrite the assistant mid-conversation. It defaults
 to a separate directory instead; point it at a project deliberately.
 
 **The default model costs nothing and needs no key.** Delegation runs on
-OpenCode's own free tier (``opencode/big-pickle``), so it does not spend
+OpenCode's own free tier (``opencode/deepseek-v4-flash-free``), so it does not spend
 the assistant's Gemini quota and does not depend on any key in ``.env``.
 Point ``KANCHA_OPENCODE_PROVIDER``/``_MODEL`` elsewhere and OpenCode will
 discover that provider's credentials from the environment on its own
@@ -108,17 +108,19 @@ class OpenCodeConfig:
 
     # ── Model selection ──────────────────────────────────────────────
     # OpenCode's own default, on its hosted Zen gateway's free tier: no
-    # API key, no cost, 200k context. The assistant's Gemini keys are a
-    # finite shared pool already split between the Conversation and Task
-    # LLMs (see reasoning/llm_client_mulapi.py), and a delegated build is
-    # thousands of tokens over many turns — putting that on the same pool
-    # would starve the conversation to run the agent.
+    # API key, no cost, 200k context. DeepSeek V4 Flash Free scores higher
+    # on SWE-bench than the previous default (big-pickle) at the same
+    # context size. The assistant's Gemini keys are a finite shared pool
+    # already split between the Conversation and Task LLMs (see
+    # reasoning/llm_client_mulapi.py), and a delegated build is thousands
+    # of tokens over many turns — putting that on the same pool would
+    # starve the conversation to run the agent.
     #
     # Not every Zen model is free. The paid ones (claude-sonnet-4-6,
     # gpt-5.x, …) return "No payment method" unless one is on file, which
     # arrives as an agent_error, not a crash.
     provider: str = "opencode"
-    model: str = "big-pickle"
+    model: str = "deepseek-v4-flash-free"
     #: OpenCode agent profile: "build" edits files and runs commands,
     #: "plan" is read-only. Research tasks work under either.
     agent: str = "build"
@@ -171,7 +173,7 @@ class OpenCodeConfig:
             port=_env_int("KANCHA_OPENCODE_PORT", 0, minimum=0),
             binary=_env_str("KANCHA_OPENCODE_BINARY", "opencode"),
             provider=_env_str("KANCHA_OPENCODE_PROVIDER", "opencode"),
-            model=_env_str("KANCHA_OPENCODE_MODEL", "big-pickle"),
+            model=_env_str("KANCHA_OPENCODE_MODEL", "deepseek-v4-flash-free"),
             agent=_env_str("KANCHA_OPENCODE_AGENT", "build"),
             workspace=(
                 Path(workspace).expanduser()
