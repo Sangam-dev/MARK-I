@@ -1,8 +1,10 @@
 """
 Text-to-speech (TTS) module for KANCHA.
 
-Uses edge-tts for speech synthesis and sounddevice for playback.
-Implements sentence splitting with overlap optimization:
+Uses Kokoro — a local ONNX neural TTS (via ``kokoro_onnx``) — for speech
+synthesis and sounddevice for playback. The model runs entirely offline,
+so a sentence's first audio is not gated on a network round-trip the way
+edge-tts was. Implements sentence splitting with overlap optimization:
 
     S1: [synth]──[play]
     S2:        [synth]──[play]
@@ -20,7 +22,7 @@ and is kept for backwards compatibility.
 from __future__ import annotations
 
 import asyncio
-import io
+import os
 import re
 import sys
 import time
@@ -28,11 +30,13 @@ import time
 from core.audio_state import audio_state
 
 try:
-    import edge_tts
+    from kokoro_onnx import Kokoro
     import sounddevice as sd
-    import soundfile as sf
 except ImportError:
-    sys.exit("Run: pip install edge-tts sounddevice soundfile")
+    sys.exit(
+        "Run: pip install kokoro-onnx sounddevice  "
+        "(plus the Kokoro model files — see output/tts.py KOKORO_MODEL_DIR)"
+    )
 
 import logging
 
@@ -62,7 +66,18 @@ def _get_speaking_lock() -> asyncio.Lock:
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-VOICE = "en-GB-RyanNeural"
+# Kokoro is fully offline — no network, no per-sentence WebSocket round trip.
+# Voice ids are "af_*" (American female), "am_*" (American male), "bf_*",
+# "bm_*", etc. `bm_george` is the default Kokoro-recommended American voice.
+VOICE = os.getenv("KANCHA_TTS_VOICE", "bm_george")
+TTS_SPEED = float(os.getenv("KANCHA_TTS_SPEED", "1.3"))
+# Where kokoro-v1.0.onnx and voices-v1.0.bin live (gitignored via **/data/).
+KOKORO_MODEL_DIR = os.getenv(
+    "KANCHA_TTS_MODEL_DIR",
+    os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tts", "data"
+    ),
+)
 # Minimum characters before any boundary can fire. Lowered from 10 to 6 so
 # short openings like "It is my absolute pleasure, sir" don't wait on the
 # LLM stream for the rest of the sentence before TTS starts. The tail-merge
@@ -206,9 +221,48 @@ def _clean(text: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+_kokoro: Kokoro | None = None
+_kokoro_synth_lock: asyncio.Lock | None = None
+
+
+def _get_kokoro() -> Kokoro:
+    """Load (once) the local Kokoro model. CPU-bound, ~1s on first call —
+    warmed up in the background at boot via :meth:`TTSHandler.warmup`."""
+    global _kokoro
+    if _kokoro is None:
+        model = os.path.join(KOKORO_MODEL_DIR, "kokoro-v1.0.onnx")
+        voices = os.path.join(KOKORO_MODEL_DIR, "voices-v1.0.bin")
+        if not os.path.exists(model) or not os.path.exists(voices):
+            raise FileNotFoundError(
+                f"Kokoro models not found in {KOKORO_MODEL_DIR}. Download "
+                "kokoro-v1.0.onnx and voices-v1.0.bin and set "
+                "KANCHA_TTS_MODEL_DIR (default ./tts/data)."
+            )
+        _kokoro = Kokoro(model, voices)
+    return _kokoro
+
+
+def _get_kokoro_synth_lock() -> asyncio.Lock:
+    """Lazy init — must be called from async context."""
+    global _kokoro_synth_lock
+    if _kokoro_synth_lock is None:
+        _kokoro_synth_lock = asyncio.Lock()
+    return _kokoro_synth_lock
+
+
+def _synth_kokoro(sentence: str) -> tuple:
+    """Synchronous Kokoro synthesis (runs in a worker thread)."""
+    kokoro = _get_kokoro()
+    samples, samplerate = kokoro.create(sentence, voice=VOICE, speed=TTS_SPEED)
+    return samples, samplerate
+
+
 async def _synthesize(sentence: str) -> tuple | None:
     """
-    Synthesize one sentence to audio (data, samplerate).
+    Synthesize one sentence to audio (data, samplerate) with Kokoro.
+
+    Runs the local ONNX inference in a worker thread, serialized behind a
+    lock (the ONNX session is not built for concurrent ``create`` calls).
 
     Returns:
         (numpy array, samplerate) or None if synthesis failed.
@@ -217,17 +271,13 @@ async def _synthesize(sentence: str) -> tuple | None:
     if not sentence.strip():
         return None
 
-    audio_bytes = b""
-    tts = edge_tts.Communicate(text=sentence, voice=VOICE, rate="+12%", pitch="-4Hz")
-    async for chunk in tts.stream():
-        if chunk["type"] == "audio":
-            audio_bytes += chunk["data"]
-
-    if not audio_bytes:
+    try:
+        async with _get_kokoro_synth_lock():
+            data, samplerate = await asyncio.to_thread(_synth_kokoro, sentence)
+        return data, samplerate
+    except Exception as exc:
+        logger.warning("Kokoro synthesis failed (skipping): %s", exc)
         return None
-
-    data, samplerate = sf.read(io.BytesIO(audio_bytes), dtype="float32")
-    return data, samplerate
 
 
 def _play(data, samplerate: int) -> None:
@@ -389,35 +439,20 @@ class TTSHandler:
         self._bus.subscribe(ResponseReady, self.on_response_ready)
 
     async def warmup(self) -> None:
-        """Pre-establish the edge-tts connection so the first real
-        synthesis doesn't pay the cold-connection cost.
+        """Pre-load the local Kokoro model so the first real synthesis
+        doesn't pay the ~1s one-time ONNX load on the user's critical path.
 
-        Builds a :class:`edge_tts.Communicate` with a single throwaway
-        word, drains the audio stream, and discards the bytes. The
-        tricky bit is that ``edge_tts`` spins up a fresh WebSocket per
-        ``Communicate`` instance, so the only way to amortise the
-        handshake is to *do* one and discard the result. The first real
-        sentence the user actually hears will then arrive ~200–400ms
-        sooner than it would otherwise.
+        Loading is a local CPU op — no network — so it can safely run in a
+        worker thread at boot and be done by the time the first response
+        needs a voice.
 
         Safe to call at any time; idempotent. Errors are logged and
         swallowed — a failed warmup must never break pipeline startup.
         """
         try:
-            logger.debug("TTS: warmup — establishing edge-tts session")
-            tts = edge_tts.Communicate(
-                text="ready", voice=VOICE, rate="+12%", pitch="-4Hz"
-            )
-            async for chunk in tts.stream():
-                # We don't need the audio — just consume the stream so
-                # the underlying WebSocket completes its handshake.
-                if chunk.get("type") not in ("audio",):
-                    continue
-                # Break out as soon as the first audio chunk arrives;
-                # the connection is warm, we don't need to download the
-                # whole throwaway word.
-                break
-            logger.debug("TTS: warmup complete")
+            logger.debug("TTS: warmup — loading Kokoro model")
+            await asyncio.to_thread(_get_kokoro)
+            logger.debug("TTS: warmup complete (Kokoro loaded)")
         except Exception as exc:
             logger.warning("TTS warmup failed (non-fatal): %s", exc)
 

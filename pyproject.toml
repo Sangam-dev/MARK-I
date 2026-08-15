@@ -11,7 +11,10 @@ dependencies = [
     # numpy (both already here). chromadb is an OPTIONAL alternative backend
     # — install it and set KANCHA_RAG_VECTOR_STORE=chroma to switch.
     # "chromadb>=0.5.5",
-    "edge-tts>=7.2.8",
+    # Local, offline TTS (output/tts.py) — replaces the network-bound
+    # edge-tts. Model files go in tts/data/ (see KANCHA_TTS_MODEL_DIR).
+    "kokoro-onnx>=0.5.0",
+    "onnxruntime>=1.17.0",
     "elevenlabs>=2.52.0",
     "fastapi>=0.140.0",
     "google-genai>=2.6.0",
@@ -37,7 +40,6 @@ dependencies = [
     # Required by FastAPI to parse multipart uploads (POST /api/rag/upload).
     "python-multipart>=0.0.9",
     "sounddevice>=0.5.5",
-    "soundfile>=0.14.0",
     "tensorflow>=2.21.0",
     "uvicorn[standard]>=0.51.0",
     "websockets>=16.0",
