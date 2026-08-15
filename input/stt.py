@@ -2,6 +2,7 @@ import asyncio
 import io
 import os
 import re
+import subprocess
 import sys
 import time
 import wave
@@ -159,6 +160,92 @@ async def _calibrate_noise_floor(
         return fallback
 
 
+_ECHO_CANCEL_SOURCE = "echo-cancel-source"
+_ECHO_CANCEL_SINK = "echo-cancel-sink"
+
+
+def _pactl(*args: str) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run(
+            ["pactl", *args], capture_output=True, text=True, timeout=15
+        )
+    except Exception:
+        return None
+
+
+def _default_source_name() -> str:
+    r = _pactl("get-default-source")
+    return r.stdout.strip() if r and r.returncode == 0 else ""
+
+
+def _default_sink_name() -> str:
+    r = _pactl("get-default-sink")
+    return r.stdout.strip() if r and r.returncode == 0 else ""
+
+
+def _set_default_source(name: str) -> None:
+    _pactl("set-default-source", name)
+
+
+def _set_default_sink(name: str) -> None:
+    _pactl("set-default-sink", name)
+
+
+def _echo_cancel_nodes_exist() -> bool:
+    sources = _pactl("list", "short", "sources")
+    sinks = _pactl("list", "short", "sinks")
+    return bool(
+        sources
+        and sinks
+        and sources.returncode == 0
+        and sinks.returncode == 0
+        and any(_ECHO_CANCEL_SOURCE in line for line in sources.stdout.splitlines())
+        and any(_ECHO_CANCEL_SINK in line for line in sinks.stdout.splitlines())
+    )
+
+
+def _load_echo_cancel_module() -> bool:
+    """Load module-echo-cancel once; idempotent. True when both AEC nodes exist."""
+    if _echo_cancel_nodes_exist():
+        return True
+    args = ["load-module", "module-echo-cancel", "aec_method=webrtc"]
+    source = _default_source_name()
+    sink = _default_sink_name()
+    if source:
+        args.append(f"source_master={source}")
+    if sink:
+        args.append(f"sink_master={sink}")
+    _pactl(*args)
+    return _echo_cancel_nodes_exist()
+
+
+def _prepare_aec() -> tuple[str, str] | None:
+    """Route default mic + speaker through the AEC nodes.
+
+    Returns the previous (source, sink) defaults to restore afterward, or
+    None if AEC is unavailable — in which case raw devices are used unchanged.
+    """
+    if not _load_echo_cancel_module():
+        return None
+    prev_source = _default_source_name()
+    prev_sink = _default_sink_name()
+    if prev_source != _ECHO_CANCEL_SOURCE:
+        _set_default_source(_ECHO_CANCEL_SOURCE)
+    if prev_sink != _ECHO_CANCEL_SINK:
+        _set_default_sink(_ECHO_CANCEL_SINK)
+    return prev_source, prev_sink
+
+
+def _restore_aec(prev: tuple[str, str] | None) -> None:
+    if not prev:
+        return
+    prev_source, prev_sink = prev
+    if prev_source and prev_source != _ECHO_CANCEL_SOURCE:
+        _set_default_source(prev_source)
+    if prev_sink and prev_sink != _ECHO_CANCEL_SINK:
+        _set_default_sink(prev_sink)
+
+
 async def listen(
     sample_rate: int = SAMPLE_RATE,
     chunk_duration: float = CHUNK_DURATION,
@@ -176,131 +263,142 @@ async def listen(
     magic number (FIX #3).
     """
 
-    if silence_threshold is None:
-        silence_threshold = (
-            await _calibrate_noise_floor(sample_rate) if calibrate else SILENCE_THRESH
-        )
+    # A1: route the default mic AND speaker through the AEC nodes (before
+    # calibration, so the noise floor is measured on the echo-cancelled
+    # signal too). Without the sink routing, the assistant's own voice is
+    # not in the echo reference and would be picked up as mic input while
+    # music or TTS is playing.
+    prev_aec = await asyncio.to_thread(_prepare_aec)
 
-    print("\n🎤 Listening...")
+    try:
+        if silence_threshold is None:
+            silence_threshold = (
+                await _calibrate_noise_floor(sample_rate) if calibrate else SILENCE_THRESH
+            )
 
-    chunk_size = int(sample_rate * chunk_duration)
+        print("\n🎤 Listening...")
 
-    chunks = []
-    pending_speech_chunks = []
+        chunk_size = int(sample_rate * chunk_duration)
 
-    started = False
-    silent_chunks = 0
-    speech_start_chunks = 0
-    onset_gap_chunks = 0  # FIX #2: tracks tolerated dips during onset
-    total_chunks = 0
+        chunks = []
+        pending_speech_chunks = []
 
-    max_chunks = int(max_duration / chunk_duration)
-    silence_chunks_limit = int(silence_limit / chunk_duration)
-    speech_start_chunks_required = max(1, int(SPEECH_START_SECS / chunk_duration))
+        started = False
+        silent_chunks = 0
+        speech_start_chunks = 0
+        onset_gap_chunks = 0  # FIX #2: tracks tolerated dips during onset
+        total_chunks = 0
 
-    loop = asyncio.get_running_loop()
-    stop_event = asyncio.Event()
-    blocked_by_tts = False
+        max_chunks = int(max_duration / chunk_duration)
+        silence_chunks_limit = int(silence_limit / chunk_duration)
+        speech_start_chunks_required = max(1, int(SPEECH_START_SECS / chunk_duration))
 
-    def callback(indata, frames, time_info, status):
-        nonlocal started
-        nonlocal silent_chunks
-        nonlocal speech_start_chunks
-        nonlocal onset_gap_chunks
-        nonlocal total_chunks
-        nonlocal blocked_by_tts
+        loop = asyncio.get_running_loop()
+        stop_event = asyncio.Event()
+        blocked_by_tts = False
 
-        if status:
-            print(status)
+        def callback(indata, frames, time_info, status):
+            nonlocal started
+            nonlocal silent_chunks
+            nonlocal speech_start_chunks
+            nonlocal onset_gap_chunks
+            nonlocal total_chunks
+            nonlocal blocked_by_tts
 
-        if audio_state.is_audio_input_blocked:
-            blocked_by_tts = True
-            chunks.clear()
-            pending_speech_chunks.clear()
-            loop.call_soon_threadsafe(stop_event.set)
-            return
+            if status:
+                print(status)
 
-        total_chunks += 1
-
-        # RMS VAD
-        rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
-
-        if rms > silence_threshold:
-            if not started:
-                # FIX #2: any above-threshold frame resets the onset gap
-                # counter and keeps accumulating pending speech, instead
-                # of requiring an unbroken run of loud chunks.
-                pending_speech_chunks.append(indata.copy())
-                speech_start_chunks += 1
-                onset_gap_chunks = 0
-
-                if speech_start_chunks < speech_start_chunks_required:
-                    return
-
-                print("🔴 Recording...")
-                started = True
-                chunks.extend(pending_speech_chunks)
+            if audio_state.is_audio_input_blocked:
+                blocked_by_tts = True
+                chunks.clear()
                 pending_speech_chunks.clear()
-                silent_chunks = 0
-                return
-
-            chunks.append(indata.copy())
-            silent_chunks = 0
-
-        else:
-            if not started:
-                # FIX #2: tolerate brief dips (unvoiced consonants, etc.)
-                # during onset instead of nuking the buffer on frame one.
-                onset_gap_chunks += 1
-                if onset_gap_chunks > ONSET_TOLERANCE_CHUNKS:
-                    speech_start_chunks = 0
-                    pending_speech_chunks.clear()
-                    onset_gap_chunks = 0
-                # else: keep pending_speech_chunks and speech_start_chunks
-                # as-is, give the next chunk a chance to recover.
-
-        if started and rms <= silence_threshold:
-            chunks.append(indata.copy())
-            silent_chunks += 1
-
-            if silent_chunks >= silence_chunks_limit:
                 loop.call_soon_threadsafe(stop_event.set)
                 return
 
-        # Max recording time
-        if total_chunks >= max_chunks:
-            loop.call_soon_threadsafe(stop_event.set)
+            total_chunks += 1
 
-    # FIX #1: blocksize was computed (CHUNK_SIZE) but never passed to the
-    # stream, so PortAudio picked its own buffer size and every duration-based
-    # threshold in this function (onset, silence, max) was operating on a
-    # false assumption about how much audio each callback represented.
-    with sd.InputStream(
-        samplerate=sample_rate,
-        channels=1,
-        dtype="float32",
-        blocksize=chunk_size,
-        callback=callback,
-    ):
-        await stop_event.wait()
+            # RMS VAD
+            rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
 
-    if blocked_by_tts or audio_state.is_audio_input_blocked:
-        print("↺ Ignored audio while assistant was speaking")
-        return None
+            if rms > silence_threshold:
+                if not started:
+                    # FIX #2: any above-threshold frame resets the onset gap
+                    # counter and keeps accumulating pending speech, instead
+                    # of requiring an unbroken run of loud chunks.
+                    pending_speech_chunks.append(indata.copy())
+                    speech_start_chunks += 1
+                    onset_gap_chunks = 0
 
-    if not started or not chunks:
-        return None
+                    if speech_start_chunks < speech_start_chunks_required:
+                        return
 
-    audio = np.concatenate(chunks, axis=0).flatten()
+                    print("🔴 Recording...")
+                    started = True
+                    chunks.extend(pending_speech_chunks)
+                    pending_speech_chunks.clear()
+                    silent_chunks = 0
+                    return
 
-    duration = len(audio) / sample_rate
+                chunks.append(indata.copy())
+                silent_chunks = 0
 
-    if duration < min_speech_secs:
-        return None
+            else:
+                if not started:
+                    # FIX #2: tolerate brief dips (unvoiced consonants, etc.)
+                    # during onset instead of nuking the buffer on frame one.
+                    onset_gap_chunks += 1
+                    if onset_gap_chunks > ONSET_TOLERANCE_CHUNKS:
+                        speech_start_chunks = 0
+                        pending_speech_chunks.clear()
+                        onset_gap_chunks = 0
+                    # else: keep pending_speech_chunks and speech_start_chunks
+                    # as-is, give the next chunk a chance to recover.
 
-    print(f"✓ Recorded {duration:.2f}s")
+            if started and rms <= silence_threshold:
+                chunks.append(indata.copy())
+                silent_chunks += 1
 
-    return audio
+                if silent_chunks >= silence_chunks_limit:
+                    loop.call_soon_threadsafe(stop_event.set)
+                    return
+
+            # Max recording time
+            if total_chunks >= max_chunks:
+                loop.call_soon_threadsafe(stop_event.set)
+
+        # FIX #1: blocksize was computed (CHUNK_SIZE) but never passed to the
+        # stream, so PortAudio picked its own buffer size and every duration-based
+        # threshold in this function (onset, silence, max) was operating on a
+        # false assumption about how much audio each callback represented.
+        with sd.InputStream(
+            samplerate=sample_rate,
+            channels=1,
+            dtype="float32",
+            blocksize=chunk_size,
+            callback=callback,
+        ):
+            await stop_event.wait()
+
+        if blocked_by_tts or audio_state.is_audio_input_blocked:
+            print("↺ Ignored audio while assistant was speaking")
+            return None
+
+        if not started or not chunks:
+            return None
+
+        audio = np.concatenate(chunks, axis=0).flatten()
+
+        duration = len(audio) / sample_rate
+
+        if duration < min_speech_secs:
+            return None
+
+        print(f"✓ Recorded {duration:.2f}s")
+
+        return audio
+    finally:
+        if prev_aec is not None:
+            await asyncio.to_thread(_restore_aec, prev_aec)
 
 
 def _to_wav_bytes(audio: np.ndarray) -> io.BytesIO:
@@ -338,7 +436,7 @@ async def transcribe(audio: np.ndarray) -> str:
 
     result = await asyncio.to_thread(
         client.audio.transcriptions.create,
-        model="whisper-large-v3",
+        model="whisper-large-v3-turbo",
         file=("audio.wav", wav_bytes, "audio/wav"),
         language="en",
     )
