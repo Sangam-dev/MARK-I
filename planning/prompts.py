@@ -8,6 +8,7 @@ hallucinates a tool name that doesn't exist.
 
 from __future__ import annotations
 
+from core.clock import current_datetime_block
 from tasks.registry import TASK_REGISTRY
 
 
@@ -43,6 +44,10 @@ than one action).
 # Available tools
 
 {{tool_catalog}}
+
+# Current date and time
+
+{{current_datetime}}
 
 # Output schema
 
@@ -98,7 +103,10 @@ Respond with raw JSON only.
 def build_planner_prompt(user_request: str, extra_context: str = "") -> str:
     """Render the full Planner prompt for a given user request."""
     catalog = format_tool_catalog()
-    system = PLANNER_SYSTEM_PROMPT.format(tool_catalog=catalog)
+    system = PLANNER_SYSTEM_PROMPT.format(
+        tool_catalog=catalog,
+        current_datetime=current_datetime_block(),
+    )
     body = f"{system}\n\n# User request\n\n{user_request.strip()}"
     if extra_context:
         body += f"\n\n# Context\n\n{extra_context.strip()}"

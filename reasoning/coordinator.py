@@ -47,6 +47,7 @@ from typing import Any
 
 from core.audio_state import audio_state
 from core.bus import EventBus
+from core.clock import current_datetime_block
 from core.events import (
     IntentIdentified,
     MemoryRetrieved,
@@ -977,7 +978,7 @@ class ReasoningCoordinator:
         it must NEVER appear here as "structured facts", which confuses
         the LLM into anchoring on old turns.
         """
-        parts = [JARVIS_PERSONA]
+        parts = [JARVIS_PERSONA, current_datetime_block()]
 
         if memory_event:
             # Only inject items that have a key+value structure — these are
