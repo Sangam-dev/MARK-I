@@ -42,6 +42,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+import time
 import uuid
 from typing import Any
 
@@ -52,6 +54,7 @@ from core.events import (
     IntentIdentified,
     MemoryRetrieved,
     PartialResponse,
+    PartialTranscriptReady,
     ResponseReady,
     TaskRequested,
     TaskResultReady,
@@ -142,6 +145,143 @@ def _ack_delay_from_env() -> float:
         return max(0.0, float(raw))
     except ValueError:
         return DEFAULT_TASK_ACK_DELAY_S
+
+
+# ── Preemptive generation ─────────────────────────────────────────────────────
+# A speculative reply is generated on the *interim* transcript (raced ahead
+# by input/stt.py — fired mid-speech on a snapshot) while the authoritative
+# Whisper transcription still runs. The guess is only ever *reused* when the
+# authoritative transcript validates it; everything about it is best-effort
+# and discardable. Every knob below is tuned to keep the speculation cheap
+# and safe — one guess per turn, never on task-like turns, never delegated,
+# never retrieved.
+PREEMPTIVE_MIN_WORDS = int(os.getenv("KANCHA_PREEMPTIVE_MIN_WORDS", "4"))
+# A parked guess older than this is stale (the user has moved on) and is
+# discarded rather than trusted.
+PREEMPTIVE_MAX_AGE_S = float(os.getenv("KANCHA_PREEMPTIVE_MAX_AGE_S", "20.0"))
+# How long to wait on an in-flight guess before giving up and running the
+# normal turn. Kept tiny — the guess already had the rest of the utterance
+# plus the endpoint plus the final Whisper round-trip as runway, and a slow
+# one is not worth delaying the real answer for.
+PREEMPTIVE_REUSE_WAIT_S = float(os.getenv("KANCHA_PREEMPTIVE_REUSE_WAIT_S", "0.2"))
+# The interim ASR runs mid-speech on a snapshot, so its transcript is a
+# *prefix* of the final one. The guess is reused only when the final begins
+# with the partial (in order) AND the partial covers at least this fraction
+# of the final words — the user did not add materially more after the
+# snapshot. Lower = more reuse but answers more often from an incomplete
+# request; higher = safer but less reuse.
+PREEMPTIVE_MIN_COVERAGE = float(os.getenv("KANCHA_PREEMPTIVE_MIN_COVERAGE", "0.7"))
+
+
+class _PreemptiveGuess:
+    """A parked speculative generation awaiting authoritative validation."""
+
+    __slots__ = ("partial", "text", "payload", "created_at", "gen")
+
+    def __init__(
+        self,
+        partial: str,
+        text: str,
+        payload: dict[str, Any],
+        created_at: float,
+        gen: int,
+    ) -> None:
+        self.partial = partial
+        self.text = text
+        self.payload = payload
+        self.created_at = created_at
+        self.gen = gen
+
+
+# LiveKit's approach: the preemptive transcript and the final transcript
+# are compared as sets of words, casefolded and punctuation-stripped, so
+# ASR rewording or a re-ordered clause doesn't defeat the match. On top of
+# that we normalise common contractions both ways ("what's" == "what is"),
+# since the two ASR passes often expand or contract them differently.
+# Because the interim ASR runs mid-speech on a snapshot, its transcript is
+# usually a *prefix* of the final one — handled by :func:`_is_partial_prefix`
+# (order-preserving prefix match + coverage) alongside word-set equality.
+_WORD_SPLIT_RE = re.compile(r"[^\w\s]")
+
+_CONTRACTION_EXPANSIONS = {
+    "whats": "what is",
+    "what's": "what is",
+    "dont": "do not",
+    "don't": "do not",
+    "doesnt": "does not",
+    "doesn't": "does not",
+    "didnt": "did not",
+    "didn't": "did not",
+    "isnt": "is not",
+    "isn't": "is not",
+    "cant": "cannot",
+    "can't": "cannot",
+    "wont": "will not",
+    "won't": "will not",
+    "wouldnt": "would not",
+    "wouldn't": "would not",
+    "couldnt": "could not",
+    "couldn't": "could not",
+    "shouldnt": "should not",
+    "shouldn't": "should not",
+    "youre": "you are",
+    "you're": "you are",
+    "theyre": "they are",
+    "they're": "they are",
+    "im": "i am",
+    "i'm": "i am",
+    "we're": "we are",
+    "theres": "there is",
+    "there's": "there is",
+    "thats": "that is",
+    "that's": "that is",
+}
+
+
+def _normalise_word_list(text: str) -> list[str]:
+    """Casefold, expand common contractions and strip punctuation down to
+    an ordered word list. Shared by the two transcript validators below."""
+    tokens = text.casefold().split()
+    expanded: list[str] = []
+    for tok in tokens:
+        expanded.extend(_CONTRACTION_EXPANSIONS.get(tok, tok).split())
+    return [
+        w
+        for w in _WORD_SPLIT_RE.sub(" ", " ".join(expanded)).split()
+        if w
+    ]
+
+
+def _transcripts_equivalent(a: str, b: str) -> bool:
+    """True when two transcripts carry the same words, ignoring case,
+    punctuation and contraction spelling (word-set equality)."""
+    wa = set(_normalise_word_list(a))
+    wb = set(_normalise_word_list(b))
+    if not wa or not wb:
+        return False
+    return wa == wb
+
+
+def _is_partial_prefix(partial: str, final: str, min_coverage: float) -> bool:
+    """True when *final* begins with *partial* — in order, after the same
+    normalisation as :func:`_transcripts_equivalent` — and *partial* covers
+    at least ``min_coverage`` of the final words.
+
+    The interim ASR runs mid-speech on a snapshot, so its transcript is a
+    prefix of the authoritative one. Word-set equality (above) handles the
+    exact-match case; this handles the snapshot-captured-early case while
+    keeping the bar high enough that a substantially-extended utterance is
+    discarded rather than answered from a stale prefix.
+    """
+    pa = _normalise_word_list(partial)
+    fa = _normalise_word_list(final)
+    if not pa or not fa:
+        return False
+    if len(pa) > len(fa):
+        return False
+    if fa[: len(pa)] != pa:
+        return False
+    return len(pa) / len(fa) >= min_coverage
 
 
 def _controller_instructions() -> str:
@@ -317,6 +457,20 @@ class ReasoningCoordinator:
         )
         self._response_stream_finished = asyncio.Event()
         self._response_stream_finished.set()
+        # ── Preemptive generation (see on_partial_transcript) ──────────
+        # session_id -> a parked _PreemptiveGuess, or None while its guess
+        # task is still in flight. Popped when the authoritative turn lands.
+        self._preemptive: dict[str, _PreemptiveGuess | None] = {}
+        # session_id -> the in-flight guess task, so the authoritative turn
+        # can await it briefly or cancel it.
+        self._preemptive_tasks: dict[str, asyncio.Task] = {}
+        # session_id -> monotonic utterance counter. Bumped on every user
+        # turn; each guess is tagged with the generation it fired for, so a
+        # late-arriving guess can never be misattributed to a later turn.
+        self._utterance_gen: dict[str, int] = {}
+        # Fire-and-forget tasks we must keep referenced (memory persist
+        # moved off the critical path).
+        self._bg_tasks: set[asyncio.Task] = set()
 
     def register(self) -> None:
         """Subscribe the controller to user input and to task results.
@@ -327,6 +481,7 @@ class ReasoningCoordinator:
         """
         self.bus.subscribe(TextInputReceived, self.on_user_input)
         self.bus.subscribe(TranscriptReady, self.on_user_input)
+        self.bus.subscribe(PartialTranscriptReady, self.on_partial_transcript)
         self.bus.subscribe(TaskResultReady, self.on_task_result)
 
     # ── Entry point: the user says something ──────────────────────────────────
@@ -339,6 +494,14 @@ class ReasoningCoordinator:
 
         session_id = event.session_id
 
+        # This is now the authoritative turn. Bump the utterance generation
+        # and lift any preemptive state for it — a parked (or still
+        # arriving) guess may be reused below if it validates.
+        gen = self._utterance_gen.get(session_id, 0) + 1
+        self._utterance_gen[session_id] = gen
+        guess_task = self._preemptive_tasks.pop(session_id, None)
+        parked = self._preemptive.pop(session_id, None)
+
         self._response_stream_finished.clear()
         # A new utterance starts a fresh chain budget.
         self._chain_depth[session_id] = 0
@@ -346,15 +509,31 @@ class ReasoningCoordinator:
         # Start thinking gate
         audio_state.thinking_started()
 
+        reused = False
         try:
             self.memory_manager.short_term.add("user", text)
-            payload = await self._run_conversation_turn(
-                session_id=session_id,
-                retrieval_query=text,
-            )
+            if parked is not None or guess_task is not None:
+                # There was (or is) a speculative guess for this utterance.
+                # Await any in-flight generation briefly, then reuse it if
+                # the authoritative transcript validates it.
+                reused = await self._try_reuse_preemptive(
+                    text,
+                    session_id,
+                    gen,
+                    parked=parked,
+                    task=guess_task,
+                )
+            if not reused:
+                payload = await self._run_conversation_turn(
+                    session_id=session_id,
+                    retrieval_query=text,
+                )
         finally:
             self._response_stream_finished.set()
             audio_state.thinking_finished()
+
+        if reused:
+            return
 
         # Delegation happens after the acknowledgement is out of the door,
         # so a long-running task never delays the immediate response.
@@ -362,6 +541,219 @@ class ReasoningCoordinator:
             payload, session_id=session_id, user_request=text
         ):
             self._maybe_resume_open_task(text, session_id)
+
+    # ── Preemptive generation ───────────────────────────────────────────────
+
+    async def on_partial_transcript(
+        self, event: PartialTranscriptReady
+    ) -> None:
+        """Start a speculative reply on an interim transcript.
+
+        Runs the *same* controller on the partial text — but with every
+        side effect disabled. The result is parked, never streamed and
+        never delegated; :meth:`_try_reuse_preemptive` decides whether the
+        authoritative turn can use it. Any rejection here simply means the
+        normal turn runs as if no speculation happened.
+        """
+        text = (event.text or "").strip()
+        if not text:
+            return
+        session_id = event.session_id
+        if not await self._should_preempt(session_id, text):
+            return
+
+        gen = self._utterance_gen.get(session_id, 0)
+        parked = self._preemptive.get(session_id)
+        if isinstance(parked, _PreemptiveGuess) and parked.gen == gen:
+            return  # already generated for this utterance
+
+        # Supersede any in-flight guess from an earlier utterance.
+        prior = self._preemptive_tasks.pop(session_id, None)
+        if prior is not None and not prior.done():
+            prior.cancel()
+
+        self._preemptive[session_id] = None  # in-flight marker
+        task = asyncio.create_task(
+            self._generate_preemptive(session_id, text, gen),
+            name=f"preemptive:{session_id}",
+        )
+        self._preemptive_tasks[session_id] = task
+
+    async def _should_preempt(self, session_id: str, text: str) -> bool:
+        """Decide whether an interim transcript is worth speculating on.
+
+        Every gate is conservative — a rejection simply falls through to
+        the normal turn, so these checks only ever *skip* work, never
+        degrade it.
+        """
+        if not self._response_stream_finished.is_set():
+            return False  # a turn is already being processed
+        # Imported lazily: nlu.classifier imports reasoning.llm_client,
+        # which triggers reasoning/__init__ -> this module. A module-level
+        # import here would form an import cycle.
+        from nlu.classifier import classify_tool_request
+
+        if classify_tool_request(text) is not None:
+            return False  # task-like — the controller must decide this
+        record = self._last_task.get(session_id) or {}
+        if record.get("status") in WAITING_STATUSES:
+            return False  # user is answering a task question — resume path
+        if len(text.split()) < PREEMPTIVE_MIN_WORDS:
+            return False
+        if not self.gemini_client.has_available_key():
+            return False  # never queue a guess behind a cooling key
+        if self.rag_router is not None:
+            # Never speculate when the turn would retrieve long-term
+            # memory — a context-free guess could degrade recall if reused.
+            try:
+                decision = await self.rag_router.decide(text)
+            except Exception:  # noqa: BLE001
+                decision = None
+            if decision is not None and decision.retrieve:
+                return False
+        return True
+
+    async def _generate_preemptive(
+        self, session_id: str, partial: str, gen: int
+    ) -> None:
+        """Generate a speculative reply on the interim transcript.
+
+        Deliberately side-effect free: nothing is added to short-term
+        memory, nothing is persisted, nothing is streamed to the user and
+        nothing is ever delegated. The result is parked and only reused by
+        :meth:`_try_reuse_preemptive` once the authoritative transcript
+        validates it.
+        """
+        try:
+            facts = await self.memory_manager.get_all_facts()
+            memory_event = MemoryRetrieved(
+                session_id=session_id,
+                query=partial,
+                structured_context=facts,
+                episodic_context=[],
+            )
+            system = self._build_system_prompt(
+                memory_event,
+                retrieved=None,
+                session_id=session_id,
+                activity_chunks=None,
+            )
+            history = [*self._get_history(), {"role": "user", "content": partial}]
+
+            response_text, payload, _ = await self._stream_once(
+                history=history,
+                system=system,
+                session_id=session_id,
+                call_site="preemptive",
+                stream_to_user=False,
+            )
+            if not response_text or payload.get("task"):
+                # A blank guess, or one that wanted to delegate — never
+                # usable. A preemptive reply must never start work.
+                self._preemptive[session_id] = None
+                return
+            self._preemptive[session_id] = _PreemptiveGuess(
+                partial=partial,
+                text=response_text,
+                payload=payload,
+                created_at=time.monotonic(),
+                gen=gen,
+            )
+            logger.debug(
+                "Preemptive reply parked (session=%s, %d chars, gen=%d)",
+                session_id,
+                len(response_text),
+                gen,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Preemptive generation failed (non-fatal): %s", exc)
+            self._preemptive[session_id] = None
+
+    async def _try_reuse_preemptive(
+        self,
+        final_text: str,
+        session_id: str,
+        gen: int,
+        parked: _PreemptiveGuess | None,
+        task: asyncio.Task | None,
+    ) -> bool:
+        """Validate and reuse a preemptive guess, or fall through to the
+        normal turn.
+
+        A guess is trusted only when it is fresh, was generated for this
+        utterance's generation, its transcript matches the authoritative
+        one (word-set equality, or an order-preserving prefix covering most
+        of it — the interim ASR runs mid-speech on a snapshot), and it
+        never delegated a task (a preemptive reply must
+        never start work).
+        """
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task), timeout=PREEMPTIVE_REUSE_WAIT_S
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                task.cancel()
+                return False
+
+        if parked is None:
+            parked = self._preemptive.pop(session_id, None)
+        if parked is None:
+            return False
+
+        if parked.gen + 1 != gen:
+            return False
+        if time.monotonic() - parked.created_at > PREEMPTIVE_MAX_AGE_S:
+            return False
+        if not (
+            _transcripts_equivalent(parked.partial, final_text)
+            or _is_partial_prefix(parked.partial, final_text, PREEMPTIVE_MIN_COVERAGE)
+        ):
+            logger.debug(
+                "Preemptive guess discarded — transcript mismatch (session=%s)",
+                session_id,
+            )
+            return False
+        if parked.payload.get("task"):
+            logger.info(
+                "Preemptive guess discarded — it delegated a task (session=%s)",
+                session_id,
+            )
+            return False
+        # The final transcript is authoritative. If the completed utterance
+        # turns out to be a task or would retrieve long-term memory, the
+        # preemptive guess — generated from the incomplete partial without
+        # any task/retrieval context — must not stand in for the real turn.
+        from nlu.classifier import classify_tool_request
+
+        if classify_tool_request(final_text) is not None:
+            logger.debug(
+                "Preemptive guess discarded — final is a task (session=%s)",
+                session_id,
+            )
+            return False
+        if self.rag_router is not None:
+            try:
+                decision = await self.rag_router.decide(final_text)
+            except Exception:  # noqa: BLE001
+                decision = None
+            if decision is not None and decision.retrieve:
+                logger.debug(
+                    "Preemptive guess discarded — final would retrieve "
+                    "(session=%s)",
+                    session_id,
+                )
+                return False
+
+        self.memory_manager.short_term.add("assistant", parked.text)
+        self._spawn_persist(parked.payload, session_id=session_id)
+        self.bus.emit(ResponseReady(text=parked.text, session_id=session_id))
+        logger.info(
+            "Preemptive reply reused (session=%s, lead_time=%.2fs)",
+            session_id,
+            time.monotonic() - parked.created_at,
+        )
+        return True
 
     def _maybe_resume_open_task(self, text: str, session_id: str) -> None:
         """Route a bare yes/no to the open task the controller forgot.
@@ -826,9 +1218,11 @@ class ReasoningCoordinator:
         # 5. Add assistant turn to short_term SYNCHRONOUSLY
         self.memory_manager.short_term.add("assistant", response_text)
 
-        # 6. Persist memory carried by the response envelope. `sql` lands
-        # in SQLite, `rag` in the vector store (+ the rag.txt audit log).
-        await self._persist_response_memory(payload, session_id=session_id)
+        # 6. Persist memory carried by the response envelope, off the
+        # critical path — the user is waiting to hear the reply, and these
+        # writes are best-effort by construction. `sql` lands in SQLite,
+        # `rag` in the vector store (+ the rag.txt audit log).
+        self._spawn_persist(payload, session_id=session_id)
 
         # 7. Deliver — unless this turn is an acknowledgement of work that
         # is about to start. In that case the text is handed to
@@ -853,6 +1247,7 @@ class ReasoningCoordinator:
         system: str,
         session_id: str,
         call_site: str,
+        stream_to_user: bool = True,
     ) -> tuple[str, dict[str, Any], bool]:
         """Stream the JSON envelope once.
 
@@ -862,7 +1257,10 @@ class ReasoningCoordinator:
         The envelope streams token-by-token. While it arrives we strip the
         scaffolding and forward ONLY the visible ``message`` text as
         ``PartialResponse`` events so the UI renders words as they
-        generate. The full buffer is parsed once at the end for the
+        generate — unless ``stream_to_user`` is False (preemptive
+        generation), in which case the text is collected but never
+        surfaced: a speculative reply must not be spoken before it is
+        validated. The full buffer is parsed once at the end for the
         authoritative message plus the ``task``/``sql``/``rag`` fields.
 
         The exception is a turn that opens with a ``"task"`` key. That
@@ -900,12 +1298,13 @@ class ReasoningCoordinator:
 
                 visible = extract_streamed_message(buffer)
                 if len(visible) > len(prev_visible):
-                    self.bus.emit(
-                        PartialResponse(
-                            text=visible[len(prev_visible) :],
-                            session_id=session_id,
+                    if stream_to_user:
+                        self.bus.emit(
+                            PartialResponse(
+                                text=visible[len(prev_visible) :],
+                                session_id=session_id,
+                            )
                         )
-                    )
                     prev_visible = visible
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -1244,6 +1643,29 @@ class ReasoningCoordinator:
             {"role": m["role"], "content": m["content"]}
             for m in self.memory_manager.short_term.get_recent()
         ]
+
+    def _spawn_persist(self, payload: dict[str, Any], session_id: str) -> None:
+        """Persist response-carried memory off the critical path.
+
+        Writes the ``sql``/``rag`` memory the primary Gemini response
+        carried, in the background: the user is waiting to hear the reply,
+        and these writes are best-effort by construction. Errors are
+        logged, never surfaced.
+        """
+        if not payload:
+            return
+
+        async def _safe() -> None:
+            try:
+                await self._persist_response_memory(payload, session_id=session_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Background memory persist failed (non-fatal): %s", exc
+                )
+
+        task = asyncio.create_task(_safe(), name="memory_persist")
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     async def _persist_response_memory(
         self, payload: dict[str, Any], session_id: str = "default"

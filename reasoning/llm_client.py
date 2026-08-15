@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -689,4 +690,48 @@ class GeminiClient:
         """Return True if the key pool has available keys."""
         if not self.pool:
             return False
+        return any(e.is_available for e in self.pool.entries())
+
+    def has_available_key(self) -> bool:
+        """Return True if any pool key is available *right now*.
+
+        Unlike :meth:`health_check` this never waits: a lane whose keys
+        are all cooling reports False so a caller can decide to skip
+        optional work (e.g. a speculative preemptive generation) instead
+        of queuing behind a cooldown.
+        """
+        if self.pool is None:
+            return False
+        return any(e.is_available for e in self.pool.entries())
+
+    async def prewarm(self) -> None:
+        """Establish the HTTPS connection and warm the model ahead of use.
+
+        The first real generation pays TTFT on top of a cold connection
+        and a cold model. A single throwaway request at boot amortises
+        both so the user's first turn starts streaming sooner. Best-effort
+        and detached: any failure (no key, quota, network) is swallowed —
+        a failed warmup must never break startup.
+        """
+        if self.pool is None:
+            return
+        if not self.has_available_key():
+            logger.debug("LLM prewarm skipped — no available key")
+            return
+        try:
+            from google.genai import types
+
+            entry = await self.pool.acquire_active()
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    entry.client.models.generate_content,
+                    model=self.model,
+                    contents="Reply with the single word: ready.",
+                    config=types.GenerateContentConfig(max_output_tokens=1),
+                ),
+                timeout=min(8.0, self.timeout),
+            )
+            logger.debug("LLM prewarm complete (key[%d])", entry.index)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("LLM prewarm skipped (non-fatal): %s", exc)
         return any(e.is_available for e in self.pool.entries())

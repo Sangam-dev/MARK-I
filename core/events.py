@@ -72,6 +72,28 @@ class TranscriptReady(BaseEvent):
 
 
 @dataclass(frozen=True)
+class PartialTranscriptReady(BaseEvent):
+    """
+    Event fired with a *provisional* transcript of the speech recorded so
+    far, produced before the authoritative :class:`TranscriptReady`.
+
+    The voice path emits this from an interim (fast, lightweight) ASR pass
+    that races ahead of the final Whisper transcription. It exists purely
+    so the ReasoningCoordinator can start generating a speculative reply
+    while the user's final transcript is still being produced. Nothing
+    here is authoritative — ``final`` must remain False, and consumers
+    must treat the text as a guess that can be discarded.
+
+    emitted by: input/stt.py (interim ASR pass)
+    consumed by: reasoning/coordinator.py (preemptive generation)
+    """
+
+    text: str = ""
+    final: bool = False
+    language: str = "en"
+
+
+@dataclass(frozen=True)
 class IntentIdentified(BaseEvent):
     """
     Event triggered when an intent is identified.

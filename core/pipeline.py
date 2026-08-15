@@ -423,6 +423,12 @@ async def build_pipeline(
     llm = GeminiClient(token_log=token_log, lane="conversation", lane_direction=FORWARD)
     await llm.initialize()
 
+    # Warm the Conversation LLM's connection + model in the background so
+    # the first user turn (and every preemptive guess) doesn't pay TTFT on
+    # a cold connection. Detached on purpose — a failed warmup must never
+    # delay pipeline startup.
+    asyncio.create_task(llm.prewarm(), name="llm_prewarm")
+
     task_llm = GeminiClient(token_log=token_log, lane="task", lane_direction=REVERSE)
     await task_llm.initialize()
 

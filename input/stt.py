@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 import wave
+from typing import Awaitable, Callable
 
 import numpy as np
 import sounddevice as sd
@@ -28,13 +29,44 @@ SAMPLE_RATE = 16000
 CHUNK_DURATION = 0.03
 CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)  # now actually used as blocksize
 SILENCE_THRESH = 0.01  # fallback default if calibration fails
-SILENCE_LIMIT = 0.8
+# Trailing-silence endpoint: how long of quiet audio ends a recording.
+# 0.4s trims another ~0.15s off every turn versus 0.55s. It stays
+# tolerant of natural mid-speech pauses because it is the *trailing* run
+# of silence that ends the turn, not the first dip. Overridable via
+# KANCHA_SILENCE_LIMIT.
+SILENCE_LIMIT = float(os.getenv("KANCHA_SILENCE_LIMIT", "0.4"))
 MAX_DURATION = 15.0
 MIN_SPEECH_SECS = 0.5
 MAX_HISTORY = 12
 SPEECH_START_SECS = 0.24
 LOW_CONFIDENCE_AUDIO_RMS = 0.025
 LOW_CONFIDENCE_AUDIO_SECS = 1.2
+
+# ── Preemptive generation (interim ASR) ─────────────────────────────────────
+# The interim pass is a cheap ASR that races ahead of the final Whisper
+# transcription so the LLM can start replying while the rest of the
+# utterance is still being captured and transcribed. It is fired MID-speech
+# on a snapshot of the audio captured so far (~1.2s in), NOT at speech end:
+# the final turbo transcription is so fast (~0.25s) that a guess started
+# only after recording finished would have no runway to hide the LLM
+# latency. Quality-critical output always comes from the final turbo pass,
+# and the speculative reply is only *reused* when the coordinator validates
+# it against the authoritative transcript.
+PREEMPTIVE_MODEL = os.getenv("KANCHA_PREEMPTIVE_MODEL", "whisper-large-v3-turbo")
+# Fire the snapshot once this much speech has been recorded — early enough
+# that the LLM guess still has the rest of the utterance + endpoint + final
+# Whisper as runway, late enough that the partial usually covers the core
+# of the request.
+PREEMPTIVE_SNAPSHOT_SECS = float(
+    os.getenv("KANCHA_PREEMPTIVE_SNAPSHOT_SECS", "1.2")
+)
+# Only worth racing the final pass for turns that are long enough to have
+# real transcription cost — a 0.5s "thanks" is transcribed instantly
+# anyway.
+PREEMPTIVE_MIN_AUDIO_SECS = float(os.getenv("KANCHA_PREEMPTIVE_MIN_AUDIO_SECS", "1.0"))
+# Refuse to preempt on fragments too short to be a whole thought — a
+# mid-sentence guess would fail validation and waste the generation.
+PREEMPTIVE_MIN_WORDS = int(os.getenv("KANCHA_PREEMPTIVE_MIN_WORDS", "4"))
 
 # FIX #2: onset tolerance — how many low-RMS chunks we allow during the
 # "is this really speech starting" window before we give up and reset.
@@ -160,6 +192,26 @@ async def _calibrate_noise_floor(
         return fallback
 
 
+_CALIBRATED_THRESHOLD: float | None = None
+
+
+async def _get_silence_threshold(sample_rate: int, calibrate: bool) -> float:
+    """Return a noise-floor-relative threshold, calibrating at most once
+    per process.
+
+    Calibration samples 0.3s of ambient audio, so paying it on every
+    listen adds ~0.3s to *every* turn. The noise floor of a fixed
+    mic/room/gain barely drifts within a session, so the first listen
+    calibrates and caches; subsequent listens reuse the value.
+    """
+    global _CALIBRATED_THRESHOLD
+    if not calibrate:
+        return SILENCE_THRESH
+    if _CALIBRATED_THRESHOLD is None:
+        _CALIBRATED_THRESHOLD = await _calibrate_noise_floor(sample_rate)
+    return _CALIBRATED_THRESHOLD
+
+
 _ECHO_CANCEL_SOURCE = "echo-cancel-source"
 _ECHO_CANCEL_SINK = "echo-cancel-sink"
 
@@ -254,6 +306,7 @@ async def listen(
     max_duration: float = MAX_DURATION,
     min_speech_secs: float = MIN_SPEECH_SECS,
     calibrate: bool = True,
+    snapshot_cb: Callable[[np.ndarray], Awaitable[None]] | None = None,
 ) -> np.ndarray | None:
     """
     Listen until speech ends using simple RMS-based VAD.
@@ -261,6 +314,15 @@ async def listen(
     If silence_threshold is None and calibrate=True, the threshold is
     derived from a short ambient-noise sample instead of using a fixed
     magic number (FIX #3).
+
+    When ``snapshot_cb`` is given, a snapshot of the audio captured so
+    far is handed to it (as a background task) once speech has been
+    recording for :data:`PREEMPTIVE_SNAPSHOT_SECS` — still mid-utterance.
+    The callback typically runs a fast interim ASR and emits
+    ``PartialTranscriptReady`` so the coordinator can start generating a
+    speculative reply while the rest of the utterance is captured and the
+    final transcription runs. A slow or failing snapshot never delays the
+    recording.
     """
 
     # A1: route the default mic AND speaker through the AEC nodes (before
@@ -272,9 +334,7 @@ async def listen(
 
     try:
         if silence_threshold is None:
-            silence_threshold = (
-                await _calibrate_noise_floor(sample_rate) if calibrate else SILENCE_THRESH
-            )
+            silence_threshold = await _get_silence_threshold(sample_rate, calibrate)
 
         print("\n🎤 Listening...")
 
@@ -288,14 +348,29 @@ async def listen(
         speech_start_chunks = 0
         onset_gap_chunks = 0  # FIX #2: tracks tolerated dips during onset
         total_chunks = 0
+        snapshot_fired = False
 
         max_chunks = int(max_duration / chunk_duration)
         silence_chunks_limit = int(silence_limit / chunk_duration)
         speech_start_chunks_required = max(1, int(SPEECH_START_SECS / chunk_duration))
+        snapshot_chunks = max(1, int(PREEMPTIVE_SNAPSHOT_SECS / chunk_duration))
 
         loop = asyncio.get_running_loop()
         stop_event = asyncio.Event()
         blocked_by_tts = False
+
+        async def _run_snapshot(snapshot: np.ndarray) -> None:
+            if snapshot_cb is None:
+                return
+            try:
+                await snapshot_cb(snapshot)
+            except Exception as exc:  # noqa: BLE001
+                print(f"⚠ Interim ASR failed (non-fatal): {exc}")
+
+        def _fire_snapshot(snapshot: np.ndarray) -> None:
+            # Called from the PortAudio callback thread via
+            # call_soon_threadsafe; creates the task on the loop thread.
+            asyncio.create_task(_run_snapshot(snapshot), name="interim_asr")
 
         def callback(indata, frames, time_info, status):
             nonlocal started
@@ -304,6 +379,7 @@ async def listen(
             nonlocal onset_gap_chunks
             nonlocal total_chunks
             nonlocal blocked_by_tts
+            nonlocal snapshot_fired
 
             if status:
                 print(status)
@@ -341,6 +417,16 @@ async def listen(
 
                 chunks.append(indata.copy())
                 silent_chunks = 0
+
+                if not snapshot_fired and len(chunks) >= snapshot_chunks:
+                    # Mid-utterance: hand a snapshot of the speech captured
+                    # so far to the interim ASR. Firing here (not at speech
+                    # end) is what gives the speculative LLM reply any
+                    # runway at all — the final Whisper call is too fast to
+                    # hide behind.
+                    snapshot_fired = True
+                    snapshot = np.concatenate(chunks, axis=0).flatten()
+                    loop.call_soon_threadsafe(_fire_snapshot, snapshot)
 
             else:
                 if not started:
@@ -447,6 +533,28 @@ async def transcribe(audio: np.ndarray) -> str:
     return result.text
 
 
+async def transcribe_interim(audio: np.ndarray) -> str:
+    """
+    Fast, cheap transcription for the preemptive path.
+
+    Same shape as :func:`transcribe` but routed through the lightweight
+    :data:`PREEMPTIVE_MODEL`, which returns in a fraction of the time of
+    the final turbo pass. The result is only ever a *guess*: the
+    coordinator discards it unless the authoritative transcript matches.
+    """
+    client = _get_client()
+    wav_bytes = _to_wav_bytes(audio)
+
+    result = await asyncio.to_thread(
+        client.audio.transcriptions.create,
+        model=PREEMPTIVE_MODEL,
+        file=("audio.wav", wav_bytes, "audio/wav"),
+        language="en",
+    )
+
+    return result.text
+
+
 async def listen_and_transcribe(
     sample_rate: int = SAMPLE_RATE,
     chunk_duration: float = CHUNK_DURATION,
@@ -454,9 +562,18 @@ async def listen_and_transcribe(
     silence_limit: float = SILENCE_LIMIT,
     max_duration: float = MAX_DURATION,
     min_speech_secs: float = MIN_SPEECH_SECS,
+    partial_cb: Callable[[np.ndarray], Awaitable[None]] | None = None,
 ) -> str | None:
     """
     Listen to mic input, detect silence, and transcribe.
+
+    When ``partial_cb`` is given, a snapshot of the audio captured so far
+    is handed to it mid-utterance (via :func:`listen`'s ``snapshot_cb``)
+    as a background task — *while* the user is still speaking. The
+    callback typically runs a fast interim ASR and emits
+    ``PartialTranscriptReady`` so the coordinator can begin generating
+    while the rest of the utterance is captured and the final
+    transcription runs.
 
     Returns the transcribed text, or None if no audio was captured.
     """
@@ -469,6 +586,7 @@ async def listen_and_transcribe(
         silence_limit=silence_limit,
         max_duration=max_duration,
         min_speech_secs=min_speech_secs,
+        snapshot_cb=partial_cb,
     )
 
     if audio is None:
@@ -496,6 +614,7 @@ from core.bus import EventBus
 from core.events import (
     AssistantState,
     AssistantStateChanged,
+    PartialTranscriptReady,
     ShutdownRequested,
     TranscriptReady,
     WakeWordDetected,
@@ -525,6 +644,7 @@ class MicrophoneListener:
         self._running = False
         self._wake_event = asyncio.Event()
         self._current_state = AssistantState.IDLE
+        self._aec_warmed = False
 
     def register(self) -> None:
         """Subscribe to bus events."""
@@ -545,12 +665,59 @@ class MicrophoneListener:
         if event.session_id == self._session_id:
             self._current_state = event.state
 
+    async def _warm_aec(self) -> None:
+        """Pre-load the echo-cancel module and nodes before first use.
+
+        The AEC path is otherwise set up lazily inside the first
+        :func:`listen` call, adding pactl module-load latency to the very
+        turn the user is already waiting on. Routing through the nodes
+        once at boot (then restoring) warms everything up so subsequent
+        :func:`listen` calls only re-point the defaults — a few fast
+        pactl calls instead of a module load. Best-effort: AEC stays
+        optional, so a failure here is swallowed.
+        """
+        try:
+            prev = await asyncio.to_thread(_prepare_aec)
+            if prev is not None:
+                await asyncio.sleep(0.05)
+                await asyncio.to_thread(_restore_aec, prev)
+        except Exception as exc:  # noqa: BLE001
+            _stt_logger.debug("AEC warm-up failed (non-fatal): %s", exc)
+
+    async def _maybe_preemptive(self, audio: np.ndarray) -> None:
+        """Race a cheap ASR ahead of the authoritative transcription.
+
+        Receives a *mid-speech snapshot* of the audio (fired by
+        :func:`listen` once :data:`PREEMPTIVE_SNAPSHOT_SECS` of speech has
+        been recorded). If the interim text looks like a whole thought it
+        is emitted as :class:`PartialTranscriptReady` so the coordinator
+        can start generating a speculative reply while the user is still
+        talking and the final Whisper call runs. Everything here is a
+        guess — the coordinator validates and may discard it.
+        """
+        if len(audio) / SAMPLE_RATE < PREEMPTIVE_MIN_AUDIO_SECS:
+            return
+        try:
+            text = await transcribe_interim(audio)
+        except Exception as exc:  # noqa: BLE001
+            _stt_logger.debug("Interim ASR failed (non-fatal): %s", exc)
+            return
+        text = (text or "").strip()
+        if not text or len(text.split()) < PREEMPTIVE_MIN_WORDS:
+            return
+        self._bus.emit(
+            PartialTranscriptReady(text=text, session_id=self._session_id)
+        )
+
     async def run(self) -> None:
         """Main loop — call this as an asyncio task."""
         self._running = True
         _stt_logger.info(
             "MicrophoneListener started (wake_word_gated=%s)", self._wake_word_gated
         )
+        if not self._aec_warmed:
+            self._aec_warmed = True
+            asyncio.create_task(self._warm_aec(), name="aec_warmup")
 
         while self._running:
             await audio_state.wait_until_idle()
@@ -569,7 +736,9 @@ class MicrophoneListener:
             )
 
             try:
-                text = await listen_and_transcribe()
+                text = await listen_and_transcribe(
+                    partial_cb=self._maybe_preemptive
+                )
             except Exception as exc:
                 _stt_logger.exception("listen_and_transcribe error: %s", exc)
                 if self._current_state == AssistantState.LISTENING:
