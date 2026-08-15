@@ -25,6 +25,7 @@ import asyncio
 import os
 import re
 import sys
+import threading
 import time
 
 from core.audio_state import audio_state
@@ -46,6 +47,8 @@ from core.events import (
     AssistantStateChanged,
     PartialResponse,
     ResponseReady,
+    TranscriptReady,
+    UserInterrupted,
 )
 
 logger = logging.getLogger("kancha.output.tts")
@@ -129,6 +132,15 @@ def _is_abbreviation(text: str, pos: int) -> bool:
 # next split.
 SOFT_PREFERRED_THRESHOLD = 60
 
+# After a barge-in, if no real user transcript arrives within this window the
+# interruption is treated as FALSE (noise, a cough, a door slamming) and the
+# assistant resumes the unspoken tail instead of leaving the conversation dead
+# (mirrors LiveKit's false-interruption resume). Overridable via
+# KANCHA_FALSE_INTERRUPTION_TIMEOUT.
+FALSE_INTERRUPTION_TIMEOUT = float(
+    os.getenv("KANCHA_FALSE_INTERRUPTION_TIMEOUT", "2.0")
+)
+
 
 def _extract_sentences(buffer: str) -> tuple[list[str], str]:
     """
@@ -159,34 +171,51 @@ def _extract_sentences(buffer: str) -> tuple[list[str], str]:
         # 200 chars away means the user will wait 4+ seconds; prefer a
         # soft split at 60 chars instead.
         boundary_pos = -1
+        deferred_hard = -1
         for i, char in enumerate(buffer):
             if char in HARD_BOUNDARIES and i >= MIN_CHUNK_LEN:
                 if char == "." and _is_abbreviation(buffer, i):
                     continue
                 if char == "." and i + 1 < len(buffer) and buffer[i + 1] == ".":
                     continue
-                # Mid-token period: decimal numbers (10.7), URLs (www.facebook.com),
-                # version numbers (v1.2.3), domain names (python.org).
-                # A sentence-ending period is always followed by whitespace or
-                # end-of-buffer — anything else is not a sentence boundary.
+                # A period is a sentence boundary ONLY when followed by
+                # whitespace or end-of-buffer. A period inside a decimal
+                # (5.9), URL (www.facebook.com), version (v1.2.3) or domain
+                # (python.org) is never a boundary and is never split or
+                # stripped — only ``.`` + space is "ignorable".
                 if char == "." and i + 1 < len(buffer) and not buffer[i + 1].isspace():
                     continue
                 if (
                     len(buffer) >= SOFT_PREFERRED_THRESHOLD
                     and i > SOFT_PREFERRED_THRESHOLD
                 ):
+                    # Far-off boundary: defer to the soft pass, but remember
+                    # it — if no comma exists, the period must still fire or
+                    # the sentence is never split (a period ignored).
+                    deferred_hard = i
                     break
                 boundary_pos = i
                 break
 
         # Second pass: soft boundary fallback. Fires when no hard boundary
         # was found AND when we deferred a far-off hard boundary in favour
-        # of an earlier soft one.
+        # of an earlier soft one. If no soft boundary exists either, fall
+        # back to the deferred hard boundary so a sentence-final period is
+        # never ignored.
         if boundary_pos == -1 and len(buffer) >= SOFT_BREAK_THRESHOLD:
+            soft_pos = -1
             for i, char in enumerate(buffer):
                 if char in SOFT_BOUNDARIES and i >= MIN_CHUNK_LEN:
-                    boundary_pos = i
+                    soft_pos = i
                     break
+            if soft_pos != -1:
+                boundary_pos = (
+                    soft_pos
+                    if deferred_hard == -1
+                    else min(soft_pos, deferred_hard)
+                )
+            else:
+                boundary_pos = deferred_hard
 
         # Final fallback: force a split at the last space if the buffer
         # has exceeded MAX_CHUNK_LEN with no usable boundary at all.
@@ -212,6 +241,17 @@ def _clean(text: str) -> str:
     text = re.sub(r"#+\s*", "", text)  # headers
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)  # links
     text = re.sub(r"—", " — ", text)  # em dash spacing
+    # Decimal numbers: espeak-ng reads "5.5" as "five five" — the '.' becomes
+    # a syllable break, not the word "point". Rewrite as "5 point 5" so Kokoro
+    # says "five point five". The digits are spaced individually so "4.40"
+    # reads "four point four zero", never "four point forty". Chained decimals
+    # ("v1.2.3") become "1 point 2 3". A sentence-final "5." (period followed
+    # by space) is left untouched.
+    text = re.sub(
+        r"\b\d+\.\d+(?:\.\d+)*\b",
+        lambda m: " point ".join(" ".join(d) for d in m.group(0).split(".")),
+        text,
+    )
     text = re.sub(r"\s{2,}", " ", text)
     return text.strip()
 
@@ -284,6 +324,53 @@ def _play(data, samplerate: int) -> None:
     """Play audio synchronously (blocks until done)."""
     sd.play(data, samplerate)
     sd.wait()
+
+
+# Set on barge-in to tell the _play poll loop to cut playback early. A
+# plain flag (not a PortAudio call) is used deliberately: the loop thread
+# must never touch the playback stream (blocking / concurrent-close risks).
+_playback_interrupted = threading.Event()
+
+
+def _play(data, samplerate: int) -> None:
+    """Play audio, polling so a barge-in can cut it deterministically.
+
+    This executor thread is the ONLY one that stops/closes the playback
+    stream. The event-loop thread only sets :data:`_playback_interrupted`
+    (see :func:`_stop_playback`), so there is never a concurrent PortAudio
+    close — the most likely cause of a mid-barge-in freeze.
+    """
+    _playback_interrupted.clear()
+    stream = None
+    try:
+        sd.play(data, samplerate)
+        stream = sd.get_stream()
+        while stream is not None and stream.active:
+            if _playback_interrupted.is_set():
+                break
+            time.sleep(0.02)
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        _playback_interrupted.clear()
+        if stream is not None:
+            try:
+                stream.abort()
+                stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _stop_playback() -> None:
+    """Request an immediate cut of the current TTS playback.
+
+    Only sets a flag — no PortAudio call runs on the event-loop thread.
+    The ``_play`` poll loop (in its executor thread) notices within ~20ms
+    and is the sole thread that aborts/closes the stream. ``play()``/``rec()``
+    streams are independent of ``InputStream`` instances anyway, so the mic
+    (recording the interrupting utterance) is never touched.
+    """
+    _playback_interrupted.set()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -397,16 +484,46 @@ class StreamingSpeaker:
     async def drain(self) -> None:
         """Stop the player and block until all queued audio has finished."""
         async with self._get_lock():
-            if self._player is None or self._player.done():
+            player = self._player
+            if player is None or player.done():
                 # Player only exits via the sentinel, so a done player means
                 # every queued sentence already played — nothing to discard.
                 self._player = None
                 self._queue = None
                 return
             await self._queue.put(None)
-            await self._player
+            try:
+                await player
+            except asyncio.CancelledError:
+                # Barge-in: the player was interrupted mid-playback. The
+                # audio is already cut, so treat the drain as complete.
+                pass
             self._player = None
             self._queue = None
+
+    def interrupt(self) -> None:
+        """Cut playback immediately and discard everything queued.
+
+        Safe to call from the event-loop thread. Cancels the player task,
+        cancels any queued synthesis tasks and stops the active playback
+        stream — leaving the mic's input stream (which is recording the
+        interrupting utterance) untouched.
+        """
+        _stop_playback()
+        player = self._player
+        self._player = None
+        queue = self._queue
+        self._queue = None
+        if player is not None and not player.done():
+            player.cancel()
+        if queue is not None:
+            while True:
+                try:
+                    item = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if item is not None:
+                    item.cancel()
 
 
 class TTSHandler:
@@ -433,10 +550,22 @@ class TTSHandler:
         self._visible = ""
         self._session_id = "default"
         self._started = False
+        # Set on barge-in; while True, any already-in-flight streaming
+        # chunks of the interrupted turn are discarded instead of spoken.
+        # Cleared by the next TranscriptReady (the interrupting utterance),
+        # whose own response must be spoken normally.
+        self._discard_until_next_turn = False
+        # False-interruption recovery: the unspoken tail captured when a
+        # barge-in cut playback. If no real user transcript arrives within
+        # FALSE_INTERRUPTION_TIMEOUT the interruption was noise — resume it.
+        self._resume_text = ""
+        self._resume_task: asyncio.Task | None = None
 
     def register(self) -> None:
         self._bus.subscribe(PartialResponse, self.on_partial)
         self._bus.subscribe(ResponseReady, self.on_response_ready)
+        self._bus.subscribe(UserInterrupted, self.on_barge_in)
+        self._bus.subscribe(TranscriptReady, self.on_transcript_ready)
 
     async def warmup(self) -> None:
         """Pre-load the local Kokoro model so the first real synthesis
@@ -465,6 +594,9 @@ class TTSHandler:
 
     async def on_partial(self, event: PartialResponse) -> None:
         async with self._get_utterance_lock():
+            if self._discard_until_next_turn:
+                # Stale streaming chunk from the turn the user barged in on.
+                return
             if event.done:
                 # Stream ended. Do NOT flush the buffered fragment here —
                 # ResponseReady follows immediately with the authoritative
@@ -480,6 +612,10 @@ class TTSHandler:
 
     async def on_response_ready(self, event: ResponseReady) -> None:
         async with self._get_utterance_lock():
+            if self._discard_until_next_turn:
+                # Authoritative tail of the interrupted turn. State is already
+                # reset by on_barge_in — just close out quietly.
+                return
             if not event.text or not event.text.strip():
                 # Nothing to say — still close out an in-flight utterance so
                 # the state machine can never get stuck in SPEAKING.
@@ -526,6 +662,75 @@ class TTSHandler:
                 await self._speak_complete_sentences()
             await self._flush_remainder()
             await self._finish_utterance(event.session_id)
+
+    async def on_barge_in(self, event: UserInterrupted) -> None:
+        """The user started speaking over the assistant — cut the audio.
+
+        Deliberately does NOT take the utterance lock: an ``on_response_ready``
+        may currently be blocked inside ``drain()`` waiting on the player
+        task, and this handler has to be able to cancel that task. Stopping
+        the player unblocks the drain, which then releases the lock so the
+        interrupted response's tail can never be spoken over the user's
+        new turn.
+
+        The unspoken tail is kept as :attr:`_resume_text`: if no real user
+        transcript materialises within :data:`FALSE_INTERRUPTION_TIMEOUT`,
+        the interruption was false (noise) and :meth:`_resume_if_no_turn`
+        speaks it — the conversation is not left dead.
+        """
+        resume_text = self._buf
+        self._speaker.interrupt()
+        self._buf = ""
+        self._visible = ""
+        self._started = False
+        self._discard_until_next_turn = True
+        if self._resume_task is not None and not self._resume_task.done():
+            self._resume_task.cancel()
+        self._resume_text = resume_text
+        if resume_text and len(resume_text.strip()) > 2:
+            self._resume_task = asyncio.create_task(
+                self._resume_if_no_turn(), name="tts_false_interruption_resume"
+            )
+        else:
+            self._resume_task = None
+        audio_state.interrupt()
+        self._bus.emit(
+            AssistantStateChanged(state=AssistantState.IDLE, session_id=self._session_id)
+        )
+
+    async def on_transcript_ready(self, event: TranscriptReady) -> None:
+        """A new user utterance has begun — the interrupted turn's stale
+        streaming chunks are no longer possible, so accept responses again."""
+        if self._discard_until_next_turn:
+            self._discard_until_next_turn = False
+            # A real user turn materialised, so the interruption was genuine:
+            # cancel any pending false-interruption resume and stop its audio
+            # so it can't overlap the response to the new utterance.
+            if self._resume_task is not None:
+                if not self._resume_task.done():
+                    self._resume_task.cancel()
+                    self._speaker.interrupt()
+                self._resume_task = None
+            self._resume_text = ""
+
+    async def _resume_if_no_turn(self) -> None:
+        """Speak the unspoken tail if the interruption turned out to be false.
+
+        Fires after :data:`FALSE_INTERRUPTION_TIMEOUT` of silence with no new
+        user transcript (the interruption was noise, not a real barge-in).
+        Cancelled by :meth:`on_transcript_ready` the moment a real turn lands.
+        """
+        try:
+            await asyncio.sleep(FALSE_INTERRUPTION_TIMEOUT)
+            text = self._resume_text.strip()
+            self._resume_text = ""
+            if not text or len(text) <= 2:
+                return
+            await self._mark_speaking()
+            await self._speaker.push(text)
+            await self._finish_utterance(self._session_id)
+        finally:
+            self._resume_task = None
 
     # ── Internals ────────────────────────────────────────────────────────────
 

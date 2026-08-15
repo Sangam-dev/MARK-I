@@ -94,6 +94,28 @@ class PartialTranscriptReady(BaseEvent):
 
 
 @dataclass(frozen=True)
+class UserInterrupted(BaseEvent):
+    """
+    Event fired when the user barges in while the assistant is speaking.
+
+    The voice path detects speech onset while TTS audio is still in the
+    air (barge-in, via echo-cancelled mic input) and cuts the assistant's
+    playback. Consumers use this to unwind the interrupted turn:
+
+    * output/tts.py stops playback, resets its utterance state and
+      releases the speaking gate.
+    * reasoning/coordinator.py cancels the in-flight generation so no
+      further ``PartialResponse``/``ResponseReady`` for the pre-barge-in
+      turn can be spoken over the user's new turn.
+
+    emitted by: input/stt.py (VAD onset while speaking)
+    consumed by: output/tts.py, reasoning/coordinator.py
+    """
+
+    text: str = ""
+
+
+@dataclass(frozen=True)
 class IntentIdentified(BaseEvent):
     """
     Event triggered when an intent is identified.
@@ -457,7 +479,7 @@ class SystemMonitorAlert(BaseEvent):
     Event triggered when the background SystemMonitorLoop detects a metric
     crossing a configured threshold.
 
-    The ``text`` field carries the same ``[SYSTEM_ALERT] …`` phrasing that
+    The ``text`` field carries the same natural-language phrasing that
     ``actions.system_monitor.SystemMonitor.check()`` returns, so the bridge
     to ``ResponseReady`` (which feeds TTS and the console formatter) is a
     one-line copy.

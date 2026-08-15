@@ -60,6 +60,7 @@ from core.events import (
     TaskResultReady,
     TextInputReceived,
     TranscriptReady,
+    UserInterrupted,
 )
 from memory.activity_memory import ActivityMemory
 from memory.manager import MemoryManager
@@ -171,6 +172,12 @@ PREEMPTIVE_REUSE_WAIT_S = float(os.getenv("KANCHA_PREEMPTIVE_REUSE_WAIT_S", "0.2
 # snapshot. Lower = more reuse but answers more often from an incomplete
 # request; higher = safer but less reuse.
 PREEMPTIVE_MIN_COVERAGE = float(os.getenv("KANCHA_PREEMPTIVE_MIN_COVERAGE", "0.7"))
+# Re-armed preemption: when a later snapshot of the SAME utterance adds at
+# least this many new words over the partial we last speculated on, the
+# coordinator supersedes its in-flight (or parked) guess with a fresh one
+# generated from the fuller text. Word-set difference, so ASR rewording of
+# already-seen words does not trigger a pointless re-arm.
+PREEMPTIVE_REARM_WORDS = int(os.getenv("KANCHA_PREEMPTIVE_REARM_WORDS", "2"))
 
 
 class _PreemptiveGuess:
@@ -282,6 +289,19 @@ def _is_partial_prefix(partial: str, final: str, min_coverage: float) -> bool:
     if fa[: len(pa)] != pa:
         return False
     return len(pa) / len(fa) >= min_coverage
+
+
+def _partial_grew(prev: str, current: str, min_new_words: int) -> bool:
+    """True when *current* adds at least ``min_new_words`` words over *prev*.
+
+    Uses the word-set *difference* (after the same normalisation as the
+    transcript validators) rather than a raw length delta, so an ASR that
+    reworded a clause without adding content does not spuriously re-arm a
+    preemptive guess.
+    """
+    wp = set(_normalise_word_list(prev))
+    wc = set(_normalise_word_list(current))
+    return len(wc - wp) >= min_new_words
 
 
 def _controller_instructions() -> str:
@@ -464,6 +484,10 @@ class ReasoningCoordinator:
         # session_id -> the in-flight guess task, so the authoritative turn
         # can await it briefly or cancel it.
         self._preemptive_tasks: dict[str, asyncio.Task] = {}
+        # session_id -> (gen, last partial we spawned a guess for). Enables
+        # re-armed preemption: a later snapshot of the SAME utterance that
+        # grew enough supersedes the earlier guess (see on_partial_transcript).
+        self._preemptive_partials: dict[str, tuple[int, str]] = {}
         # session_id -> monotonic utterance counter. Bumped on every user
         # turn; each guess is tagged with the generation it fired for, so a
         # late-arriving guess can never be misattributed to a later turn.
@@ -471,6 +495,10 @@ class ReasoningCoordinator:
         # Fire-and-forget tasks we must keep referenced (memory persist
         # moved off the critical path).
         self._bg_tasks: set[asyncio.Task] = set()
+        # The task running the current user turn. Captured in on_user_input
+        # so a barge-in (UserInterrupted) can cancel the in-flight LLM
+        # generation and stop its partials from being spoken over the user.
+        self._turn_task: asyncio.Task | None = None
 
     def register(self) -> None:
         """Subscribe the controller to user input and to task results.
@@ -483,6 +511,7 @@ class ReasoningCoordinator:
         self.bus.subscribe(TranscriptReady, self.on_user_input)
         self.bus.subscribe(PartialTranscriptReady, self.on_partial_transcript)
         self.bus.subscribe(TaskResultReady, self.on_task_result)
+        self.bus.subscribe(UserInterrupted, self.on_user_interrupted)
 
     # ── Entry point: the user says something ──────────────────────────────────
 
@@ -493,6 +522,7 @@ class ReasoningCoordinator:
             return
 
         session_id = event.session_id
+        self._turn_task = asyncio.current_task()
 
         # This is now the authoritative turn. Bump the utterance generation
         # and lift any preemptive state for it — a parked (or still
@@ -501,6 +531,7 @@ class ReasoningCoordinator:
         self._utterance_gen[session_id] = gen
         guess_task = self._preemptive_tasks.pop(session_id, None)
         parked = self._preemptive.pop(session_id, None)
+        self._preemptive_partials.pop(session_id, None)
 
         self._response_stream_finished.clear()
         # A new utterance starts a fresh chain budget.
@@ -542,6 +573,19 @@ class ReasoningCoordinator:
         ):
             self._maybe_resume_open_task(text, session_id)
 
+    async def on_user_interrupted(self, event: UserInterrupted) -> None:
+        """The user barged in while the assistant was speaking.
+
+        Cancel the in-flight generation of the interrupted turn. Its
+        ``finally`` still releases the stream/thinking gates, and stopping
+        it means no further ``PartialResponse``/``ResponseReady`` for that
+        turn can be spoken over the user's new utterance. The barge-in's
+        own transcript becomes the next authoritative turn as usual.
+        """
+        task = self._turn_task
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
     # ── Preemptive generation ───────────────────────────────────────────────
 
     async def on_partial_transcript(
@@ -563,11 +607,19 @@ class ReasoningCoordinator:
             return
 
         gen = self._utterance_gen.get(session_id, 0)
-        parked = self._preemptive.get(session_id)
-        if isinstance(parked, _PreemptiveGuess) and parked.gen == gen:
-            return  # already generated for this utterance
 
-        # Supersede any in-flight guess from an earlier utterance.
+        # Re-armed preemption: within the SAME utterance, a later (fuller)
+        # partial supersedes the previous guess only when the interim ASR
+        # caught at least PREEMPTIVE_REARM_WORDS new words. Anything less
+        # is a reword or truncation of what we already guessed on.
+        last = self._preemptive_partials.get(session_id)
+        if last is not None and last[0] == gen:
+            if not _partial_grew(last[1], text, PREEMPTIVE_REARM_WORDS):
+                return
+        self._preemptive_partials[session_id] = (gen, text)
+
+        # Supersede any in-flight guess — whether from an earlier utterance
+        # or (re-arm) from this one's previous snapshot.
         prior = self._preemptive_tasks.pop(session_id, None)
         if prior is not None and not prior.done():
             prior.cancel()

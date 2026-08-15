@@ -27,16 +27,21 @@ function startBackend() {
         console.log("[AURA] AURA_SKIP_BACKEND_SPAWN=1 — not spawning backend, expecting it to already be running");
         return;
     }
-    console.log(`[AURA] starting backend: uv run uvicorn api.server:app --port ${BACKEND_PORT}  (cwd=${BACKEND_DIR})`);
+    console.log(`[AURA] starting backend: uv run python scripts/run_backend.py --port ${BACKEND_PORT}  (cwd=${BACKEND_DIR})`);
+    // `detached: true` makes the backend its own process group (Linux), so a
+    // `process.kill(-pid)` in stopBackend() can kill the WHOLE tree — the `uv`
+    // wrapper, the python launcher/uvicorn, and any grandchild — instead of
+    // just the `uv` process, whose python uvicorn child used to survive,
+    // orphaned, and hold the port until the next launch hit EADDRINUSE.
     backendProcess = spawn("uv", [
         "run",
-        "uvicorn",
-        "api.server:app",
+        "python",
+        "scripts/run_backend.py",
         "--host",
         "127.0.0.1",
         "--port",
         BACKEND_PORT,
-    ], { cwd: BACKEND_DIR, stdio: "inherit" });
+    ], { cwd: BACKEND_DIR, stdio: "inherit", detached: process.platform !== "win32" });
     backendProcess.on("error", (err) => {
         // Most common cause: `uv` is not on PATH. The renderer's WebSocket client
         // (src/app/lib/wsClient.ts) will keep retrying regardless, so the UI
@@ -50,10 +55,22 @@ function startBackend() {
     });
 }
 function stopBackend() {
-    if (backendProcess && !backendProcess.killed) {
-        console.log("[AURA] stopping backend");
-        backendProcess.kill();
+    if (!backendProcess || backendProcess.killed)
+        return;
+    console.log("[AURA] stopping backend");
+    if (process.platform !== "win32" && backendProcess.pid) {
+        // Negative pid = the whole process group (see startBackend's detached
+        // spawn). This is what actually reaches the python uvicorn.
+        try {
+            process.kill(-backendProcess.pid, "SIGTERM");
+            return;
+        }
+        catch (err) {
+            // Fall through to killing just the direct child.
+            console.warn("[AURA] group kill failed, killing direct child:", err);
+        }
     }
+    backendProcess.kill();
 }
 const FULL_W = 900, FULL_H = 900;
 const COMP_W = 120, COMP_H = 120, COMP_MARGIN = 15;

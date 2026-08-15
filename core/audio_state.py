@@ -5,7 +5,7 @@ import asyncio
 import time
 
 
-DEFAULT_TTS_COOLDOWN_SECS = 0.8
+DEFAULT_TTS_COOLDOWN_SECS = 0.3
 
 
 class AudioState:
@@ -63,6 +63,19 @@ class AudioState:
         if self._active_speakers == 0:
             self._quiet_until = time.monotonic() + self._tts_cooldown_secs
             self.tts_active.clear()
+
+    def interrupt(self) -> None:
+        """Cut all assistant output immediately and release the mic gates.
+
+        Called on user barge-in. TTS playback is cut and both the speaking
+        gate and the post-speech cooldown are cleared so the mic capture of
+        the *interrupting* utterance is never dropped. Resetting the speaker
+        count also makes any later :meth:`speaking_finished` a no-op, so a
+        response that finishes after the barge-in cannot re-block the mic.
+        """
+        self._active_speakers = 0
+        self._quiet_until = 0.0
+        self.tts_active.clear()
 
     def thinking_started(self) -> None:
         """Mark that a user turn is being reasoned about.

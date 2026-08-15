@@ -3,7 +3,7 @@
 Owns a single asyncio task that wakes every ``interval_s`` seconds, calls
 ``monitor.check()`` on a worker thread (``psutil`` calls are blocking), and
 emits ``SystemMonitorAlert`` on the EventBus whenever the check returns a
-non-empty ``[SYSTEM_ALERT] …`` string.
+non-empty alert string.
 
 Subscribes to **nothing** — the loop is purely an emitter. The hop from
 ``SystemMonitorAlert`` to ``ResponseReady`` (which TTS and the console

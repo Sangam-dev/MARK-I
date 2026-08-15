@@ -137,7 +137,7 @@ def get_system_status() -> dict:
 class SystemMonitor:
     """
     Stateful monitor — cooldown state persists across session reconnections.
-    Call check() periodically; returns a [SYSTEM_ALERT] string or None.
+    Call check() periodically; returns a natural-language alert string or None.
     """
 
     def __init__(self, thresholds: dict | None = None):
@@ -166,9 +166,9 @@ class SystemMonitor:
             self._cpu_streak += 1
             if self._cpu_streak >= _CPU_STREAK and self._can_alert("cpu"):
                 alerts.append(
-                    f"[SYSTEM_ALERT] CPU usage has been critically high ({cpu:.0f}%) "
-                    "for several seconds. Warn the user in their language and suggest "
-                    "closing heavy applications."
+                    f"Your CPU usage has been critically high at {cpu:.0f}% "
+                    "for several seconds. Consider closing heavy applications "
+                    "to bring it down."
                 )
                 self._record("cpu")
                 self._cpu_streak = 0
@@ -177,23 +177,21 @@ class SystemMonitor:
 
         if ram >= self.thresholds["ram"] and self._can_alert("ram"):
             alerts.append(
-                f"[SYSTEM_ALERT] RAM is at {ram:.0f}% — nearly exhausted. "
-                "Warn the user in their language and suggest freeing memory."
+                f"Your RAM is nearly exhausted at {ram:.0f}%. "
+                "Consider freeing up some memory."
             )
             self._record("ram")
 
         if temp > 0 and temp >= self.thresholds["temp"] and self._can_alert("temp"):
             alerts.append(
-                f"[SYSTEM_ALERT] CPU temperature is {temp:.0f}°C — above the safe limit. "
-                "Warn the user in their language and advise reducing system load "
-                "or checking cooling."
+                f"Your CPU temperature is {temp:.0f}°C, which is above the "
+                "safe limit. Consider reducing system load or checking the cooling."
             )
             self._record("temp")
 
         if gpu >= 0 and gpu >= self.thresholds["gpu"] and self._can_alert("gpu"):
             alerts.append(
-                f"[SYSTEM_ALERT] GPU load is at {gpu:.0f}%. "
-                "Briefly inform the user in their language."
+                f"GPU load is at {gpu:.0f}%. Just letting you know."
             )
             self._record("gpu")
 
