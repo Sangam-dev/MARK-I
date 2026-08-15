@@ -95,6 +95,7 @@ no code fences.
 7. If the request is a single atomic action (e.g. "open firefox"), produce a single task with empty depends_on.
 8. NEVER invent tool names or arguments that aren't in the catalog.
 9. Maximum 8 tasks per plan. If the user asks for more, split into a single plan and the Executor will replan on failure.
+10. URLs (http://, https:// or www.) are opened with `open_app` / `open_application` in the browser — NEVER with `system`/`open_path` (files and folders only), and never with `file_operation`.
 
 Respond with raw JSON only.
 """

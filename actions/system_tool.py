@@ -30,6 +30,11 @@ _SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._+-]*$")
 
 _MAX_OUTPUT_CHARS = 4000
 
+# http(s):// or bare www. — a web address, not a filesystem path. The
+# default handler (xdg-open) opens these natively, so open_path accepts
+# them without an existence check.
+_URL_RE = re.compile(r"^(?:https?://|www\.)", re.IGNORECASE)
+
 
 # ── Results ───────────────────────────────────────────────────────────────
 
@@ -100,7 +105,7 @@ ACTIONS: dict[str, ActionSpec] = {
     ),
     "open_path": ActionSpec(
         name="open_path",
-        summary="Open a file or directory in its default handler (target=path).",
+        summary="Open a file, directory or URL in its default handler (target=path or url).",
         binaries=("xdg-open",),
     ),
     "wifi": ActionSpec(
@@ -544,9 +549,20 @@ class SystemTool:
     async def _handle_open_path(
         self, spec: ActionSpec, params: dict[str, Any]
     ) -> SystemToolResult:
-        path = _require_existing_path(params.get("target") or params.get("path"), "target")
+        raw = str(params.get("target") or params.get("path") or "").strip()
+        if not raw:
+            raise ArgumentError("'target' is required")
+
+        # xdg-open (and the platform default handlers) open URLs natively,
+        # so a URL is passed through untouched; anything else must resolve
+        # to a real filesystem path before a command is built.
+        if _URL_RE.match(raw):
+            target = raw
+        else:
+            target = _require_existing_path(raw, "target")
+
         binary = self._resolve_binary(spec)
-        argv = [binary, str(path)]
+        argv = [binary, str(target)]
 
         if self._run is run_argv:
             # xdg-open does NOT exit while the application it launched is
@@ -566,12 +582,12 @@ class SystemTool:
                     success=False, error=str(exc), action=spec.name
                 )
             return SystemToolResult(
-                success=True, output=f"Opened {path}.", action=spec.name
+                success=True, output=f"Opened {target}.", action=spec.name
             )
 
         # An injected runner (tests) captures the argv instead of
         # spawning — keep that contract.
-        return await self._exec(spec, argv, success_output=f"Opened {path}.")
+        return await self._exec(spec, argv, success_output=f"Opened {target}.")
 
     # ── networking ────────────────────────────────────────────────────
 
