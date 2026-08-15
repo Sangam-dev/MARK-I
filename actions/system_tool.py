@@ -546,9 +546,32 @@ class SystemTool:
     ) -> SystemToolResult:
         path = _require_existing_path(params.get("target") or params.get("path"), "target")
         binary = self._resolve_binary(spec)
-        return await self._exec(
-            spec, [binary, str(path)], success_output=f"Opened {path}."
-        )
+        argv = [binary, str(path)]
+
+        if self._run is run_argv:
+            # xdg-open does NOT exit while the application it launched is
+            # still open, so waiting on it (the generic _exec path) times
+            # out, kills the child, and reports every open as a failure
+            # that then retries. Launch it detached — its own session, no
+            # pipes to hold — and report success immediately.
+            try:
+                await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                return SystemToolResult(
+                    success=False, error=str(exc), action=spec.name
+                )
+            return SystemToolResult(
+                success=True, output=f"Opened {path}.", action=spec.name
+            )
+
+        # An injected runner (tests) captures the argv instead of
+        # spawning — keep that contract.
+        return await self._exec(spec, argv, success_output=f"Opened {path}.")
 
     # ── networking ────────────────────────────────────────────────────
 

@@ -2,6 +2,8 @@ import os
 import re
 import shutil
 import platform
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
 
@@ -244,6 +246,288 @@ def _format_size(b: int) -> str:
         b /= 1024
     return f"{b:.1f} TB"
 
+
+# ── Fuzzy name resolution ───────────────────────────────────────────────
+#
+# Finding things by *spoken* names — "the study plan file", "our project"
+# — is a token-match problem, not a substring one: "study plan" will never
+# be a substring of "final_assessment_study_plan.md". The old find matched
+# ``name.lower() in item.name.lower()`` and therefore missed every fuzzy
+# reference, which is what turned one "open the study plan" request into a
+# three-turn find/open saga. This section indexes a root once (cached,
+# bounded) and ranks candidates by token overlap, with recently-touched
+# files weighted higher — the things people ask about are the things they
+# just built.
+
+# Directories that never hold something a user wants located by name:
+# VCS internals, dependency trees, virtualenvs and build caches.
+_INDEX_EXCLUDED_DIRS = frozenset(
+    {
+        ".git", ".hg", ".svn", ".bzr", "node_modules", ".venv", "venv",
+        "env", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+        ".cache", ".local", ".config", ".idea", ".vscode", "dist", "build",
+        ".next", ".turbo", ".nuxt", "coverage", "htmlcov", ".tox",
+        "site-packages", "jarvis_frontend/electron-out", "electron-out",
+    }
+)
+
+# Tokens that carry no distinguishing signal in a spoken file name.
+_FIND_STOPWORDS = frozenset(
+    {
+        "the", "a", "an", "my", "our", "your", "his", "her", "its",
+        "their", "of", "in", "on", "at", "for", "to", "with", "by",
+        "from", "into", "inside", "under", "over", "and", "or", "file",
+        "files", "folder", "folders", "directory", "dir", "document",
+        "documents", "project", "projects", "thing", "things", "one",
+        "some", "called", "named", "which", "that", "this", "please",
+    }
+)
+
+# Index entries go stale as builds land new files, so cache briefly.
+_INDEX_TTL_S = 10.0
+_MAX_INDEX_DIRS = 2000
+_MAX_INDEX_ENTRIES = 6000
+_MAX_INDEX_DEPTH = 5
+
+# Below this a match is noise, not a hit: "study plan" against a paper
+# that merely lives in the same folder scores ~0.25 and must not flood a
+# find listing.
+_FIND_MIN_SCORE = 0.30
+
+#: Above this score a fuzzy match is treated as "the thing" and used
+#: without asking; above the floor but below it, the caller offers the
+#: top candidates instead of guessing.
+_RESOLVE_CONFIDENT = 0.55
+_RESOLVE_AMBIGUOUS = 0.30
+
+
+@dataclass(slots=True)
+class _IndexedEntry:
+    path: Path
+    name: str
+    stem_tokens: tuple[str, ...]
+    dir_tokens: tuple[str, ...]
+    mtime: float
+    is_dir: bool = False
+    size: int = 0
+
+
+# root -> (built_at, entries)
+_index_cache: dict[Path, tuple[float, list[_IndexedEntry]]] = {}
+
+
+def _tokenize(text: str) -> tuple[str, ...]:
+    """Meaningful lowercase tokens from *text* — no stopwords, no single
+    letters, no punctuation. Splitting on non-alphanumerics is what lets
+    "study plan" and "final_assessment_study_plan.md" share tokens."""
+    return tuple(
+        t
+        for t in re.findall(r"[a-z0-9]+", (text or "").lower())
+        if len(t) > 1 and t not in _FIND_STOPWORDS
+    )
+
+
+def _make_index_entry(path: Path, stat: os.stat_result, *, is_dir: bool) -> _IndexedEntry:
+    stem = path.name.rsplit(".", 1)[0] if not is_dir else path.name
+    dir_tokens = _tokenize(path.parent.name) if not is_dir else ()
+    return _IndexedEntry(
+        path=path,
+        name=path.name,
+        stem_tokens=_tokenize(stem),
+        dir_tokens=dir_tokens,
+        mtime=stat.st_mtime,
+        is_dir=is_dir,
+        size=stat.st_size,
+    )
+
+
+def _index_root(root: Path) -> list[_IndexedEntry]:
+    """Recursively index *root*, cached for a few seconds.
+
+    The walk prunes excluded directories (``node_modules``, ``.git``,
+    virtualenvs, build output) so indexing home does not descend into
+    megabytes of dependencies, and caps both directory count and entry
+    count so a cold walk stays bounded.
+    """
+    root = root.resolve()
+    now = time.time()
+    cached = _index_cache.get(root)
+    if cached is not None and now - cached[0] < _INDEX_TTL_S:
+        return cached[1]
+
+    entries: list[_IndexedEntry] = []
+    dirs_seen = 0
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            # Hidden entries are lock files, editor swaps and config
+            # noise — never what a spoken name points at.
+            dirnames[:] = sorted(
+                d
+                for d in dirnames
+                if d not in _INDEX_EXCLUDED_DIRS and not d.startswith(".")
+            )
+            filenames = [f for f in filenames if not f.startswith(".")]
+            try:
+                depth = len(Path(dirpath).relative_to(root).parts)
+            except ValueError:
+                depth = 0
+            if depth > _MAX_INDEX_DEPTH:
+                dirnames[:] = []
+                continue
+            dirs_seen += 1
+            if dirs_seen > _MAX_INDEX_DIRS:
+                break
+            if depth > 0:
+                try:
+                    entries.append(_make_index_entry(Path(dirpath), os.stat(dirpath), is_dir=True))
+                except OSError:
+                    pass
+            for fname in filenames:
+                if len(entries) >= _MAX_INDEX_ENTRIES:
+                    break
+                try:
+                    fp = Path(dirpath) / fname
+                    entries.append(_make_index_entry(fp, os.stat(fp), is_dir=False))
+                except OSError:
+                    continue
+    except OSError:
+        pass
+
+    _index_cache[root] = (now, entries)
+    return entries
+
+
+def _fuzzy_score(query: tuple[str, ...], entry: _IndexedEntry) -> float:
+    """Rank how well *query* names *entry*, in 0.0..1.0.
+
+    The stem (filename without extension) counts at full weight, the
+    immediate parent directory at half — so "kancha workspace" helps
+    without letting the location drown the name. Files touched in the
+    last day get a 1.3x boost, the last week 1.15x: people ask about what
+    they just built.
+    """
+    if not query:
+        return 0.0
+    q = frozenset(query)
+    stem = frozenset(entry.stem_tokens)
+    dirt = frozenset(entry.dir_tokens)
+
+    hit_stem = len(q & stem)
+    hit_dir = len(q & dirt)
+    weighted = hit_stem + 0.5 * hit_dir
+    if weighted == 0:
+        return 0.0
+
+    recall = weighted / len(q)
+    precision = weighted / max(1.0, len(stem | (dirt & q)))
+    score = 0.6 * recall + 0.4 * precision
+
+    # Every query token lives in the name itself — "study plan" against
+    # study_plan.md. That is the clearest possible hit, floor it high.
+    if q <= stem:
+        score = max(score, 0.85)
+    if q == stem:
+        score = 1.0
+
+    age_days = max(0.0, (time.time() - entry.mtime) / 86400.0)
+    if age_days <= 1.0:
+        score *= 1.3
+    elif age_days <= 7.0:
+        score *= 1.15
+    return min(score, 1.0)
+
+
+def _fuzzy_find(
+    name: str,
+    search_root: Path,
+    *,
+    extension: str = "",
+    max_results: int = 20,
+    include_dirs: bool = False,
+) -> list[_IndexedEntry]:
+    """Ranked matches for *name* under *search_root* (best first)."""
+    query = _tokenize(name)
+    scored: list[tuple[float, _IndexedEntry]] = []
+    for entry in _index_root(search_root):
+        if entry.is_dir and not include_dirs:
+            continue
+        if extension and entry.path.suffix.lower() != extension.lower():
+            continue
+        score = _fuzzy_score(query, entry) if query else 1.0
+        if score < _FIND_MIN_SCORE:
+            continue
+        scored.append((score, entry))
+    scored.sort(key=lambda t: (t[0], t[1].mtime), reverse=True)
+    return [entry for _, entry in scored[:max_results]]
+
+
+def _fuzzy_search_roots() -> list[Path]:
+    """Where a fuzzy name is looked for when the user gave no location:
+    the assistant's own workspace first (that is where delegated builds
+    land), then the standard folders."""
+    roots = [Path.home() / "kancha-workspace"]
+    for name in ("Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos"):
+        roots.append(Path.home() / name)
+    return roots
+
+
+def resolve_fuzzy_name(
+    name: str, *, max_results: int = 3
+) -> tuple[str | None, list[tuple[str, str]]]:
+    """Resolve a spoken *name* to an absolute path.
+
+    Returns ``(path, [])`` when the top match is confident enough to act
+    on, ``(None, [(name, path), ...])`` when several candidates tie (the
+    caller turns those into a clarifying question), and ``(None, [])``
+    when nothing matched — the caller then lets the tool's own not-found
+    message surface.
+    """
+    text = str(name or "").strip()
+    if not text:
+        return None, []
+
+    # A URL is a target, not a *name* — its path tokens ("example.com",
+    # "pdf") only ever match some unrelated file on disk. Leave it to the
+    # tool, same as the executor's open-routing does.
+    if "://" in text or text.startswith("www."):
+        return None, []
+
+    # Already a real path? Not our job — the tool resolves and opens it.
+    try:
+        if _resolve_path(text).exists():
+            return None, []
+    except Exception:  # noqa: BLE001
+        pass
+
+    query = _tokenize(text)
+    if not query:
+        return None, []
+
+    best: list[tuple[float, _IndexedEntry]] = []
+    seen: set[Path] = set()
+    for root in _fuzzy_search_roots():
+        if not root.exists():
+            continue
+        for entry in _index_root(root):
+            if entry.path in seen:
+                continue
+            seen.add(entry.path)
+            score = _fuzzy_score(query, entry)
+            if score <= 0:
+                continue
+            best.append((score, entry))
+
+    if not best:
+        return None, []
+
+    best.sort(key=lambda t: (t[0], t[1].mtime), reverse=True)
+    top = best[0][0]
+    if top >= _RESOLVE_CONFIDENT:
+        return str(best[0][1].path), []
+    if top >= _RESOLVE_AMBIGUOUS:
+        return None, [(e.name, str(e.path)) for _, e in best[:max_results]]
+    return None, []
+
 def _safe_trash(target: Path) -> str:
 
     if not _SEND2TRASH:
@@ -466,32 +750,18 @@ def find_files(name: str = "", extension: str = "",
         if not search_path.exists():
             return f"Search path not found: {path}"
 
-        results    = []
-        dir_count  = 0
-        max_dirs   = 500  # performans + güvenlik limiti
-
-        for item in search_path.rglob("*"):
-            if item.is_dir():
-                dir_count += 1
-                if dir_count > max_dirs:
-                    break
-                continue
-            if not item.is_file():
-                continue
-            if extension and item.suffix.lower() != extension.lower():
-                continue
-            if name and name.lower() not in item.name.lower():
-                continue
-            size = _format_size(item.stat().st_size)
-            results.append(f"📄 {item.name} ({size}) — {item.parent}")
-            if len(results) >= max_results:
-                break
-
-        if not results:
+        matches = _fuzzy_find(
+            name, search_path, extension=extension, max_results=max_results
+        )
+        if not matches:
             query = name or extension or "files"
             return f"No {query} found in {search_path.name}/"
 
-        return f"Found {len(results)} file(s):\n" + "\n".join(results)
+        lines = [
+            f"📄 {entry.name} ({_format_size(entry.size)}) — {entry.path.parent}"
+            for entry in matches
+        ]
+        return f"Found {len(matches)} file(s):\n" + "\n".join(lines)
 
     except Exception as e:
         return f"Search error: {e}"

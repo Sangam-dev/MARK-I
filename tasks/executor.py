@@ -9,7 +9,7 @@ from typing import Any
 from actions.alarms import cancel_alarms, list_alarms, set_alarm
 from actions.apps import open_app
 from actions.desktop_control import desktop_control
-from actions.file_controller import file_controller
+from actions.file_controller import file_controller, resolve_fuzzy_name
 from actions.gmail_tool import get_shared_gmail_tool
 from actions.system_commands import SystemCommandExecutor
 from actions.system_monitor import (
@@ -27,6 +27,32 @@ from core.events import TaskCompleted, TaskExecutionRequested
 from tasks.registry import TASK_REGISTRY, validate_task
 
 logger = logging.getLogger("kancha.tasks.executor")
+
+# file_operation has NO 'open' action (planning/prompts.py rule 4d), but
+# the Task LLM still occasionally emits one — route it to the `system`
+# tool instead of failing with "Unknown action: 'open_path'".
+_OPEN_ALIASES = frozenset({"open", "open_path", "open_file", "open_folder"})
+
+
+def _resolve_open_target(
+    params: dict[str, Any],
+) -> tuple[str | None, list[tuple[str, str]] | None]:
+    """Best-effort fuzzy resolution for an ``open_path`` target.
+
+    Returns ``(path, None)`` when confident, ``(None, candidates)`` when
+    several files tie (the caller replies with the list instead of
+    guessing), and ``(None, None)`` to leave the request untouched — the
+    tool then answers with its normal not-found message.
+    """
+    target = str(params.get("target") or params.get("path") or "").strip()
+    if not target or "://" in target or target.startswith("www."):
+        return None, None  # nothing to resolve, or a URL rather than a name
+    path, candidates = resolve_fuzzy_name(target)
+    if path:
+        return path, None
+    if candidates:
+        return None, candidates
+    return None, None
 
 _FILE_FAILURE_RE = re.compile(
     r"^(?:access denied|path not found|not a directory|permission denied|"
@@ -285,6 +311,8 @@ class TaskExecutor:
             # Pass the whole param dict, not just the name: `target` is
             # what makes "open kancha in vscode" open the project rather
             # than an empty editor window.
+            params = dict(params)
+            params = self._resolve_project_target(params)
             result = await asyncio.to_thread(open_app, params)
             return TaskExecutionResult(result.success, result.message)
 
@@ -315,6 +343,23 @@ class TaskExecutor:
         # "no handler" result at the bottom of this method.
 
         if task_name == "file_operation":
+            action = str(params.get("action") or "").strip().lower()
+            if action in _OPEN_ALIASES:
+                # Rule 4d: opens belong to `system`, but the Task LLM
+                # still occasionally emits file_operation — route it so
+                # the request succeeds instead of dying on an unknown
+                # action.
+                logger.info(
+                    "file_operation action=%r is an open — routing to system/open_path",
+                    action,
+                )
+                open_params: dict[str, Any] = {"action": "open_path"}
+                for key in ("target", "path"):
+                    if params.get(key):
+                        open_params[key] = str(params[key])
+                if not open_params.get("target"):
+                    open_params["target"] = str(params.get("name") or "")
+                return await self._dispatch("system", open_params)
             result_text = await asyncio.to_thread(file_controller, params)
             return TaskExecutionResult(
                 not _FILE_FAILURE_RE.match(result_text.strip()),
@@ -378,6 +423,24 @@ class TaskExecutor:
             # SystemTool is already async (asyncio.create_subprocess_exec),
             # so no to_thread hop here. It returns a structured result;
             # this layer flattens it into the executor's success/message.
+            params = dict(params)
+            # A spoken name that is not a real path yet ("open the study
+            # plan file") gets resolved to an absolute path before the
+            # tool refuses it — SystemTool only opens existing paths by
+            # design.
+            if str(params.get("action") or "").strip().lower() == "open_path":
+                path, candidates = _resolve_open_target(params)
+                if path:
+                    params["target"] = path
+                elif candidates:
+                    listed = "; ".join(
+                        f"{i + 1}) {name} ({location})"
+                        for i, (name, location) in enumerate(candidates)
+                    )
+                    return TaskExecutionResult(
+                        True,
+                        f"I found a few matches for that: {listed}. Which one should I open?",
+                    )
             result = await get_shared_system_tool().execute(params)
             if result.success:
                 return TaskExecutionResult(True, result.output or "Done.")
@@ -419,9 +482,13 @@ class TaskExecutor:
             # the point of it — so `delegate` starts it in the background
             # and returns; the run is watched via OpenCode's event stream
             # and reported through the `progress` action.
-            result = await get_shared_opencode_tool().execute(
-                self._with_resolved_directory(params)
-            )
+            prepared = self._with_resolved_directory(params)
+            prepared, project_name, summary = self._enrich_with_project_context(prepared)
+            if project_name and summary:
+                await self._index_activity_memory(
+                    summary, str(prepared.get("session_id") or "default")
+                )
+            result = await get_shared_opencode_tool().execute(prepared)
             if result.success:
                 return TaskExecutionResult(True, result.output or "Done.")
             return TaskExecutionResult(False, result.error or "Delegation failed.")
@@ -432,6 +499,102 @@ class TaskExecutor:
         return TaskExecutionResult(False, f"No handler found for task: {task_name}")
 
     # ── agent_task helpers ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _resolve_project_target(params: dict[str, Any]) -> dict[str, Any]:
+        """"Open our previous project in vscode" → target=its root.
+
+        Only kicks in when the target is not already a real path (the
+        file controller would resolve those) and the project registry
+        confidently recognises the name. Unresolved targets pass through
+        untouched, so the existing "no such folder" failure still
+        surfaces.
+        """
+        target = str(params.get("target") or "").strip()
+        if not target:
+            return params
+        try:
+            from actions.file_controller import _resolve_path  # noqa: PLC0415
+
+            if _resolve_path(target).exists():
+                return params
+        except Exception:  # noqa: BLE001
+            return params
+        try:
+            from memory.projects import get_shared_project_store  # noqa: PLC0415
+
+            store = get_shared_project_store()
+            project = store.resolve_project(target)
+        except Exception:  # noqa: BLE001
+            return params
+        if project is None:
+            return params
+        updated = dict(params)
+        updated["target"] = project.root
+        logger.info("open_app target resolved to project '%s' at %s", project.name, project.root)
+        return updated
+
+    @staticmethod
+    def _enrich_with_project_context(
+        params: dict[str, Any],
+    ) -> tuple[dict[str, Any], str | None, str | None]:
+        """Give a delegated agent the context of the project it is asked
+        to continue.
+
+        "continue working on our previous project" reaches OpenCode as a
+        bare sentence and a blank workspace. When the instruction names
+        or implies a project ("previous project", "study plan", a
+        follow-up to the thing we just built), this resolves it, points
+        the agent at its root (unless a directory was already named) and
+        prepends what the project is and what was last done in it — the
+        difference between resuming real work and starting from nothing.
+
+        Returns ``(params, project_name, summary)``; when nothing
+        resolves, ``params`` is returned untouched and the other two are
+        ``None``. The summary is the condensed record for semantic
+        memory. Best-effort: any failure leaves the delegation unchanged.
+        """
+        if str(params.get("action") or "").strip() not in ("delegate", "follow_up"):
+            return params, None, None
+        task = str(params.get("task") or params.get("instruction") or "").strip()
+        if not task:
+            return params, None, None
+        try:
+            from memory.projects import get_shared_project_store  # noqa: PLC0415
+
+            store = get_shared_project_store()
+            project = store.resolve_project(task)
+            if project is None:
+                return params, None, None
+        except Exception:  # noqa: BLE001
+            logger.exception("Project-context enrichment failed — delegating unchanged")
+            return params, None, None
+
+        updated = dict(params)
+        # Point a *new* delegation at the project root. A follow_up must
+        # keep its session's own working directory — moving it would
+        # detach the continuation from the work already in flight.
+        if (
+            str(params.get("action") or "").strip() == "delegate"
+            and not str(updated.get("directory") or "").strip()
+        ):
+            updated["directory"] = project.root
+        updated["task"] = f"{task}\n\n{store.project_context(project)}"
+        try:
+            store.record_activity(
+                str(params.get("session_id") or "default"),
+                task,
+                project=project.name,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not record project activity")
+        summary = store.activity_summary(project, task)
+        logger.info(
+            "agent_task enriched with project context: '%s' at %s",
+            project.name,
+            project.root,
+        )
+        return updated, project.name, summary
 
     @staticmethod
     def _with_resolved_directory(params: dict[str, Any]) -> dict[str, Any]:
@@ -470,6 +633,20 @@ class TaskExecutor:
         updated["directory"] = str(resolved)
         logger.info("agent_task will work in %s (from %r)", resolved, raw)
         return updated
+
+    async def _index_activity_memory(self, summary: str, session: str) -> None:
+        """Best-effort write of a condensed activity record into the
+        isolated semantic store. Never raises, never delays the
+        delegation: a store that is not ready (or fails) just skips."""
+        try:
+            from memory.activity_memory import get_shared_activity_memory  # noqa: PLC0415
+
+            memory = get_shared_activity_memory()
+            if not memory.ready:
+                return
+            await memory.index(summary, session=session)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Project activity index failed (non-fatal): %s", exc)
 
     # ── system_monitor handler ──────────────────────────────────────────────
 

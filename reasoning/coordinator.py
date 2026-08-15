@@ -57,6 +57,7 @@ from core.events import (
     TextInputReceived,
     TranscriptReady,
 )
+from memory.activity_memory import ActivityMemory
 from memory.manager import MemoryManager
 from memory.rag import MemoryRouter, RAGManager, RetrievedChunk
 from memory.token_log import TokenLog
@@ -280,6 +281,7 @@ class ReasoningCoordinator:
         token_log: TokenLog | None = None,
         rag_manager: RAGManager | None = None,
         rag_router: MemoryRouter | None = None,
+        activity_memory: ActivityMemory | None = None,
         ack_delay_s: float | None = None,
     ) -> None:
         self.bus = bus
@@ -291,6 +293,10 @@ class ReasoningCoordinator:
         # that case.
         self.rag_manager = rag_manager
         self.rag_router = rag_router
+        # The isolated project-activity store. Queried separately from
+        # rag_manager and rendered in its own prompt section, so project
+        # history can never crowd conversation memory (and vice versa).
+        self.activity_memory = activity_memory
         # task_id -> the TaskRequested we delegated. Popped when its
         # result comes back; tells us whether the result should be
         # chained (follow_up) or simply reported.
@@ -763,8 +769,14 @@ class ReasoningCoordinator:
         # 2. Retrieve RAG chunks
         retrieved = await self._retrieve_rag_context(retrieval_query, intent_event=None)
 
+        # 2b. Retrieve project activity from its own store (same router
+        # gate, separate index — see _retrieve_activity_context).
+        activity = await self._retrieve_activity_context(retrieval_query)
+
         # 3. Build the system prompt: persona + memory + controller rules
-        system = self._build_system_prompt(memory_event, retrieved, session_id)
+        system = self._build_system_prompt(
+            memory_event, retrieved, session_id, activity_chunks=activity
+        )
 
         # 4. Stream the reply (history already ends with the current turn)
         history = self._get_history()
@@ -942,6 +954,7 @@ class ReasoningCoordinator:
         memory_event: MemoryRetrieved | None,
         retrieved: list[RetrievedChunk] | None = None,
         session_id: str | None = None,
+        activity_chunks: list[RetrievedChunk] | None = None,
     ) -> str:
         """
         Build the system prompt: persona + facts + memory + controller rules.
@@ -953,6 +966,8 @@ class ReasoningCoordinator:
         * **Relevant long-term memory** — semantic chunks from the vector
           store, present only when the Memory Router asked for retrieval
           and something scored above the similarity threshold.
+        * **Recent project activity** — a separate section fed from the
+          isolated activity store; only when the same router gate fires.
         * **Recent action** — what was last delegated and how it went, so
           "try again" / "cancel that" resolve against something concrete.
         * **Controller instructions** — the tool catalog and the rules for
@@ -980,6 +995,10 @@ class ReasoningCoordinator:
         rag_block = self._format_rag_context(retrieved)
         if rag_block:
             parts.append(rag_block)
+
+        activity_block = self._format_activity_context(activity_chunks)
+        if activity_block:
+            parts.append(activity_block)
 
         action_block = self._format_last_task(session_id)
         if action_block:
@@ -1119,6 +1138,72 @@ class ReasoningCoordinator:
             "Ignore anything irrelevant, and never mention that you looked "
             "anything up or refer to these numbered entries."
         )
+
+    def _format_activity_context(
+        self, retrieved: list[RetrievedChunk] | None
+    ) -> str:
+        """Render project-activity chunks into their own prompt section.
+
+        Kept separate from :meth:`_format_rag_context` on purpose:
+        activity records are project-work history, not conversational
+        memory, and the model should treat them as such. The section has
+        its own small budget (activity summaries are short by
+        construction), so project history never eats into the
+        conversation-memory budget either.
+        """
+        if not retrieved:
+            return ""
+
+        budget = 1500
+        lines: list[str] = []
+        used = 0
+        for index, chunk in enumerate(retrieved, start=1):
+            header = (
+                f"[{index}] {chunk.title} "
+                f"(project memory, relevance {chunk.score:.2f})"
+            )
+            entry = f"{header}\n{chunk.content.strip()}"
+            if used + len(entry) > budget:
+                if not lines:
+                    entry = entry[:budget].rstrip() + " […]"
+                else:
+                    break
+            lines.append(entry)
+            used += len(entry)
+
+        if not lines:
+            return ""
+        return (
+            "Recent project activity (from project memory):\n\n"
+            + "\n\n".join(lines)
+        )
+
+    async def _retrieve_activity_context(
+        self, user_input: str
+    ) -> list[RetrievedChunk]:
+        """Retrieve project-activity hits from the isolated store.
+
+        Uses the *same* router gate as the main retrieval, so nothing new
+        is ever queried for messages the router would skip. The two
+        stores are searched independently — activity hits are additive
+        and can never alter what the main store returns.
+        """
+        if self.activity_memory is None or self.rag_router is None:
+            return []
+        try:
+            decision = await self.rag_router.decide(user_input)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Memory router failed (%s) — skipping project memory", exc)
+            return []
+        if not decision.retrieve:
+            return []
+        try:
+            return await self.activity_memory.search(decision.query or user_input)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Project memory retrieval failed (%s) — answering without it", exc
+            )
+            return []
 
     async def _retrieve_rag_context(
         self, user_input: str, intent_event: IntentIdentified | None

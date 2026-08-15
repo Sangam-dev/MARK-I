@@ -55,6 +55,7 @@ from core.events import (
     TranscriptReady,
 )
 from core.system_monitor_loop import SystemMonitorLoop
+from memory.activity_memory import ActivityMemory, set_shared_activity_memory
 from memory.manager import MemoryManager
 from memory.rag import (
     IngestService,
@@ -156,6 +157,11 @@ class Pipeline:
     rag_router: MemoryRouter | None = None
     rag_ingest: IngestService | None = None
     rag_enabled: bool = False
+    # ── Project activity memory (isolated semantic store) ─────────────
+    # A dedicated vector store (its own sqlite file) for condensed
+    # project-activity records. None when RAG is off or its init failed;
+    # ``shutdown_pipeline`` closes it like the main RAG store.
+    activity_memory: ActivityMemory | None = None
     # ── OpenCode (delegated execution layer) ──────────────────────────
     # Config only. The server is started lazily on the first delegation,
     # so an assistant that is never asked to build anything never pays
@@ -312,6 +318,33 @@ async def build_pipeline(
     else:
         logger.info("RAG disabled (KANCHA_RAG_ENABLED=0 or enable_rag=False)")
 
+    # ── Project activity memory (isolated semantic store) ───────────────
+    # Layer 3 of navigation: a dedicated vector store for condensed
+    # project-activity records, in its OWN sqlite file (never the main
+    # vectors.db) so project history can never affect — or be affected by
+    # — conversation/document memory. Best-effort: a failure here only
+    # disables project recall; the coordinator and executor already
+    # null-check.
+    activity_memory: ActivityMemory | None = None
+    if rag_manager is not None:
+        try:
+            activity_memory = ActivityMemory(
+                data_dir=rag_config.data_dir / "activity",
+                base_config=rag_config,
+            )
+            await activity_memory.initialize()
+            set_shared_activity_memory(activity_memory)
+            logger.info(
+                "Project activity memory enabled — store=%s",
+                activity_memory.store_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Project activity memory init failed: %s — continuing without it",
+                exc,
+            )
+            activity_memory = None
+
     # ── OpenCode: delegated execution layer ─────────────────────────────
     # Coding, research and multi-step work go to OpenCode rather than to
     # the assistant's own action system — see agent/__init__.py. Only the
@@ -444,6 +477,7 @@ async def build_pipeline(
         token_log=token_log,
         rag_manager=rag_manager,
         rag_router=rag_router,
+        activity_memory=activity_memory,
     )
     coordinator.register()
 
@@ -524,6 +558,7 @@ async def build_pipeline(
         rag_router=rag_router,
         rag_ingest=rag_ingest,
         rag_enabled=rag_manager is not None,
+        activity_memory=activity_memory,
         opencode=opencode_config,
     )
 
@@ -556,6 +591,13 @@ async def shutdown_pipeline(pipeline: Pipeline, drain_timeout: float = 3.0) -> N
             await pipeline.rag.close()
         except Exception as exc:
             logger.warning("RAG close error (non-fatal): %s", exc)
+
+    if pipeline.activity_memory is not None:
+        try:
+            await pipeline.activity_memory.close()
+        except Exception as exc:
+            logger.warning("Project activity memory close error (non-fatal): %s", exc)
+        set_shared_activity_memory(None)
 
     # Stop delegated runs and the event pump before the transport they
     # both use goes away, then the server subprocess itself. The latter

@@ -271,14 +271,22 @@ def _classify_file_request(cleaned: str) -> ToolDecision | None:
         re.IGNORECASE,
     )
     if match and "file" in lowered:
-        return ToolDecision(
-            task_name="file_operation",
-            parameters={
-                "action": "find",
-                "path": _extract_file_location(cleaned, "home"),
-                "name": match.group("name").strip(),
-            },
-        )
+        # The name group runs to the end of the sentence, so it drags the
+        # location phrase along ("find the study plan file inside the
+        # kancha-workspace directory"). Strip the location and spoken
+        # noise so `name` is the item itself — the fuzzy matcher then
+        # finds final_assessment_study_plan.md for "study plan file".
+        raw = _strip_file_location(match.group("name")).strip(" .")
+        name = re.sub(r"^(?:the|my)\s+", "", raw, flags=re.IGNORECASE).strip()
+        if name:
+            return ToolDecision(
+                task_name="file_operation",
+                parameters={
+                    "action": "find",
+                    "path": _extract_file_location(cleaned, "home"),
+                    "name": name,
+                },
+            )
 
     return None
 
