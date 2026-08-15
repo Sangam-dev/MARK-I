@@ -17,6 +17,7 @@ declare global {
             onEnterCompact: (cb: () => void) => () => void;
             onEnterFull: (cb: () => void) => () => void;
             requestRestore: () => void;
+            requestQuit: () => void;
         };
     }
 }
@@ -1273,6 +1274,30 @@ export default function App() {
             },
         );
 
+        // Backend said "quit" (user asked the assistant to quit/exit). Wait
+        // for the spoken confirmation to finish (assistant returns to
+        // idle/sleeping), then ask the Electron main process to stop the
+        // backend and exit. A fixed cap means we can never hang the app open.
+        let quitArmed = false;
+        const offAppCommand = wsClient.on<{ command: string }>(
+            "app_command",
+            (payload) => {
+                if (payload.command !== "quit" || quitArmed) return;
+                quitArmed = true;
+                console.log("[AURA] backend requested app quit");
+                const DONE_STATES = new Set(["idle", "sleeping"]);
+                const deadline = Date.now() + 8000;
+                const tryQuit = () => {
+                    if (DONE_STATES.has(astateRef.current) || Date.now() >= deadline) {
+                        window.electronAPI?.requestQuit?.();
+                        return;
+                    }
+                    setTimeout(tryQuit, 200);
+                };
+                tryQuit();
+            },
+        );
+
         return () => {
             offOpen();
             offClose();
@@ -1281,6 +1306,7 @@ export default function App() {
             offPartial();
             offResponse();
             offError();
+            offAppCommand();
         };
     }, []);
 

@@ -24,7 +24,6 @@ except ImportError as _groq_err:
 
 load_dotenv()
 
-VOICE = "en-US-AriaNeural"
 SAMPLE_RATE = 16000
 CHUNK_DURATION = 0.03
 CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)  # now actually used as blocksize
@@ -45,7 +44,7 @@ VAD_MODEL_URL = os.getenv(
 # tolerant of natural mid-speech pauses because it is the *trailing* run
 # of silence that ends the turn, not the first dip. Overridable via
 # KANCHA_SILENCE_LIMIT.
-SILENCE_LIMIT = float(os.getenv("KANCHA_SILENCE_LIMIT", "0.4"))
+SILENCE_LIMIT = float(os.getenv("KANCHA_SILENCE_LIMIT", "0.8"))
 MAX_DURATION = 15.0
 MIN_SPEECH_SECS = 0.5
 MAX_HISTORY = 12
@@ -63,7 +62,7 @@ LOW_CONFIDENCE_AUDIO_SECS = 1.2
 # latency. Quality-critical output always comes from the final turbo pass,
 # and the speculative reply is only *reused* when the coordinator validates
 # it against the authoritative transcript.
-PREEMPTIVE_MODEL = os.getenv("KANCHA_PREEMPTIVE_MODEL", "whisper-large-v3-turbo")
+PREEMPTIVE_MODEL = os.getenv("KANCHA_PREEMPTIVE_MODEL", "whisper-large-v3")
 # Fire the snapshot once this much speech has been recorded — early enough
 # that the LLM guess still has the rest of the utterance + endpoint + final
 # Whisper as runway, late enough that the partial usually covers the core
@@ -259,7 +258,7 @@ async def _get_silence_threshold(sample_rate: int, calibrate: bool) -> float:
 # windows so between-word probability dips can't flap the flag.
 class SileroVAD:
     ACTIVATION_THRESHOLD = float(os.getenv("KANCHA_VAD_ACTIVATION", "0.5"))
-    DEACTIVATION_THRESHOLD = float(os.getenv("KANCHA_VAD_DEACTIVATION", "0.35"))
+    DEACTIVATION_THRESHOLD = float(os.getenv("KANCHA_VAD_DEACTIVATION", "0.2"))
     WINDOW = 512
     CONTEXT = 64
     # Number of inference windows averaged into the decision.
@@ -741,7 +740,7 @@ async def transcribe(audio: np.ndarray) -> str:
 
     result = await asyncio.to_thread(
         client.audio.transcriptions.create,
-        model="whisper-large-v3-turbo",
+        model="whisper-large-v3",
         file=("audio.wav", wav_bytes, "audio/wav"),
         language="en",
     )

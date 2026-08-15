@@ -17,7 +17,8 @@
     "productName": "AURA",
     "files": [
       "dist/**/*",
-      "electron-out/**/*"
+      "electron-out/**/*",
+      "electron/icon.png"
     ],
     "linux": {
       "target": [

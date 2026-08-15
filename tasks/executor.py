@@ -23,7 +23,7 @@ from actions.web_search import web_search
 from actions.youtube_video import youtube_video
 from agent.tool import get_shared_opencode_tool
 from core.bus import EventBus
-from core.events import TaskCompleted, TaskExecutionRequested
+from core.events import AppQuitRequested, TaskCompleted, TaskExecutionRequested
 from tasks.registry import TASK_REGISTRY, validate_task
 
 logger = logging.getLogger("kancha.tasks.executor")
@@ -273,7 +273,9 @@ class TaskExecutor:
             return
 
         try:
-            result = await self._dispatch(event.task_name, dict(event.parameters))
+            result = await self._dispatch(
+                event.task_name, dict(event.parameters), event.session_id
+            )
         except Exception as exc:
             logger.exception("Task %s failed with exception", event.task_name)
             await self._bus.emit_and_wait(
@@ -303,7 +305,7 @@ class TaskExecutor:
         )
 
     async def _dispatch(
-        self, task_name: str, params: dict[str, Any]
+        self, task_name: str, params: dict[str, Any], session_id: str = "default"
     ) -> TaskExecutionResult:
         """Route task to the appropriate action function (all blocking calls run in thread)."""
 
@@ -341,6 +343,21 @@ class TaskExecutor:
         # removed from the assistant entirely — see the note in
         # tasks/registry.py. A request naming one falls through to the
         # "no handler" result at the bottom of this method.
+        #
+        # quit_app IS here — closing the AURA application is not a machine
+        # power-state change (the computer keeps running), so it does not
+        # belong to the removed power-state family.
+
+        if task_name == "quit_app":
+            # Signal the frontend to close the app. The signal travels on
+            # the bus, and api/bridge.py translates it to a WebSocket
+            # "app_command" message — the executor stays transport-agnostic.
+            # The frontend waits for the spoken confirmation to finish
+            # speaking before it actually quits, so the user hears the reply.
+            self._bus.emit(
+                AppQuitRequested(command="quit", session_id=session_id)
+            )
+            return TaskExecutionResult(True, "Closing the assistant now.")
 
         if task_name == "file_operation":
             action = str(params.get("action") or "").strip().lower()
@@ -359,7 +376,7 @@ class TaskExecutor:
                         open_params[key] = str(params[key])
                 if not open_params.get("target"):
                     open_params["target"] = str(params.get("name") or "")
-                return await self._dispatch("system", open_params)
+                return await self._dispatch("system", open_params, session_id)
             result_text = await asyncio.to_thread(file_controller, params)
             return TaskExecutionResult(
                 not _FILE_FAILURE_RE.match(result_text.strip()),

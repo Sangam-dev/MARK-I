@@ -5,7 +5,7 @@
  * answers/guide.md):
  *
  *   Client -> Server: { type: "user_text" | "retry_last" | "ping" | "toggle_listen", payload, session_id }
- *   Server -> Client: { type: "state" | "transcript" | "response" | "response_partial" | "task_update" | "error" | "pong", payload, session_id }
+ *   Server -> Client: { type: "state" | "transcript" | "response" | "response_partial" | "task_update" | "error" | "pong" | "app_command", payload, session_id }
  *
  * This module is intentionally the ONLY place in the frontend that touches
  * the raw `WebSocket` API — App.tsx and friends subscribe via `wsClient.on(...)`
@@ -23,6 +23,7 @@ export type ServerMessageType =
   | "task_update"
   | "error"
   | "pong"
+  | "app_command"
   // Pseudo-events emitted locally by this client (not part of the wire
   // format) so consumers can react to connect/disconnect uniformly via `on`.
   | "_open"

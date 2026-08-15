@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 
 from core.events import (
+    AppQuitRequested,
     AssistantState,
     AssistantStateChanged,
     PartialResponse,
@@ -103,6 +104,15 @@ def attach_bridge(pipeline: Pipeline) -> None:
             event.session_id,
         )
 
+    async def _on_app_quit_requested(event: AppQuitRequested) -> None:
+        # Forward the quit to the frontend over the same channel as every
+        # other server->client message. The renderer (App.tsx) waits for the
+        # spoken confirmation to finish, then asks the Electron main process
+        # to stop the backend and exit.
+        await manager.broadcast(
+            "app_command", {"command": event.command}, event.session_id
+        )
+
     bus.subscribe(AssistantStateChanged, _on_state_changed)
     bus.subscribe(TextInputReceived, _on_text_input)
     bus.subscribe(TranscriptReady, _on_transcript_ready)
@@ -110,6 +120,7 @@ def attach_bridge(pipeline: Pipeline) -> None:
     bus.subscribe(ResponseReady, _on_response_ready)
     bus.subscribe(TaskCompleted, _on_task_completed)
     bus.subscribe(SystemError, _on_system_error)
+    bus.subscribe(AppQuitRequested, _on_app_quit_requested)
 
     logger.info(
         "WebSocket bridge attached to pipeline bus (session=%s)", pipeline.session_id

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, screen } from "electron";
+import { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, screen } from "electron";
 import { fileURLToPath } from "url";
 import path from "path";
 import { spawn } from "child_process";
@@ -22,6 +22,7 @@ const BACKEND_PORT = process.env.AURA_BACKEND_PORT || "8765";
 // `uv run uvicorn api.server:app --reload` yourself in a separate terminal.
 const SKIP_BACKEND_SPAWN = process.env.AURA_SKIP_BACKEND_SPAWN === "1";
 let backendProcess = null;
+let tray = null;
 function startBackend() {
     if (SKIP_BACKEND_SPAWN) {
         console.log("[AURA] AURA_SKIP_BACKEND_SPAWN=1 — not spawning backend, expecting it to already be running");
@@ -63,6 +64,9 @@ function stopBackend() {
         // spawn). This is what actually reaches the python uvicorn.
         try {
             process.kill(-backendProcess.pid, "SIGTERM");
+            // Null it out so a second call (before-quit + process exit both
+            // fire) is a no-op instead of re-killing an already-dead group.
+            backendProcess = null;
             return;
         }
         catch (err) {
@@ -70,7 +74,18 @@ function stopBackend() {
             console.warn("[AURA] group kill failed, killing direct child:", err);
         }
     }
-    backendProcess.kill();
+    try {
+        backendProcess.kill();
+    }
+    catch {
+        // Already gone — nothing left to stop.
+    }
+    backendProcess = null;
+}
+function quitApp() {
+    console.log("[AURA] quitting — stopping backend and exiting");
+    stopBackend();
+    app.quit();
 }
 const FULL_W = 900, FULL_H = 900;
 const COMP_W = 120, COMP_H = 120, COMP_MARGIN = 15;
@@ -185,11 +200,44 @@ app.whenReady().then(() => {
         hasShadow: false,
         resizable: false,
         webPreferences: {
-            preload: path.join(__dirname, "preload.js"),
+            preload: path.join(__dirname, "preload.cjs"),
             contextIsolation: true,
         },
     });
     win.loadFile(path.join(__dirname, "../dist/index.html"));
+    // ── System tray ─────────────────────────────────────────────────────────
+    // The window is frameless + skipTaskbar, so there is otherwise no OS-level
+    // way to reach a close/quit affordance. The tray is the reliable escape
+    // hatch: right-click for "Quit AURA" (left-click restores the orb).
+    const trayIcon = nativeImage.createFromPath(path.join(__dirname, "..", "electron", "icon.png"));
+    tray = new Tray(trayIcon);
+    tray.setToolTip("AURA");
+    tray.setContextMenu(Menu.buildFromTemplate([
+        {
+            label: "Show AURA",
+            click: () => {
+                if (!win)
+                    return;
+                if (isCompact)
+                    exitCompact();
+                win.show();
+                win.focus();
+            },
+        },
+        { type: "separator" },
+        {
+            label: "Quit AURA",
+            click: () => quitApp(),
+        },
+    ]));
+    tray.on("click", () => {
+        if (!win)
+            return;
+        if (isCompact)
+            exitCompact();
+        win.show();
+        win.focus();
+    });
     // COMPACT trigger: another application became the active OS window.
     win.on("blur", () => {
         if (isCompact || isAnimating)
@@ -215,6 +263,9 @@ ipcMain.on("manual-compact", () => {
     if (!isCompact && !isAnimating)
         enterCompact();
 });
+// Frontend voice command ("quit"/"exit") → stop backend and exit. The
+// renderer only fires this after the spoken confirmation has finished.
+ipcMain.on("quit-app", quitApp);
 ipcMain.on("restore-full", () => {
     if (isCompact && !isAnimating)
         exitCompact();

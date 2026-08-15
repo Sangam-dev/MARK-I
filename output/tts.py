@@ -71,8 +71,8 @@ def _get_speaking_lock() -> asyncio.Lock:
 
 # Kokoro is fully offline — no network, no per-sentence WebSocket round trip.
 # Voice ids are "af_*" (American female), "am_*" (American male), "bf_*",
-# "bm_*", etc. `bm_george` is the default Kokoro-recommended American voice.
-VOICE = os.getenv("KANCHA_TTS_VOICE", "bm_george")
+# "bm_*", etc. `bm_daniel` is the default Kokoro-recommended American voice.
+VOICE = os.getenv("KANCHA_TTS_VOICE", "bm_daniel")
 TTS_SPEED = float(os.getenv("KANCHA_TTS_SPEED", "1.3"))
 # Where kokoro-v1.0.onnx and voices-v1.0.bin live (gitignored via **/data/).
 KOKORO_MODEL_DIR = os.getenv(
@@ -138,7 +138,7 @@ SOFT_PREFERRED_THRESHOLD = 60
 # (mirrors LiveKit's false-interruption resume). Overridable via
 # KANCHA_FALSE_INTERRUPTION_TIMEOUT.
 FALSE_INTERRUPTION_TIMEOUT = float(
-    os.getenv("KANCHA_FALSE_INTERRUPTION_TIMEOUT", "2.0")
+    os.getenv("KANCHA_FALSE_INTERRUPTION_TIMEOUT", "3.0")
 )
 
 

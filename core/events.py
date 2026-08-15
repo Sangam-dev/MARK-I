@@ -447,6 +447,24 @@ class TaskCompleted(BaseEvent):
 
 
 @dataclass(frozen=True)
+class AppQuitRequested(BaseEvent):
+    """
+    Event triggered when the assistant decides the AURA app should close.
+
+    emitted by: Task module (quit_app)
+    consumed by: WebSocket bridge (api/bridge.py) — forwards it to the
+    frontend, which quits the Electron app. This is app close, NOT a
+    machine power-state change: the assistant has no route to shutdown,
+    sleep or restart (see the note in tasks/registry.py).
+
+    ``command`` lets the payload tell the frontend exactly what to do
+    (currently only "quit") without growing the wire format per feature.
+    """
+
+    command: str = "quit"
+
+
+@dataclass(frozen=True)
 class SystemError(BaseEvent):
     """
     Event triggered when a system error occurs.

@@ -355,6 +355,21 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
             "enabled": bool,
         },
     ),
+    "quit_app": TaskSpec(
+        name="quit_app",
+        description=(
+            "Close the AURA assistant application itself — the window and "
+            "its backend stop, ending the session. Use it when the user "
+            "says 'quit', 'exit', 'close the app', 'goodbye' as a way of "
+            "stopping, or otherwise asks to leave the assistant. It only "
+            "closes the application; it does NOT change the computer's "
+            "power state — there is no sleep, restart or power-off action, "
+            "and the machine keeps running."
+        ),
+        required_params=(),
+        optional_params=(),
+        param_types={},
+    ),
 }
 
 
