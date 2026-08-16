@@ -477,7 +477,13 @@ async def build_pipeline(
             except Exception:  # noqa: BLE001
                 return
             if decision.retrieve:
-                rag_manager.prefetch(decision.query or text)
+                query = decision.query or text
+                rag_manager.prefetch(query)
+                if activity_memory is not None:
+                    # The activity store embeds on its own lane — prefetch
+                    # it too so the coordinator's parallel retrieval never
+                    # waits on a cold embedding.
+                    activity_memory.prefetch(query)
 
         bus.subscribe(TranscriptReady, _prefetch_rag_query)
         bus.subscribe(TextInputReceived, _prefetch_rag_query)

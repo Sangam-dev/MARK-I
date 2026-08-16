@@ -46,6 +46,7 @@ dependencies = [
     "argparse>=1.4.0",
     "yt-dlp>=2026.7.4",
     "send2trash>=2.1.0",
+    "deepgram-sdk>=7.7.0",
 ]
 
 [dependency-groups]

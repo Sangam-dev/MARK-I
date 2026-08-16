@@ -178,6 +178,19 @@ PREEMPTIVE_MIN_COVERAGE = float(os.getenv("KANCHA_PREEMPTIVE_MIN_COVERAGE", "0.7
 # generated from the fuller text. Word-set difference, so ASR rewording of
 # already-seen words does not trigger a pointless re-arm.
 PREEMPTIVE_REARM_WORDS = int(os.getenv("KANCHA_PREEMPTIVE_REARM_WORDS", "2"))
+# Master toggle for ALL speculative work: interim ASR snapshots in
+# input/stt.py plus the preemptive generation here. Set SPECULATION=0 to
+# disable (a turn then just runs the normal single generation). 1 = on.
+SPECULATION_ENABLED = (
+    os.getenv("SPECULATION", "1").strip().lower()
+    not in ("0", "false", "off", "no")
+)
+# Preemptive replies are capped short: a full-length speculative answer
+# cannot finish inside the snapshot→final-transcript runway (see the note
+# on PREEMPTIVE_REUSE_WAIT_S), so it would only ever be wasted work — and
+# a wasted generation still pays the full prompt + streamed output. A
+# short guess finishes fast enough to be reused.
+PREEMPTIVE_MAX_TOKENS = int(os.getenv("KANCHA_PREEMPTIVE_MAX_TOKENS", "80"))
 
 
 class _PreemptiveGuess:
@@ -618,11 +631,17 @@ class ReasoningCoordinator:
                 return
         self._preemptive_partials[session_id] = (gen, text)
 
-        # Supersede any in-flight guess — whether from an earlier utterance
-        # or (re-arm) from this one's previous snapshot.
-        prior = self._preemptive_tasks.pop(session_id, None)
+        # No re-arm restarts. The preemptive reply is capped short
+        # (PREEMPTIVE_MAX_TOKENS) so the first generation finishes inside
+        # the snapshot→final-transcript runway; cancelling it here and
+        # re-spawning would discard that head start, and the re-armed guess
+        # would have even less time left to complete. Keep the first guess
+        # and validate it against the latest partial instead.
+        if self._preemptive.get(session_id) is not None:
+            return  # a guess is already parked for this utterance
+        prior = self._preemptive_tasks.get(session_id)
         if prior is not None and not prior.done():
-            prior.cancel()
+            return  # a generation is already in flight — let it finish
 
         self._preemptive[session_id] = None  # in-flight marker
         task = asyncio.create_task(
@@ -638,6 +657,8 @@ class ReasoningCoordinator:
         the normal turn, so these checks only ever *skip* work, never
         degrade it.
         """
+        if not SPECULATION_ENABLED:
+            return False  # speculation is switched off (SPECULATION=0)
         if not self._response_stream_finished.is_set():
             return False  # a turn is already being processed
         # Imported lazily: nlu.classifier imports reasoning.llm_client,
@@ -698,6 +719,7 @@ class ReasoningCoordinator:
                 session_id=session_id,
                 call_site="preemptive",
                 stream_to_user=False,
+                max_output_tokens=PREEMPTIVE_MAX_TOKENS,
             )
             if not response_text or payload.get("task"):
                 # A blank guess, or one that wanted to delegate — never
@@ -711,8 +733,8 @@ class ReasoningCoordinator:
                 created_at=time.monotonic(),
                 gen=gen,
             )
-            logger.debug(
-                "Preemptive reply parked (session=%s, %d chars, gen=%d)",
+            logger.info(
+                "Speculation passed — preemptive guess parked (session=%s, %d chars, gen=%d)",
                 session_id,
                 len(response_text),
                 gen,
@@ -746,29 +768,50 @@ class ReasoningCoordinator:
                 )
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 task.cancel()
+                logger.info(
+                    "Speculation failed — preemptive reply not ready within %.1fs "
+                    "(session=%s)",
+                    PREEMPTIVE_REUSE_WAIT_S,
+                    session_id,
+                )
                 return False
 
         if parked is None:
             parked = self._preemptive.pop(session_id, None)
         if parked is None:
+            logger.info(
+                "Speculation failed — no usable preemptive guess "
+                "(generation failed or produced nothing) (session=%s)",
+                session_id,
+            )
             return False
 
         if parked.gen + 1 != gen:
+            logger.info(
+                "Speculation failed — stale guess from an earlier utterance "
+                "(session=%s)",
+                session_id,
+            )
             return False
         if time.monotonic() - parked.created_at > PREEMPTIVE_MAX_AGE_S:
+            logger.info(
+                "Speculation failed — preemptive guess too old (session=%s)",
+                session_id,
+            )
             return False
         if not (
             _transcripts_equivalent(parked.partial, final_text)
             or _is_partial_prefix(parked.partial, final_text, PREEMPTIVE_MIN_COVERAGE)
         ):
-            logger.debug(
-                "Preemptive guess discarded — transcript mismatch (session=%s)",
+            logger.info(
+                "Speculation failed — partial transcript does not match final "
+                "(session=%s)",
                 session_id,
             )
             return False
         if parked.payload.get("task"):
             logger.info(
-                "Preemptive guess discarded — it delegated a task (session=%s)",
+                "Speculation failed — preemptive guess delegated a task (session=%s)",
                 session_id,
             )
             return False
@@ -779,8 +822,8 @@ class ReasoningCoordinator:
         from nlu.classifier import classify_tool_request
 
         if classify_tool_request(final_text) is not None:
-            logger.debug(
-                "Preemptive guess discarded — final is a task (session=%s)",
+            logger.info(
+                "Speculation failed — final transcript is a task (session=%s)",
                 session_id,
             )
             return False
@@ -790,8 +833,8 @@ class ReasoningCoordinator:
             except Exception:  # noqa: BLE001
                 decision = None
             if decision is not None and decision.retrieve:
-                logger.debug(
-                    "Preemptive guess discarded — final would retrieve "
+                logger.info(
+                    "Speculation failed — final would retrieve long-term memory "
                     "(session=%s)",
                     session_id,
                 )
@@ -1202,21 +1245,22 @@ class ReasoningCoordinator:
         acknowledgement, so it is returned under ``_ack`` **unsent** and
         :meth:`_schedule_ack` decides whether the user ever hears it.
         """
-        # 1. Retrieve SQLite facts
-        facts = await self.memory_manager.get_all_facts()
+        # 1-2. Gather the turn's context concurrently. All three are
+        # read-only and independent (SQLite facts, RAG retrieval, project
+        # activity), so serializing them only added their combined latency
+        # to every turn — the retrieval embeddings overlap the facts lookup
+        # instead of following it.
+        facts, retrieved, activity = await asyncio.gather(
+            self.memory_manager.get_all_facts(),
+            self._retrieve_rag_context(retrieval_query, intent_event=None),
+            self._retrieve_activity_context(retrieval_query),
+        )
         memory_event = MemoryRetrieved(
             session_id=session_id,
             query=retrieval_query,
             structured_context=facts,
             episodic_context=[],
         )
-
-        # 2. Retrieve RAG chunks
-        retrieved = await self._retrieve_rag_context(retrieval_query, intent_event=None)
-
-        # 2b. Retrieve project activity from its own store (same router
-        # gate, separate index — see _retrieve_activity_context).
-        activity = await self._retrieve_activity_context(retrieval_query)
 
         # 3. Build the system prompt: persona + memory + controller rules
         system = self._build_system_prompt(
@@ -1300,6 +1344,7 @@ class ReasoningCoordinator:
         session_id: str,
         call_site: str,
         stream_to_user: bool = True,
+        max_output_tokens: int | None = None,
     ) -> tuple[str, dict[str, Any], bool]:
         """Stream the JSON envelope once.
 
@@ -1335,6 +1380,7 @@ class ReasoningCoordinator:
                 system=system,
                 hedge_width=1,
                 call_site=call_site,
+                max_output_tokens=max_output_tokens,
             ):
                 raw_parts.append(chunk)
                 buffer += chunk

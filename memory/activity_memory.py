@@ -126,6 +126,21 @@ class ActivityMemory:
 
     # ── reads ───────────────────────────────────────────────────────
 
+    def prefetch(self, query: str) -> None:
+        """Start embedding *query* for the activity store in the background.
+
+        Embedding is a network round-trip; starting it when the transcript
+        lands lets it finish inside the STT/LLM window, so a later
+        :meth:`search` of the same text finds it already cached (mirrors
+        ``RAGManager.prefetch``). Never blocks and never raises.
+        """
+        if self._manager is None:
+            return
+        try:
+            self._manager.prefetch(query)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Activity query prefetch failed (harmless): %s", exc)
+
     async def search(self, query: str, top_k: int = 3) -> list[Any]:
         """Semantic recall over project activity. Returns [] on any failure
         — retrieval enhances a reply, it must never break one."""

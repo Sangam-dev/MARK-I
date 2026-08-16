@@ -510,6 +510,7 @@ class GeminiClient:
         system: str = "",
         hedge_width: int | None = None,
         call_site: str = "conversational",
+        max_output_tokens: int | None = None,
     ) -> AsyncIterator[str]:
         """Stream a conversational response as text deltas.
 
@@ -551,7 +552,10 @@ class GeminiClient:
             contents.append(types.Content(role="user", parts=[types.Part(text="")]))
 
         config = (
-            types.GenerateContentConfig(system_instruction=full_system)
+            types.GenerateContentConfig(
+                system_instruction=full_system,
+                max_output_tokens=max_output_tokens,
+            )
             if full_system
             else None
         )

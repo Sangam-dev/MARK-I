@@ -46,7 +46,7 @@ VAD_MODEL_URL = os.getenv(
 # tolerant of natural mid-speech pauses because it is the *trailing* run
 # of silence that ends the turn, not the first dip. Overridable via
 # KANCHA_SILENCE_LIMIT.
-SILENCE_LIMIT = float(os.getenv("KANCHA_SILENCE_LIMIT", "0.8"))
+SILENCE_LIMIT = float(os.getenv("KANCHA_SILENCE_LIMIT", "0.5"))
 MAX_DURATION = 15.0
 MIN_SPEECH_SECS = 0.5
 MAX_HISTORY = 12
@@ -64,7 +64,7 @@ LOW_CONFIDENCE_AUDIO_SECS = 1.2
 # latency. Quality-critical output always comes from the final turbo pass,
 # and the speculative reply is only *reused* when the coordinator validates
 # it against the authoritative transcript.
-PREEMPTIVE_MODEL = os.getenv("KANCHA_PREEMPTIVE_MODEL", "whisper-large-v3")
+PREEMPTIVE_MODEL = os.getenv("KANCHA_PREEMPTIVE_MODEL", "whisper-large-v3-turbo")
 # Fire the snapshot once this much speech has been recorded — early enough
 # that the LLM guess still has the rest of the utterance + endpoint + final
 # Whisper as runway, late enough that the partial usually covers the core
@@ -86,10 +86,17 @@ PREEMPTIVE_MIN_WORDS = int(os.getenv("KANCHA_PREEMPTIVE_MIN_WORDS", "4"))
 PREEMPTIVE_RESNAPSHOT_SECS = float(
     os.getenv("KANCHA_PREEMPTIVE_RESNAPSHOT_SECS", "0.7")
 )
-# Cap on snapshots per utterance. Beyond this the interim ASR calls are
-# pure overhead — the utterance is long enough that the final Whisper pass
-# dominates anyway.
-PREEMPTIVE_MAX_SNAPSHOTS = int(os.getenv("KANCHA_PREEMPTIVE_MAX_SNAPSHOTS", "3"))
+# Cap on snapshots per utterance. With re-arm restarts disabled (the
+# coordinator now lets the first preemptive generation run to completion),
+# later snapshots only add interim ASR cost without improving the guess —
+# so a single snapshot is both cheaper and faster.
+PREEMPTIVE_MAX_SNAPSHOTS = int(os.getenv("KANCHA_PREEMPTIVE_MAX_SNAPSHOTS", "1"))
+# Master toggle — set SPECULATION=0 to disable the interim ASR snapshots
+# entirely (no speculative LLM work downstream). 1 = on.
+SPECULATION_ENABLED = (
+    os.getenv("SPECULATION", "1").strip().lower()
+    not in ("0", "false", "off", "no")
+)
 
 # FIX #2: onset tolerance — how many low-RMS chunks we allow during the
 # "is this really speech starting" window before we give up and reset.
@@ -589,6 +596,7 @@ async def listen(
     calibrate: bool = True,
     snapshot_cb: Callable[[np.ndarray], Awaitable[None]] | None = None,
     barge_in_cb: Callable[[], None] | None = None,
+    manage_aec: bool = True,
 ) -> np.ndarray | None:
     """
     Listen until speech ends using simple RMS-based VAD.
@@ -612,14 +620,22 @@ async def listen(
     the callback) treat the user's interjection as a fresh utterance. The
     callback fires once onset is confirmed so the caller can cut the
     assistant's playback.
+
+    ``manage_aec`` defaults to True (prepare + restore the echo-cancel
+    nodes around this recording, so the listen is self-sufficient). Callers
+    that already routed AEC for the whole session pass False to skip the
+    redundant ``pactl`` round-trips — the nodes stay routed, barge-in is
+    unchanged, and each turn saves ~100-200ms of subprocess churn.
     """
 
     # A1: route the default mic AND speaker through the AEC nodes (before
     # calibration, so the noise floor is measured on the echo-cancelled
     # signal too). Without the sink routing, the assistant's own voice is
     # not in the echo reference and would be picked up as mic input while
-    # music or TTS is playing.
-    prev_aec = await asyncio.to_thread(_prepare_aec)
+    # music or TTS is playing. Skipped when the caller already manages AEC
+    # for the session (manage_aec=False) — the nodes stay routed and the
+    # per-turn pactl churn disappears.
+    prev_aec = await asyncio.to_thread(_prepare_aec) if manage_aec else None
 
     # Phase 2: neural VAD replaces the RMS energy gate. Resetting per listen
     # is correct — each listen() captures one fresh utterance.
@@ -669,8 +685,10 @@ async def listen(
         blocked_by_tts = False
         # Barge-in (recording through the assistant's voice) is only safe
         # when the echo-cancel path is active — otherwise the VAD cannot
-        # tell the assistant's own audio from the user's.
-        aec_active = prev_aec is not None
+        # tell the assistant's own audio from the user's. With
+        # manage_aec=False the caller guarantees the path is already routed
+        # for the session, so it counts as active regardless of prev_aec.
+        aec_active = prev_aec is not None if manage_aec else True
 
         async def _run_snapshot(snapshot: np.ndarray) -> None:
             if snapshot_cb is None:
@@ -764,12 +782,13 @@ async def listen(
                     barge_in_fired = True
                     loop.call_soon_threadsafe(barge_in_cb)
 
-                # Mid-utterance snapshots for the interim ASR. Fire the
-                # first once PREEMPTIVE_SNAPSHOT_SECS of speech is in, then
-                # re-fire every PREEMPTIVE_RESNAPSHOT_SECS of *additional*
-                # speech (capped). Each re-fire is a fuller partial, letting
-                # the coordinator supersede its stale guess mid-utterance.
-                if snapshots_fired < PREEMPTIVE_MAX_SNAPSHOTS and (
+                # Mid-utterance snapshot for the interim ASR. Fire once
+                # PREEMPTIVE_SNAPSHOT_SECS of speech is in (skipped entirely
+                # when SPECULATION=0). The interim ASR races a cheap
+                # transcription ahead of the final one so the coordinator
+                # can start a speculative reply while the user is still
+                # talking.
+                if SPECULATION_ENABLED and snapshots_fired < PREEMPTIVE_MAX_SNAPSHOTS and (
                     len(chunks) - snapshot_fire_base
                     >= (snapshot_chunks if snapshots_fired == 0 else resnapshot_chunks)
                 ):
@@ -873,7 +892,7 @@ async def transcribe(audio: np.ndarray) -> str:
 
     result = await asyncio.to_thread(
         client.audio.transcriptions.create,
-        model="whisper-large-v3",
+        model="whisper-large-v3-turbo",
         file=("audio.wav", wav_bytes, "audio/wav"),
         language="en",
     )
@@ -915,6 +934,7 @@ async def listen_and_transcribe(
     min_speech_secs: float = MIN_SPEECH_SECS,
     partial_cb: Callable[[np.ndarray], Awaitable[None]] | None = None,
     barge_in_cb: Callable[[], None] | None = None,
+    manage_aec: bool = True,
 ) -> str | None:
     """
     Listen to mic input, detect silence, and transcribe.
@@ -930,6 +950,9 @@ async def listen_and_transcribe(
     ``barge_in_cb`` (see :func:`listen`) fires when the user starts
     speaking while the assistant still has audio in the air.
 
+    ``manage_aec`` is forwarded to :func:`listen`: pass False when the
+    caller has already routed the echo-cancel nodes for the session.
+
     Returns the transcribed text, or None if no audio was captured.
     """
     audio = await listen(
@@ -941,6 +964,7 @@ async def listen_and_transcribe(
         min_speech_secs=min_speech_secs,
         snapshot_cb=partial_cb,
         barge_in_cb=barge_in_cb,
+        manage_aec=manage_aec,
     )
 
     if audio is None:
@@ -1032,6 +1056,8 @@ class MicrophoneListener:
         talking and the final Whisper call runs. Everything here is a
         guess — the coordinator validates and may discard it.
         """
+        if not SPECULATION_ENABLED:
+            return  # speculation switched off (SPECULATION=0)
         if len(audio) / SAMPLE_RATE < PREEMPTIVE_MIN_AUDIO_SECS:
             return
         try:
@@ -1099,6 +1125,7 @@ class MicrophoneListener:
                     text = await listen_and_transcribe(
                         partial_cb=self._maybe_preemptive,
                         barge_in_cb=self._on_barge_in,
+                        manage_aec=self._session_aec is None,
                     )
                 except Exception as exc:
                     _stt_logger.exception("listen_and_transcribe error: %s", exc)

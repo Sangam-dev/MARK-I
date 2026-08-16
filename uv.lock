@@ -339,6 +339,22 @@ wheels = [
 ]
 
 [[package]]
+name = "deepgram-sdk"
+version = "7.7.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "pydantic-core" },
+    { name = "typing-extensions" },
+    { name = "websockets" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/aa/62/35862ebd6dc3873d7f67319afb775143b86fbf0fa1b1ab6697249325bfd4/deepgram_sdk-7.7.0.tar.gz", hash = "sha256:4cce45c853d6caebbed62081d9118b915a2f3a2e54eb420ff5148c30e16dcffd", size = 242704, upload-time = "2026-08-12T13:26:28.154Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/38/fa/7db3da57efe9b7919d57c4aac0eb9cbdf2ee40ed766316aada60cce89c03/deepgram_sdk-7.7.0-py3-none-any.whl", hash = "sha256:25355b2e119f969c8614136e494ef30be91a06c56152a9cba49535ef3f18f82c", size = 633789, upload-time = "2026-08-12T13:26:26.738Z" },
+]
+
+[[package]]
 name = "distro"
 version = "1.9.0"
 source = { registry = "https://pypi.org/simple" }
@@ -802,6 +818,7 @@ dependencies = [
     { name = "aiofiles" },
     { name = "aiosqlite" },
     { name = "argparse" },
+    { name = "deepgram-sdk" },
     { name = "elevenlabs" },
     { name = "fastapi" },
     { name = "google-genai" },
@@ -841,6 +858,7 @@ requires-dist = [
     { name = "aiofiles", specifier = ">=24.1.0" },
     { name = "aiosqlite", specifier = ">=0.20.0" },
     { name = "argparse", specifier = ">=1.4.0" },
+    { name = "deepgram-sdk", specifier = ">=7.7.0" },
     { name = "elevenlabs", specifier = ">=2.52.0" },
     { name = "fastapi", specifier = ">=0.140.0" },
     { name = "google-genai", specifier = ">=2.6.0" },
