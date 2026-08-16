@@ -149,6 +149,9 @@ class AgentStateStore:
         }
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         try:
+            # The registry lives in ``projects/``; a delegation pointed at
+            # a directory outside it must not make the registry unwritable.
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(
                 json.dumps(payload, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",

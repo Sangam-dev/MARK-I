@@ -482,7 +482,11 @@ def _log(msg: str) -> None:
 
 
 def _parse_retry_after(exc: Exception) -> float | None:
-    match = re.search(r"retryDelay['\"]?\s*:\s*['\"](\d+(?:\.\d+)?)s", str(exc))
+    msg = str(exc)
+    match = re.search(r"retryDelay['\"]?\s*:\s*['\"](\d+(?:\.\d+)?)s", msg)
+    if match:
+        return float(match.group(1))
+    match = re.search(r"[Rr]etry in\s+(\d+(?:\.\d+)?)s", msg)
     return float(match.group(1)) if match else None
 
 
@@ -494,13 +498,23 @@ def _is_retryable(exc: Exception) -> bool:
 
 
 def _is_quota_exhausted(exc: Exception) -> bool:
-    """Return True for daily-quota exhaustion (e.g. ``limit: 0`` or
-    ``GenerateRequestsPerDayPerProject``). These are the errors that
+    """Return True for daily-quota exhaustion. These are the errors that
     should remove a key from rotation for an extended period; ordinary
     429s and ``resource_exhausted`` per-minute limits are NOT daily
-    exhaustion."""
+    exhaustion.
+
+    The free tier reports its daily request cap as
+    ``generate_content_free_tier_requests, limit: <n>`` (e.g. 500 for
+    gemini-3.5-flash-lite) — no ``limit: 0``, no ``PerDay`` suffix — so
+    that metric name is recognised explicitly, or an account whose day
+    is gone would be re-tried every minute instead of parked for the
+    day."""
     msg = str(exc)
-    return "limit: 0" in msg or "GenerateRequestsPerDay" in msg
+    return (
+        "limit: 0" in msg
+        or "GenerateRequestsPerDay" in msg
+        or "generate_content_free_tier_requests" in msg
+    )
 
 
 def _is_not_found(exc: Exception) -> bool:
@@ -621,6 +635,9 @@ async def _try_with_active_key(
         and continues to the next model on the **same** key.
       * A 429/503/auth/network error on a (key, model) attempt treats
         the key as exhausted for this call and rotates to the next key.
+      * Streaming is validated on the first chunk: the driver waits for
+        it inside the rotation guard, so a first-chunk error rotates
+        instead of escaping to the caller, then replays that chunk.
       * Success returns the result.
       * Daily-quota exhaustion removes the key from rotation for
         ``DAILY_QUOTA_COOLDOWN_SECS``.
@@ -648,7 +665,34 @@ async def _try_with_active_key(
             saw_any_attempt = True
             try:
                 if is_stream:
-                    return await _run_stream(entry, model, timeout, call_kwargs)
+                    gen = await _run_stream(entry, model, timeout, call_kwargs)
+                    # Pull the first chunk *inside* the try so a key-level
+                    # failure (quota, auth, timeout) surfaces here and
+                    # rotates to the next key, exactly like the
+                    # non-streaming path below. Before this the generator
+                    # was returned with no request in flight, so the first
+                    # chunk's error escaped to the caller with the key
+                    # never cooled or advanced — a streaming lane stayed
+                    # pinned to one exhausted key forever. The first chunk
+                    # is replayed by ``_replay`` so the caller's stream
+                    # looks exactly as it would have.
+                    try:
+                        first = await anext(gen)
+                    except StopAsyncIteration:
+                        # An empty stream is not a key failure — the
+                        # request itself succeeded. The old code handed
+                        # the caller a stream that simply had no chunks;
+                        # keep that, instead of surfacing an exception.
+                        first = None
+                    pool.mark_success(entry, model)
+
+                    async def _replay() -> AsyncIterator[str]:
+                        if first is not None:
+                            yield first
+                        async for chunk in gen:
+                            yield chunk
+
+                    return _replay()
                 text = await _run_blocking(entry, model, timeout, call_kwargs)
                 pool.mark_success(entry, model)
                 return text
