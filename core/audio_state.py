@@ -35,6 +35,25 @@ class AudioState:
         self.thinking_active = asyncio.Event()
         self._active_thinking = 0
 
+        #: Recently played sentences, as ``(monotonic timestamp, text)``.
+        #: This is what the mic could still be echoing; STT reads it to
+        #: reject a transcript that near-duplicates the assistant's own
+        #: voice (see ``input.stt._is_self_echo``). Bounded, newest last.
+        self.recent_spoken: list[tuple[float, str]] = []
+        self._max_recent_spoken = 8
+
+    def note_spoken(self, text: str) -> None:
+        """Record a sentence that actually started playing aloud.
+
+        Called just before playback begins (not when synthesis is queued),
+        so the timestamp tracks the moment the audio leaves the speaker.
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        self.recent_spoken.append((time.monotonic(), text))
+        del self.recent_spoken[:-self._max_recent_spoken]
+
     @property
     def is_speaking(self) -> bool:
         """True if TTS is currently speaking."""

@@ -401,24 +401,28 @@ async def speak(text: str) -> None:
         if not sentences:
             return
 
-        audio_future = None
+        audio_future: tuple[str, asyncio.Task] | None = None
 
-        for i, sentence in enumerate(sentences):
-            print(f"  {i + 1}/{len(sentences)}: {sentence}")
-            this_future = asyncio.create_task(_synthesize(sentence))
+        for index, sentence in enumerate(sentences):
+            print(f"  {index + 1}/{len(sentences)}: {sentence}")
+            this_future = (sentence, asyncio.create_task(_synthesize(sentence)))
 
             # While current synthesizes, play previous
             if audio_future is not None:
-                audio = await audio_future
+                prev_sentence, prev_task = audio_future
+                audio = await prev_task
                 if audio:
+                    audio_state.note_spoken(prev_sentence)
                     await loop.run_in_executor(None, _play, *audio)
 
             audio_future = this_future
 
         # Play the last one
         if audio_future is not None:
-            audio = await audio_future
+            prev_sentence, prev_task = audio_future
+            audio = await prev_task
             if audio:
+                audio_state.note_spoken(prev_sentence)
                 await loop.run_in_executor(None, _play, *audio)
 
         elapsed = time.perf_counter() - start
@@ -439,7 +443,7 @@ class StreamingSpeaker:
     def __init__(self) -> None:
         # Lazily created on first use (asyncio primitives bind to a loop).
         self._lock: asyncio.Lock | None = None
-        self._queue: asyncio.Queue[asyncio.Task | None] | None = None
+        self._queue: asyncio.Queue[tuple[str, asyncio.Task | None] | None] | None = None
         self._player: asyncio.Task | None = None
 
     def _get_lock(self) -> asyncio.Lock:
@@ -457,15 +461,22 @@ class StreamingSpeaker:
 
         A single failure (synthesis or playback) is logged and skipped so it
         can never abort the rest of the stream. The loop only exits on the
-        ``None`` sentinel pushed by :meth:`drain`.
+        ``None`` sentinel pushed by :meth:`drain`. The sentence text rides
+        along with its task so :meth:`AudioState.note_spoken` is called the
+        moment the audio actually starts — the echo guard (``input.stt``)
+        reads that to reject the assistant hearing itself.
         """
         while True:
             item = await self._queue.get()
             if item is None:
                 break
+            sentence, task = item
+            if task is None:
+                continue
             try:
-                audio = await item
+                audio = await task
                 if audio is not None:
+                    audio_state.note_spoken(sentence)
                     loop = asyncio.get_running_loop()
                     await loop.run_in_executor(None, _play, *audio)
             except Exception as exc:
@@ -479,7 +490,7 @@ class StreamingSpeaker:
         async with self._get_lock():
             self._ensure_player()
             this = asyncio.create_task(_synthesize(sentence))
-            await self._queue.put(this)
+            await self._queue.put((sentence, this))
 
     async def drain(self) -> None:
         """Stop the player and block until all queued audio has finished."""
@@ -522,8 +533,8 @@ class StreamingSpeaker:
                     item = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-                if item is not None:
-                    item.cancel()
+                if item is not None and item[1] is not None:
+                    item[1].cancel()
 
 
 class TTSHandler:

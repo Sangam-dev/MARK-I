@@ -14,6 +14,8 @@ Environment variables (all optional, all prefixed ``KANCHA_OPENCODE_``)::
     KANCHA_OPENCODE_BINARY           path   (default opencode)
     KANCHA_OPENCODE_PROVIDER         str    (default opencode)
     KANCHA_OPENCODE_MODEL            str    (default deepseek-v4-flash-free)
+    KANCHA_OPENCODE_FALLBACK_MODELS  str    (comma-separated model ids, default the
+                                           other Zen free models)
     KANCHA_OPENCODE_AGENT            str    (default build)
     KANCHA_OPENCODE_WORKSPACE        path   (default ~/kancha-workspace)
     KANCHA_OPENCODE_TIMEOUT_S        s      (default 1800)
@@ -90,6 +92,15 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _env_list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """Comma-separated env value → tuple of non-empty items."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    items = tuple(item.strip() for item in raw.split(",") if item.strip())
+    return items if items else default
+
+
 @dataclass(frozen=True, slots=True)
 class OpenCodeConfig:
     """Immutable configuration for the OpenCode integration."""
@@ -121,6 +132,20 @@ class OpenCodeConfig:
     # arrives as an agent_error, not a crash.
     provider: str = "opencode"
     model: str = "deepseek-v4-flash-free"
+    #: Model ids tried, in order, when the primary returns an agent_error —
+    #: the class of failure a provider outage arrives as ("Upstream request
+    #: failed: Endpoint is unavailable"). All on the same provider, so this
+    #: needs no key: they are the other free Zen models. A primary outage
+    #: then costs one quick failing call before the task runs under a
+    #: working model instead of being reported broken.
+    fallback_models: tuple[str, ...] = (
+        "big-pickle",
+        "hy3-free",
+        "laguna-s-2.1-free",
+        "mimo-v2.5-free",
+        "nemotron-3-ultra-free",
+        "nemotron-3.5-lightning-free",
+    )
     #: OpenCode agent profile: "build" edits files and runs commands,
     #: "plan" is read-only. Research tasks work under either.
     agent: str = "build"
@@ -174,6 +199,17 @@ class OpenCodeConfig:
             binary=_env_str("KANCHA_OPENCODE_BINARY", "opencode"),
             provider=_env_str("KANCHA_OPENCODE_PROVIDER", "opencode"),
             model=_env_str("KANCHA_OPENCODE_MODEL", "deepseek-v4-flash-free"),
+            fallback_models=_env_list(
+                "KANCHA_OPENCODE_FALLBACK_MODELS",
+                (
+                    "big-pickle",
+                    "hy3-free",
+                    "laguna-s-2.1-free",
+                    "mimo-v2.5-free",
+                    "nemotron-3-ultra-free",
+                    "nemotron-3.5-lightning-free",
+                ),
+            ),
             agent=_env_str("KANCHA_OPENCODE_AGENT", "build"),
             workspace=(
                 Path(workspace).expanduser()
@@ -195,8 +231,14 @@ class OpenCodeConfig:
     def describe(self) -> str:
         """One-line summary for startup logs."""
         where = self.server_url or f"spawn {self.binary} on {self.host}:{self.port or 'auto'}"
+        fallbacks = (
+            f" fallbacks=[{', '.join(self.fallback_models)}]"
+            if self.fallback_models
+            else ""
+        )
         return (
-            f"model={self.provider}/{self.model} agent={self.agent} "
+            f"model={self.provider}/{self.model}{fallbacks} "
+            f"agent={self.agent} "
             f"workspace={self.workspace} server=({where}) "
             f"timeout={self.request_timeout_s:.0f}s"
         )

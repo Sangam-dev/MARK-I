@@ -36,3 +36,5 @@ scripts/
 memory/data/
 memory/rag.txt
 memory/alarms.json
+
+course/

@@ -353,6 +353,11 @@ class OpenCodeClient:
     ) -> OpenCodeResult:
         """Send *text* to *session_id* and wait for the agent to finish.
 
+        Tries the configured model first and then, when it returns an
+        ``agent_error`` (a provider outage), each :attr:`fallback_models
+        <agent.config.OpenCodeConfig.fallback_models>` in turn — the
+        first attempt that neither succeeds nor errors this way wins.
+
         On success ``data`` carries ``text`` (the agent's reply),
         ``tools`` (the tools it used), ``tokens`` and ``cost``.
 
@@ -370,10 +375,57 @@ class OpenCodeClient:
         if not text.strip():
             return _failure("invalid_argument", "There is nothing to send.")
 
+        # The primary model, then any configured fallbacks, tried in order
+        # when the previous one fails with an agent_error — the class of
+        # failure a provider outage arrives as. A delegation is one prompt
+        # on a fresh session, and a failed attempt produces no agent
+        # output, so re-sending the same task under the next model is safe.
+        models = (self._config.model, *self._config.fallback_models)
+        last: OpenCodeResult | None = None
+        for index, model_id in enumerate(models):
+            result = await self._prompt_once(session_id, text, directory, model_id)
+            if result.success or result.error_kind != "agent_error":
+                return result
+            last = result
+            remaining = models[index + 1 :]
+            if remaining:
+                logger.warning(
+                    "OpenCode model %s/%s failed in %s (%s) — trying %s/%s",
+                    self._config.provider,
+                    model_id,
+                    session_id,
+                    result.error,
+                    self._config.provider,
+                    remaining[0],
+                )
+            else:
+                logger.warning(
+                    "OpenCode model %s/%s failed in %s (%s) — no fallbacks left",
+                    self._config.provider,
+                    model_id,
+                    session_id,
+                    result.error,
+                )
+        assert last is not None
+        return last
+
+    async def _prompt_once(
+        self, session_id: str, text: str, directory: str, model_id: str
+    ) -> OpenCodeResult:
+        """One model attempt: send *text* to *session_id* and wait.
+
+        On success ``data`` carries ``text`` (the agent's reply),
+        ``tools`` (the tools it used), ``tokens`` and ``cost``.
+
+        This call is the whole run: it returns when the agent stops, and
+        that is minutes. Callers who need the user to stay conversational
+        run it as a background task and watch :meth:`stream_events` —
+        see :class:`agent.tool.OpenCodeTool`.
+        """
         payload = {
             "model": {
                 "providerID": self._config.provider,
-                "modelID": self._config.model,
+                "modelID": model_id,
             },
             "agent": self._config.agent,
             "parts": [{"type": "text", "text": text}],

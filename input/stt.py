@@ -4,8 +4,10 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import wave
+from difflib import SequenceMatcher
 from typing import Awaitable, Callable
 
 import numpy as np
@@ -95,6 +97,55 @@ PREEMPTIVE_MAX_SNAPSHOTS = int(os.getenv("KANCHA_PREEMPTIVE_MAX_SNAPSHOTS", "3")
 # 1-2 frames even mid-word, let alone at onset. Without this, fast speech
 # gets its first syllable eaten constantly.
 ONSET_TOLERANCE_CHUNKS = 3  # ~90ms of tolerated dips during onset
+
+# ── Self-echo rejection ────────────────────────────────────────────────────
+# The mic occasionally captures the assistant's own voice (echo leak) and
+# transcribes it as if the user had spoken. Such a transcript near-duplicates
+# what the assistant just said, within seconds of it playing. The guard
+# rejects those before they become a turn — breaking the self-listening loop.
+# Overridable via KANCHA_SELF_ECHO_WINDOW_S / KANCHA_SELF_ECHO_RATIO /
+# KANCHA_SELF_ECHO_MIN_WORDS.
+SELF_ECHO_WINDOW_SECS = float(os.getenv("KANCHA_SELF_ECHO_WINDOW_S", "6.0"))
+SELF_ECHO_RATIO = float(os.getenv("KANCHA_SELF_ECHO_RATIO", "0.6"))
+SELF_ECHO_MIN_WORDS = int(os.getenv("KANCHA_SELF_ECHO_MIN_WORDS", "4"))
+
+
+def _word_tokens(text: str) -> list[str]:
+    """Lowercased words for the echo comparison."""
+    return re.findall(r"[a-z0-9']+", text.lower())
+
+
+def _text_similarity(a: str, b: str) -> float:
+    """Word-level SequenceMatcher ratio — how much of *a* overlaps *b*."""
+    wa = _word_tokens(a)
+    wb = _word_tokens(b)
+    if not wa or not wb:
+        return 0.0
+    return SequenceMatcher(None, wa, wb).ratio()
+
+
+def _is_self_echo(text: str) -> bool:
+    """True when *text* near-duplicates what the assistant recently spoke.
+
+    That is the signature of the mic capturing the assistant's own voice.
+    Each recently played sentence is compared separately (the transcript may
+    echo any one of them); the highest overlap decides. Cheap — a handful of
+    short-string comparisons per transcript.
+    """
+    now = time.monotonic()
+    candidates = [
+        spoken
+        for at, spoken in audio_state.recent_spoken
+        if now - at <= SELF_ECHO_WINDOW_SECS
+        and len(_word_tokens(spoken)) >= SELF_ECHO_MIN_WORDS
+    ]
+    if not candidates:
+        return False
+    ratio = max(_text_similarity(text, spoken) for spoken in candidates)
+    if ratio >= SELF_ECHO_RATIO:
+        _stt_logger.debug("Self-echo suspected (%.2f): %r", ratio, text)
+        return True
+    return False
 
 # FIX #3: calibration settings for noise-floor-relative threshold instead
 # of a hardcoded magic number that only works for one mic/room/gain combo.
@@ -404,28 +455,110 @@ def _echo_cancel_nodes_exist() -> bool:
     )
 
 
+# Serialises the check-and-load so two threads (e.g. the warm-up task and the
+# session prepare in MicrophoneListener.run) cannot both decide the module is
+# missing and load it twice. A duplicated module means duplicated
+# echo-cancel-source/-sink nodes and ambiguous, flaky echo cancellation.
+_aec_module_lock = threading.Lock()
+
+
 def _load_echo_cancel_module() -> bool:
-    """Load module-echo-cancel once; idempotent. True when both AEC nodes exist."""
-    if _echo_cancel_nodes_exist():
-        return True
-    args = ["load-module", "module-echo-cancel", "aec_method=webrtc"]
-    source = _default_source_name()
-    sink = _default_sink_name()
-    if source:
-        args.append(f"source_master={source}")
-    if sink:
-        args.append(f"sink_master={sink}")
-    _pactl(*args)
-    return _echo_cancel_nodes_exist()
+    """Load module-echo-cancel once; idempotent and race-free.
+
+    True when both AEC nodes exist — either already present or created here.
+    The lock makes the exists-check + load atomic across threads.
+    """
+    with _aec_module_lock:
+        if _echo_cancel_nodes_exist():
+            return True
+        args = ["load-module", "module-echo-cancel", "aec_method=webrtc"]
+        source = _default_source_name()
+        sink = _default_sink_name()
+        if source:
+            args.append(f"source_master={source}")
+        if sink:
+            args.append(f"sink_master={sink}")
+        _pactl(*args)
+        return _echo_cancel_nodes_exist()
+
+
+def _count_echo_cancel_nodes() -> tuple[int, int]:
+    """(source nodes, sink nodes) actually named echo-cancel-source/-sink.
+
+    Counts the *name* field of each pactl line, not a substring, so a
+    ``echo-cancel-sink.monitor`` source line is never miscounted as a sink.
+    """
+    sources = _pactl("list", "short", "sources")
+    sinks = _pactl("list", "short", "sinks")
+
+    def names(out) -> list[str]:
+        if not out or out.returncode != 0:
+            return []
+        fields = [line.split() for line in out.stdout.splitlines()]
+        return [f[1] for f in fields if len(f) > 1]
+
+    nsrc = sum(1 for n in names(sources) if n == _ECHO_CANCEL_SOURCE)
+    nsink = sum(1 for n in names(sinks) if n == _ECHO_CANCEL_SINK)
+    return nsrc, nsink
+
+
+# Cached once per process: the PulseAudio node topology does not change while
+# we run (we only ever unload *duplicates* of module-echo-cancel), so re-
+# querying pactl on every listen would be pure overhead.
+_aec_path_unhealthy: bool | None = None
+
+
+def _aec_path_is_unhealthy() -> bool:
+    """True when the echo-cancel path cannot be trusted.
+
+    A module loaded twice (the old load race) leaves two
+    echo-cancel-source/sink pairs with one shared name, which makes routing
+    ambiguous and cancellation flaky — exactly the state that lets the
+    assistant hear itself. Checked once; the result is cached.
+    """
+    global _aec_path_unhealthy
+    if _aec_path_unhealthy is None:
+        nsrc, nsink = _count_echo_cancel_nodes()
+        _aec_path_unhealthy = nsrc > 1 or nsink > 1
+    return _aec_path_unhealthy
+
+
+def _repair_duplicate_echo_cancel() -> bool:
+    """Unload every module-echo-cancel past the first, restoring one healthy
+    AEC path. Best-effort; False when duplicates remain after the attempt.
+    """
+    global _aec_path_unhealthy
+    modules = _pactl("list", "short", "modules")
+    if not modules or modules.returncode != 0:
+        return False
+    ids = []
+    for line in modules.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and "module-echo-cancel" in parts[1]:
+            ids.append(parts[0])
+    for module_id in ids[1:]:
+        _pactl("unload-module", module_id)
+    _aec_path_unhealthy = None  # force a fresh verdict
+    return not _aec_path_is_unhealthy()
 
 
 def _prepare_aec() -> tuple[str, str] | None:
     """Route default mic + speaker through the AEC nodes.
 
     Returns the previous (source, sink) defaults to restore afterward, or
-    None if AEC is unavailable — in which case raw devices are used unchanged.
+    None if AEC is unavailable or untrustworthy — in which case raw devices
+    are used unchanged (the caller then falls back to pause-while-speaking).
+    A duplicated echo-cancel path (the module was loaded twice) is repaired
+    here when possible; if the repair fails, AEC is skipped rather than
+    risking a self-transcription loop through ambiguous nodes.
     """
     if not _load_echo_cancel_module():
+        return None
+    if _aec_path_is_unhealthy() and not _repair_duplicate_echo_cancel():
+        _stt_logger.warning(
+            "Echo-cancel path is duplicated and could not be repaired — "
+            "using raw devices (pause-while-speaking)"
+        )
         return None
     prev_source = _default_source_name()
     prev_sink = _default_sink_name()
@@ -862,7 +995,6 @@ class MicrophoneListener:
         self._running = False
         self._wake_event = asyncio.Event()
         self._current_state = AssistantState.IDLE
-        self._aec_warmed = False
         # Held while the listener is running when echo cancellation is
         # available: the default mic AND speaker stay routed through the
         # AEC nodes for the whole session, so TTS playback is always in the
@@ -889,25 +1021,6 @@ class MicrophoneListener:
         if event.session_id == self._session_id:
             self._current_state = event.state
 
-    async def _warm_aec(self) -> None:
-        """Pre-load the echo-cancel module and nodes before first use.
-
-        The AEC path is otherwise set up lazily inside the first
-        :func:`listen` call, adding pactl module-load latency to the very
-        turn the user is already waiting on. Routing through the nodes
-        once at boot (then restoring) warms everything up so subsequent
-        :func:`listen` calls only re-point the defaults — a few fast
-        pactl calls instead of a module load. Best-effort: AEC stays
-        optional, so a failure here is swallowed.
-        """
-        try:
-            prev = await asyncio.to_thread(_prepare_aec)
-            if prev is not None:
-                await asyncio.sleep(0.05)
-                await asyncio.to_thread(_restore_aec, prev)
-        except Exception as exc:  # noqa: BLE001
-            _stt_logger.debug("AEC warm-up failed (non-fatal): %s", exc)
-
     async def _maybe_preemptive(self, audio: np.ndarray) -> None:
         """Race a cheap ASR ahead of the authoritative transcription.
 
@@ -929,6 +1042,10 @@ class MicrophoneListener:
         text = (text or "").strip()
         if not text or len(text.split()) < PREEMPTIVE_MIN_WORDS:
             return
+        if _is_self_echo(text):
+            # The "speech" the interim ASR heard was the assistant's own
+            # voice — don't burn a speculative LLM call on it.
+            return
         self._bus.emit(
             PartialTranscriptReady(text=text, session_id=self._session_id)
         )
@@ -947,9 +1064,6 @@ class MicrophoneListener:
         _stt_logger.info(
             "MicrophoneListener started (wake_word_gated=%s)", self._wake_word_gated
         )
-        if not self._aec_warmed:
-            self._aec_warmed = True
-            asyncio.create_task(self._warm_aec(), name="aec_warmup")
 
         # Route default mic + speaker through the AEC nodes for the whole
         # session (best-effort). Kept routed while TTS plays so the
@@ -1001,6 +1115,22 @@ class MicrophoneListener:
                     break
 
                 if text and text.strip():
+                    if _is_self_echo(text):
+                        # The transcript is the assistant's own voice leaking
+                        # onto the mic — drop it before it becomes a turn, or
+                        # the cycle (speak -> hear self -> speak) never ends.
+                        _stt_logger.warning("Ignoring self-echo: %r", text)
+                        if self._current_state == AssistantState.LISTENING:
+                            self._bus.emit(
+                                AssistantStateChanged(
+                                    state=AssistantState.IDLE,
+                                    session_id=self._session_id,
+                                )
+                            )
+                        if not self._wake_word_gated:
+                            await asyncio.sleep(0.1)
+                        continue
+
                     _stt_logger.info("Transcript: %r", text)
 
                     # UI state: recording finished, a transcript is ready — the
