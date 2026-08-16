@@ -35,6 +35,12 @@ other: a second ``delegate`` never inherits the first one's context, and
 a follow-up never lands in a fresh session that has no idea what
 "that same file" refers to.
 
+Sessions also survive a restart. The registry file (``agent/state.py``)
+remembers each label's session id and working directory, so "continue
+working on X" attaches to the same OpenCode session instead of starting
+from scratch; a ``delegate`` aimed at a project that already exists is
+routed to ``follow_up`` rather than silently orphaning it.
+
 Whose work is it
 ----------------
 The assistant delegates; it does not do the work and it does not become
@@ -72,6 +78,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from agent.client import (
@@ -80,6 +87,11 @@ from agent.client import (
     get_shared_opencode_client,
 )
 from agent.progress import RunProgress, summarise_permission, summarise_question
+from agent.state import (
+    LAST_INSTRUCTIONS_KEPT,
+    AgentStateStore,
+    ProjectRecord,
+)
 
 logger = logging.getLogger("kancha.agent.tool")
 
@@ -297,6 +309,12 @@ class DelegatedSession:
     session_id: str
     objective: str
     directory: str = ""
+    title: str = ""
+    #: The tail of instructions this session was given, persisted so
+    #: "what were we working on" has an answer after a restart.
+    last_instructions: list[str] = field(default_factory=list)
+    #: The agent's last reported summary, persisted for the same reason.
+    last_summary: str = ""
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     turns: int = 1
@@ -366,8 +384,16 @@ def normalise_label(value: Any) -> str:
 class OpenCodeTool:
     """Validates, routes and tracks structured delegations to OpenCode."""
 
-    def __init__(self, client: OpenCodeClient | None = None) -> None:
+    def __init__(
+        self,
+        client: OpenCodeClient | None = None,
+        state_store: AgentStateStore | None = None,
+    ) -> None:
         self._client_override = client
+        #: The registry that survives a restart. When present, sessions are
+        #: restored from it on startup, the default project directory is
+        #: ``project_root/<label>``, and every delegation is persisted.
+        self._store = state_store
         self._sessions: dict[str, DelegatedSession] = {}
         self._active: str = ""
         self._notifier: Notifier | None = None
@@ -375,6 +401,7 @@ class OpenCodeTool:
         self._pumps: dict[str, asyncio.Task[None]] = {}
         #: session_id -> label, so an event can find its run in O(1).
         self._by_session_id: dict[str, str] = {}
+        self._restore()
 
     @property
     def client(self) -> OpenCodeClient:
@@ -396,6 +423,107 @@ class OpenCodeTool:
         it to ``ResponseReady`` at startup.
         """
         self._notifier = notifier
+
+    def set_state_store(self, store: AgentStateStore | None) -> None:
+        """Attach persistence (or detach it), restoring anything stored."""
+        self._store = store
+        self._restore()
+
+    # ── persistence ─────────────────────────────────────────────────
+
+    def _restore(self) -> None:
+        """Rehydrate the session map from the persisted registry.
+
+        Sessions themselves live on the OpenCode server (``opencode.db``);
+        a stored ``session_id`` is attached to again rather than opened
+        fresh, which is exactly what "continue working on X" means after a
+        restart. Nothing is running on load — a crashed process left the
+        old run's message unanswered and OpenCode has moved on. A label
+        already live in memory (a genuine re-attach) is never clobbered.
+        """
+        store = self._store
+        if store is None:
+            return
+        for label, record in store.records.items():
+            if label in self._sessions:
+                continue
+            self._hydrate(record)
+        if not self._active and store.active in self._sessions:
+            self._active = store.active
+        if self._sessions:
+            logger.info(
+                "Restored %d delegated project(s) from %s%s",
+                len(self._sessions),
+                store.path,
+                f" (active: {self._active})" if self._active else "",
+            )
+
+    def _hydrate(self, record: ProjectRecord) -> None:
+        """Materialise a stored record as a live, resumable session."""
+        session = DelegatedSession(
+            label=record.label,
+            session_id=record.session_id,
+            objective=record.objective,
+            directory=record.directory,
+            title=record.title,
+            last_instructions=list(record.last_instructions),
+            last_summary=record.last_summary,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+            turns=record.turns,
+            progress=RunProgress(
+                label=record.label,
+                objective=record.objective,
+                directory=record.directory,
+            ),
+        )
+        self._sessions[record.label] = session
+        if record.session_id:
+            self._by_session_id[record.session_id] = record.label
+
+    def _resurrect(self, label: str) -> DelegatedSession | None:
+        """Bring a persisted project back into the live map.
+
+        ``_evict_oldest`` bounds the in-memory window; a project dropped
+        from it is still in the registry, and naming it again must find it.
+        """
+        store = self._store
+        record = store.records.get(label) if store is not None else None
+        if record is None:
+            return None
+        self._hydrate(record)
+        logger.info("Resurrected persisted project '%s' from %s", label, store.path)
+        return self._sessions[label]
+
+    def _persist(self, drop: set[str] | None = None) -> None:
+        """Snapshot the session map into the registry file, best-effort.
+
+        Persistence is the memory that survives a restart; a disk failure
+        must cost the record, never the delegation that produced it.
+        """
+        store = self._store
+        if store is None:
+            return
+        sessions = {
+            label: ProjectRecord(
+                label=session.label,
+                title=session.title,
+                session_id=session.session_id,
+                directory=session.directory,
+                objective=session.objective,
+                created_at=session.created_at,
+                updated_at=session.updated_at,
+                turns=session.turns,
+                last_instructions=session.last_instructions,
+                last_summary=session.last_summary,
+                state=session.progress.state,
+            )
+            for label, session in self._sessions.items()
+        }
+        try:
+            store.save(sessions, self._active, drop=drop)
+        except Exception:  # noqa: BLE001 — the record, not the run
+            logger.exception("Could not persist project state to %s", store.path)
 
     # ── background machinery ──────────────────────────────────────────
 
@@ -506,6 +634,7 @@ class OpenCodeTool:
             session.updated_at = time.time()
             if reply.success:
                 summary = str(reply.data.get("text") or "").strip()
+                session.last_summary = summary
                 session.progress.tokens = (
                     reply.data.get("tokens") or session.progress.tokens
                 )
@@ -538,6 +667,9 @@ class OpenCodeTool:
         finally:
             # However this ended, stop volunteering updates about it.
             heartbeat.cancel()
+            # The end state of the run is the last thing worth persisting
+            # before the session settles back to idle.
+            self._persist()
 
     async def _fire_notifier(self, session: DelegatedSession) -> None:
         notifier = self._notifier
@@ -633,6 +765,27 @@ class OpenCodeTool:
         # directory means the work lands somewhere nobody looks.
         directory = str(params.get("directory") or "").strip()
 
+        # A "delegate" aimed at a project we already know about, with no
+        # new location, is really a continuation — opening a fresh session
+        # for it would orphan all the context the agent built. Route it to
+        # follow_up so a small change never starts from scratch.
+        if (
+            not directory
+            and requested
+            and (requested in self._sessions or self._known_label(requested))
+        ):
+            return await self._handle_follow_up(
+                {**params, "instruction": task, "label": requested}
+            )
+
+        # No location named and persistence is on: give the project its
+        # own folder under ``projects/``. The directory exists before the
+        # session is created — OpenCode fails to resolve a message in a
+        # working directory that does not exist yet.
+        if not directory and self._store is not None:
+            directory = str(self.client.config.project_root / label)
+            Path(directory).mkdir(parents=True, exist_ok=True)
+
         created = await self.client.create_session(
             title=task[:120], directory=directory
         )
@@ -646,6 +799,7 @@ class OpenCodeTool:
             session_id=session_id,
             objective=task,
             directory=resolved_directory,
+            title=task[:120],
             progress=RunProgress(
                 label=label, objective=task, directory=resolved_directory
             ),
@@ -662,7 +816,9 @@ class OpenCodeTool:
             resolved_directory or "(default workspace)",
             task,
         )
-        return self._start(session, DELEGATION_PREAMBLE + task, "delegate")
+        result = self._start(session, DELEGATION_PREAMBLE + task, "delegate")
+        self._persist()
+        return result
 
     def _start(
         self, session: DelegatedSession, text: str, action: str
@@ -740,6 +896,10 @@ class OpenCodeTool:
         self._active = session.label
         session.turns += 1
         session.updated_at = time.time()
+        session.last_instructions = (
+            session.last_instructions + [instruction]
+        )[-LAST_INSTRUCTIONS_KEPT:]
+        session.last_summary = ""
         # A follow-up is a new run against the same context: reset the
         # counters so "how's it going" describes this instruction, not
         # the sum of everything the session has ever done.
@@ -754,7 +914,9 @@ class OpenCodeTool:
             session.session_id,
             instruction,
         )
-        return self._start(session, instruction, "follow_up")
+        result = self._start(session, instruction, "follow_up")
+        self._persist()
+        return result
 
     # ── status ────────────────────────────────────────────────────────
 
@@ -1023,6 +1185,7 @@ class OpenCodeTool:
         self._by_session_id.pop(session.session_id, None)
         if self._active == session.label:
             self._active = next(reversed(self._sessions), "") if self._sessions else ""
+        self._persist(drop={session.label})
         return AgentToolResult(
             success=True,
             action="end_session",
@@ -1047,6 +1210,12 @@ class OpenCodeTool:
                 return value
         return ""
 
+    def _known_label(self, label: str) -> bool:
+        """Known live, or persisted and therefore resumable by name."""
+        if label in self._sessions:
+            return True
+        return bool(self._store and label in self._store.records)
+
     def _resolve_session(
         self, params: dict[str, Any]
     ) -> tuple[DelegatedSession | None, str]:
@@ -1056,6 +1225,11 @@ class OpenCodeTool:
             session = self._sessions.get(label)
             if session is not None:
                 return session, ""
+            # A project evicted from the in-memory window is still in the
+            # registry, and "continue X" must find it.
+            resurrected = self._resurrect(label)
+            if resurrected is not None:
+                return resurrected, ""
             known = ", ".join(self._sessions) or "none"
             return None, f"No delegated task called '{label}'. Known: {known}."
 
@@ -1064,10 +1238,20 @@ class OpenCodeTool:
             for session in self._sessions.values():
                 if session.session_id == session_id:
                     return session, ""
+            if self._store is not None:
+                for record in self._store.records.values():
+                    if record.session_id == session_id:
+                        resurrected = self._resurrect(record.label)
+                        if resurrected is not None:
+                            return resurrected, ""
             return None, f"No delegated task with session id '{session_id}'."
 
         if self._active and self._active in self._sessions:
             return self._sessions[self._active], ""
+        if self._active:
+            resurrected = self._resurrect(self._active)
+            if resurrected is not None:
+                return resurrected, ""
         return None, "Nothing has been delegated yet, so there is nothing to continue."
 
     def _evict_oldest(self) -> None:

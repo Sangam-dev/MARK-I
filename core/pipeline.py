@@ -45,6 +45,7 @@ from pathlib import Path
 from agent.client import OpenCodeClient, close_shared_opencode, set_shared_opencode_client
 from agent.config import OpenCodeConfig
 from agent.progress import RunProgress
+from agent.state import AgentStateStore
 from agent.tool import get_shared_opencode_tool
 from core.bus import EventBus
 from core.events import (
@@ -397,6 +398,15 @@ async def build_pipeline(
         bus.emit(ResponseReady(text=text))
 
     get_shared_opencode_tool().set_notifier(_announce_agent_update)
+
+    # The registry file is what lets a project be resumed by name after a
+    # restart: it remembers which label is which session id and where it
+    # works. Persistence is a memory, so it is wired unconditionally —
+    # delegation is not disabled with the agent (the tool is what the LLM
+    # calls; KANCHA_OPENCODE_ENABLED only governs the spawned server).
+    get_shared_opencode_tool().set_state_store(
+        AgentStateStore(opencode_config.project_root / "agent-state.json")
+    )
 
     if opencode_config.enabled:
         logger.info("OpenCode delegation enabled — %s", opencode_config.describe())

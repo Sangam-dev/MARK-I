@@ -18,6 +18,7 @@ Environment variables (all optional, all prefixed ``KANCHA_OPENCODE_``)::
                                            other Zen free models)
     KANCHA_OPENCODE_AGENT            str    (default build)
     KANCHA_OPENCODE_WORKSPACE        path   (default ~/kancha-workspace)
+    KANCHA_OPENCODE_PROJECTS_DIR     path   (default <workspace>/projects)
     KANCHA_OPENCODE_TIMEOUT_S        s      (default 1800)
     KANCHA_OPENCODE_STARTUP_TIMEOUT_S s     (default 45)
     KANCHA_OPENCODE_MAX_SESSIONS     int    (default 8)
@@ -152,6 +153,14 @@ class OpenCodeConfig:
 
     # ── Where the work happens ───────────────────────────────────────
     workspace: Path = Path.home() / "kancha-workspace"
+    #: Where a delegated project gets its own directory by default —
+    #: ``projects/<label>`` under the workspace. A user-named directory
+    #: overrides this for that project, and every project keeps a
+    #: ``projects/agent-state.json`` registry here so the assistant can
+    #: resume a session by name after a restart. Only applied when
+    #: persistence is enabled (the store is wired by the pipeline);
+    #: without a store, an unnamed delegation uses the workspace.
+    project_root: Path = Path.home() / "kancha-workspace" / "projects"
 
     # ── Budgets ──────────────────────────────────────────────────────
     # A delegated build is minutes of work, not seconds — this is not a
@@ -191,6 +200,12 @@ class OpenCodeConfig:
         ``tests/test_opencode.py::from_env_fallbacks_match_the_field_defaults``.
         """
         workspace = _env_str("KANCHA_OPENCODE_WORKSPACE", "")
+        resolved_workspace = (
+            Path(workspace).expanduser()
+            if workspace
+            else Path.home() / "kancha-workspace"
+        )
+        projects_dir = _env_str("KANCHA_OPENCODE_PROJECTS_DIR", "")
         return cls(
             enabled=_env_bool("KANCHA_OPENCODE_ENABLED", True),
             server_url=_env_str("KANCHA_OPENCODE_URL", "").rstrip("/"),
@@ -211,10 +226,11 @@ class OpenCodeConfig:
                 ),
             ),
             agent=_env_str("KANCHA_OPENCODE_AGENT", "build"),
-            workspace=(
-                Path(workspace).expanduser()
-                if workspace
-                else Path.home() / "kancha-workspace"
+            workspace=resolved_workspace,
+            project_root=(
+                Path(projects_dir).expanduser()
+                if projects_dir
+                else resolved_workspace / "projects"
             ),
             request_timeout_s=_env_float(
                 "KANCHA_OPENCODE_TIMEOUT_S", 1800.0, low=10.0, high=7200.0
@@ -239,6 +255,7 @@ class OpenCodeConfig:
         return (
             f"model={self.provider}/{self.model}{fallbacks} "
             f"agent={self.agent} "
-            f"workspace={self.workspace} server=({where}) "
+            f"workspace={self.workspace} projects={self.project_root} "
+            f"server=({where}) "
             f"timeout={self.request_timeout_s:.0f}s"
         )
