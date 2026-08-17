@@ -10,20 +10,15 @@ from typing import Any
 
 import aiosqlite
 
-from .base import AbstractMemoryBackend
 from core.exceptions import MemoryError
 
 
-class StructuredMemory(AbstractMemoryBackend):
+class StructuredMemory:
     """SQLite-backed structured memory for conversations, facts, and tasks."""
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
         self._conn: aiosqlite.Connection | None = None
-
-    @property
-    def name(self) -> str:
-        return "structured"
 
     async def initialize(self) -> None:
         """Create tables and enable WAL mode."""
@@ -36,15 +31,6 @@ class StructuredMemory(AbstractMemoryBackend):
 
         # Create tables
         await self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS interactions (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                metadata TEXT DEFAULT '{}'
-            );
-
             CREATE TABLE IF NOT EXISTS facts (
                 id TEXT PRIMARY KEY,
                 key TEXT NOT NULL,
@@ -64,8 +50,6 @@ class StructuredMemory(AbstractMemoryBackend):
                 metadata TEXT DEFAULT '{}'
             );
 
-            CREATE INDEX IF NOT EXISTS idx_interactions_session
-                ON interactions(session_id, timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_facts_session_key
                 ON facts(session_id, key);
             CREATE INDEX IF NOT EXISTS idx_tasks_session_status
@@ -73,63 +57,13 @@ class StructuredMemory(AbstractMemoryBackend):
         """)
         await self._conn.commit()
 
-    async def store(self, content: str, metadata: dict[str, Any]) -> str:
-        """Store generic content. Delegates to store_interaction."""
-        session_id = metadata.get("session_id", "default")
-        role = metadata.get("role", "user")
-        return await self.store_interaction(session_id, role, content, metadata)
-
-    async def retrieve(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        """Retrieve recent interactions matching query (simple text search)."""
-        if not self._conn:
-            raise MemoryError("Database not initialized")
-
-        # Simple text search in content
-        cursor = await self._conn.execute(
-            """
-            SELECT id, session_id, role, content, timestamp, metadata
-            FROM interactions
-            WHERE content LIKE ?
-            ORDER BY timestamp DESC
-            LIMIT ?
-            """,
-            (f"%{query}%", limit),
-        )
-        rows = await cursor.fetchall()
-        return [
-            {
-                "id": row["id"],
-                "session_id": row["session_id"],
-                "role": row["role"],
-                "content": row["content"],
-                "timestamp": row["timestamp"],
-                "metadata": json.loads(row["metadata"]),
-            }
-            for row in rows
-        ]
-
-    async def delete(self, record_id: str) -> bool:
-        """Delete a record by ID from any table."""
-        if not self._conn:
-            raise MemoryError("Database not initialized")
-
-        # Try each table
-        for table in ("interactions", "facts", "tasks"):
-            cursor = await self._conn.execute(
-                f"DELETE FROM {table} WHERE id = ?", (record_id,)
-            )
-            if cursor.rowcount > 0:
-                await self._conn.commit()
-                return True
-        return False
-
     async def clear_session(self, session_id: str) -> int:
-        """Clear all records for a session across all tables."""
+        """Clear all records for a session (facts and tasks)."""
         if not self._conn:
             raise MemoryError("Database not initialized")
 
         total = 0
-        for table in ("interactions", "facts", "tasks"):
+        for table in ("facts", "tasks"):
             cursor = await self._conn.execute(
                 f"DELETE FROM {table} WHERE session_id = ?", (session_id,)
             )
@@ -137,78 +71,11 @@ class StructuredMemory(AbstractMemoryBackend):
         await self._conn.commit()
         return total
 
-    async def health_check(self) -> bool:
-        """Check if database is accessible."""
-        try:
-            if not self._conn:
-                return False
-            await self._conn.execute("SELECT 1")
-            return True
-        except Exception:
-            return False
-
     async def close(self) -> None:
         """Close database connection."""
         if self._conn:
             await self._conn.close()
             self._conn = None
-
-    # --- Interaction methods ---
-
-    async def store_interaction(
-        self,
-        session_id: str,
-        role: str,
-        content: str,
-        metadata: dict[str, Any] | None = None,
-    ) -> str:
-        """Store a conversation interaction."""
-        if not self._conn:
-            raise MemoryError("Database not initialized")
-
-        record_id = str(uuid.uuid4())
-        timestamp = datetime.utcnow().isoformat()
-        meta_json = json.dumps(metadata or {})
-
-        await self._conn.execute(
-            """
-            INSERT INTO interactions (id, session_id, role, content, timestamp, metadata)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (record_id, session_id, role, content, timestamp, meta_json),
-        )
-        await self._conn.commit()
-        return record_id
-
-    async def get_recent_interactions(
-        self, session_id: str, limit: int = 10
-    ) -> list[dict[str, Any]]:
-        """Get recent interactions for a session."""
-        if not self._conn:
-            raise MemoryError("Database not initialized")
-
-        cursor = await self._conn.execute(
-            """
-            SELECT id, session_id, role, content, timestamp, metadata
-            FROM interactions
-            WHERE session_id = ?
-            ORDER BY timestamp DESC
-            LIMIT ?
-            """,
-            (session_id, limit),
-        )
-        rows = await cursor.fetchall()
-        return [
-            {
-                "id": row["id"],
-                "session_id": row["session_id"],
-                "role": row["role"],
-                "content": row["content"],
-                "timestamp": row["timestamp"],
-                "metadata": json.loads(row["metadata"]),
-            }
-            for row in rows
-        ]
 
     # --- Fact methods ---
 

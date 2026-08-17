@@ -144,7 +144,6 @@ class MockMemory:
     _short_term_data: list[dict[str, str]] = field(default_factory=list)
     short_term: MockShortTerm = field(default_factory=MockShortTerm)
     structured_facts: list[dict[str, str]] = field(default_factory=list)
-    _recent_plan_outputs: dict[str, dict[str, str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.short_term = MockShortTerm(_data=self._short_term_data)
@@ -155,12 +154,6 @@ class MockMemory:
     async def store_fact(self, key: str, value: str, session_id: str) -> str:
         self.structured_facts.append({"key": key, "value": value})
         return key
-
-    def get_recent_plan_outputs(self, plan_id: str | None = None) -> dict[str, str]:
-        return {}
-
-    def clear_plan_outputs(self, plan_id: str | None = None) -> None:
-        pass
 
 
 # ── Test runner ──────────────────────────────────────────────────────
