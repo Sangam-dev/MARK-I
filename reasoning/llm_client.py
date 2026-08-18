@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import Any, AsyncIterator
 
 from memory.token_log import TokenLog
@@ -28,14 +29,8 @@ MEMORY_RESPONSE_FORMAT = """\
 Respond with ONLY one JSON object, no markdown, no code fences, no preamble:
 
 {
-  "task": {
-    "task_type": "...",
-    "instruction": "...",
-    "parameters": {},
-    "expected_result": "...",
-    "context": {},
-    "follow_up": false
-  },
+  "task": {"task_type": "...", "instruction": "...", "parameters": {},
+           "expected_result": "...", "context": {}, "follow_up": false},
   "message": "Your reply to the user",
   "sql": [{"key": "...", "value": "..."}],
   "rag": [{"type": "...", "title": "...", "content": "..."}]
@@ -45,55 +40,30 @@ Rules:
 - "task" is OPTIONAL and delegates one unit of work to the execution
   layer. Include it ONLY when the request needs a tool, a system action,
   or live data. Omit it entirely for ordinary conversation. The task
-  layer never sees the conversation — "instruction" must therefore be
-  self-contained, with every reference ("it", "that", "the second one")
-  already resolved into explicit values.
-
-- When you include "task", it MUST be the FIRST key in the object,
-  before "message". Ordinary replies start directly with "message".
-  This ordering is load-bearing: it is how the assistant knows, while
-  your reply is still being generated, whether it is about to start
-  work — which decides whether your acknowledgement is spoken at all.
-
+  layer never sees this conversation, so "instruction" must be
+  self-contained: resolve every reference ("it", "that", "the second
+  one") into explicit values.
+- When you include "task", it MUST be the FIRST key, before "message".
+  This ordering is load-bearing: while your reply is still generating,
+  it tells the assistant whether work is about to start and whether the
+  acknowledgement should be spoken.
 - "message" is REQUIRED and is the only text shown to the user.
-
-- Long values — an essay, an email body, a report — go inside the JSON
-  string as ONE line using \\n for line breaks. Never a real newline, and
-  never write the content outside the object. The whole reply must still
-  be a single parseable JSON object: no sentence before the "{", nothing
-  after the "}".
-
-- "sql" is OPTIONAL and holds STRUCTURED memory: short key/value facts.
-  Use it for preferences, profile details, settings, relationships and
-  other small stable values.
-    Good: {"key": "favorite_language", "value": "Rust"}
-          {"key": "current_project", "value": "AI Assistant"}
-          {"key": "preferred_editor", "value": "Neovim"}
-  Existing keys are updated in place; new keys are inserted. Never
-  duplicate a key. Values must be short — a phrase, not a paragraph.
-
-- "rag" is OPTIONAL and holds SEMANTIC memory: self-contained passages
-  worth recalling. Use it for experiences, research,
-  technical documentation, project progress, learning summaries, design
-  decisions and debugging solutions , all of this are mandatory. 
-  Each entry needs "type", "title"
-  and "content", where "content" is a complete standalone paragraph
-  that still makes sense with no surrounding conversation. 
-    Good: {"type": "debugging", "title": "Fixed the WebSocket drop",
-           "content": "The socket closed after 60s because the proxy
-           idle timeout was shorter than the heartbeat interval.
-           Lowering the heartbeat to 25s resolved it."}
+- Long values (essay, email, report) go inside the JSON as ONE line
+  using \\n for line breaks. Never a real newline, never text outside
+  the object, no sentence before "{", nothing after "}".
+- "sql" is OPTIONAL structured memory: short key/value facts
+  (preferences, profile, settings, relationships). Keys update in
+  place; never duplicate a key; values are a phrase, not a paragraph.
+- "rag" is OPTIONAL semantic memory: self-contained passages worth
+  recalling — experiences, research, technical documentation, project
+  progress, learning summaries, design decisions, debugging solutions.
+  Each entry has "type", "title" and "content", a standalone paragraph.
   NEVER put greetings, chit-chat, one-off questions, temporary context,
-  or restatements of the user's request in "rag".
-
-- Choosing between them: if it fits in a short key/value pair it is
-  "sql"; if it needs a paragraph to be useful later it is "rag". Most
-  turns need neither.
-
-- Omit "sql" and "rag" entirely when there is nothing to store.
-  Never return empty arrays and never return null.
-
-- Omit "task" entirely when no action is required. Never return null.
+  or restatements of the request in "rag".
+- Choose by size: a short key/value pair is "sql"; a paragraph that
+  must stand alone is "rag". Most turns need neither.
+- Omit "sql", "rag" and "task" entirely when there is nothing to store.
+  Never return empty arrays, never return null.
 """
 # JSON string escapes that can appear inside the streamed ``message`` value.
 # Decoding them the same way ``json.loads`` does keeps the streamed display
@@ -564,6 +534,8 @@ class GeminiClient:
             raise RuntimeError("GeminiClient is not initialized")
 
         buffer: list[str] = []
+        stream_started = time.perf_counter()
+        first_chunk = True
         try:
             async for chunk in hedged_stream_conv(
                 pool=self.pool,
@@ -575,6 +547,12 @@ class GeminiClient:
                 ),
                 timeout=self.timeout,
             ):
+                if first_chunk:
+                    logger.info(
+                        "TTFT: first token after %.2fs",
+                        time.perf_counter() - stream_started,
+                    )
+                    first_chunk = False
                 buffer.append(chunk)
                 yield chunk
 

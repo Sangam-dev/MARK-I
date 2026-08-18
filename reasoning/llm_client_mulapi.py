@@ -62,7 +62,7 @@ load_dotenv()
 
 try:
     from google import genai
-    from google.genai import errors as genai_errors
+    from google.genai import errors as genai_errors,types
 
 except ImportError:
     sys.exit("Run: pip install google-genai")

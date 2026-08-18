@@ -10,6 +10,8 @@ events stream in; ``speak()`` does the same for a complete text block.
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import glob
 import os
 import re
 import sys
@@ -23,6 +25,7 @@ from core.audio_state import audio_state
 
 try:
     from kokoro_onnx import Kokoro
+    import onnxruntime as ort
     import sounddevice as sd
 except ImportError:
     sys.exit(
@@ -180,8 +183,47 @@ _kokoro: Kokoro | None = None
 _kokoro_synth_lock: asyncio.Lock | None = None
 
 
+def _preload_nvidia_libs() -> None:
+    """Preload the pip-installed NVIDIA CUDA/cuDNN runtime libraries.
+
+    onnxruntime-gpu's CUDA provider is dlopen'd lazily when the session is
+    created, and it does NOT search ``site-packages/nvidia/*/lib`` on its
+    own — without these libraries in the loader's view the provider fails
+    with ``libcublasLt.so.13: cannot open shared object file`` and silently
+    falls back to CPU. Loading them here with ``RTLD_GLOBAL`` (before the
+    session exists) makes them visible to the provider's dlopen. Requires
+    the matching nvidia wheels installed (see pyproject.toml).
+    """
+    import site
+
+    site_packages = site.getsitepackages()
+    lib_dirs: list[str] = []
+    for sp in site_packages:
+        lib_dirs.extend(
+            glob.glob(os.path.join(sp, "nvidia", "cu13", "lib"))
+            + glob.glob(os.path.join(sp, "nvidia", "cudnn", "lib"))
+        )
+    for so in sorted(
+        p for d in lib_dirs for p in glob.glob(os.path.join(d, "*.so*"))
+    ):
+        try:
+            ctypes.CDLL(so, mode=os.RTLD_GLOBAL)
+        except OSError:
+            # A lib whose own deps aren't loadable yet — the next dlopen
+            # pass (or the session itself) will resolve it; harmless.
+            pass
+
+
 def _get_kokoro() -> Kokoro:
-    """Load (once) the local Kokoro model; warmed up at boot via TTSHandler.warmup."""
+    """Load (once) the local Kokoro model; warmed up at boot via TTSHandler.warmup.
+
+    The ONNX session is built explicitly so TTS runs on the GPU when
+    onnxruntime-gpu is installed: kokoro-onnx's own detection probes for
+    a module named ``onnxruntime-gpu``, which never exists (the GPU wheel
+    installs the ``onnxruntime`` module), so it would silently stay on
+    CPU. We prefer CUDA (then TensorRT) and fall back to CPU only when
+    no GPU provider is usable.
+    """
     global _kokoro
     if _kokoro is None:
         model = os.path.join(KOKORO_MODEL_DIR, "kokoro-v1.0.onnx")
@@ -192,7 +234,23 @@ def _get_kokoro() -> Kokoro:
                 "kokoro-v1.0.onnx and voices-v1.0.bin and set "
                 "KANCHA_TTS_MODEL_DIR (default ./tts/data)."
             )
-        _kokoro = Kokoro(model, voices)
+        _preload_nvidia_libs()
+        available = ort.get_available_providers()
+        preferred = [
+            p
+            for p in ("CUDAExecutionProvider", "TensorrtExecutionProvider")
+            if p in available
+        ]
+        selected = [*preferred, "CPUExecutionProvider"] if preferred else [
+            "CPUExecutionProvider"
+        ]
+        session = ort.InferenceSession(model, providers=selected)
+        logger.info(
+            "Kokoro ONNX session using providers: %s (available: %s)",
+            session.get_providers(),
+            available,
+        )
+        _kokoro = Kokoro.from_session(session, voices)
     return _kokoro
 
 
