@@ -77,6 +77,13 @@ SOFT_BOUNDARIES = {",", "—"}
 SOFT_BREAK_THRESHOLD = 24
 BOUNDARIES = HARD_BOUNDARIES | SOFT_BOUNDARIES
 
+# First-sentence early split: the opening words of a reply start speaking as
+# soon as ~this many chars arrive, even without any punctuation, instead of
+# waiting for the model to finish the full first sentence. Applied only to the
+# first sentence of an utterance; the rest keep normal sentence granularity.
+EARLY_SPLIT_MIN_LEN = int(os.getenv("KANCHA_EARLY_SPLIT_MIN_LEN", "10"))
+EARLY_SPLIT_CHARS = " \t,;—"
+
 ABBREV = re.compile(
     r"\b(Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|e\.g|i\.e|approx|dept|est|govt|inc|ltd)\.$",
     re.IGNORECASE,
@@ -97,15 +104,24 @@ FALSE_INTERRUPTION_TIMEOUT = float(
 )
 
 
-def _extract_sentences(buffer: str) -> tuple[list[str], str]:
+def _extract_sentences(
+    buffer: str, early_first: bool = False
+) -> tuple[list[str], str]:
     """
     Extract complete speakable sentences, preferring hard boundaries (., !, ?)
     past MIN_CHUNK_LEN. Once the buffer passes SOFT_PREFERRED_THRESHOLD,
     prefer the nearest soft boundary (comma/em-dash) so long single-sentence
     responses start speaking at the first clause. Falls back to the deferred
     hard boundary, then to a forced split at MAX_CHUNK_LEN.
+
+    With ``early_first``, the very first split may also happen at a plain word
+    boundary once the buffer passes EARLY_SPLIT_MIN_LEN — no punctuation
+    required — so the opening words of a streaming reply start speaking
+    immediately. Only the first sentence is affected; subsequent ones still
+    wait for real boundaries.
     """
     sentences = []
+    first = True
     while True:
         # Hard boundary pass; a far-off one past SOFT_PREFERRED_THRESHOLD is
         # deferred so the soft pass can split earlier instead.
@@ -146,6 +162,18 @@ def _extract_sentences(buffer: str) -> tuple[list[str], str]:
             else:
                 boundary_pos = deferred_hard
 
+        # Early first split: no punctuation yet, but enough text to start.
+        if (
+            boundary_pos == -1
+            and early_first
+            and first
+            and len(buffer) >= EARLY_SPLIT_MIN_LEN
+        ):
+            for i in range(EARLY_SPLIT_MIN_LEN, len(buffer)):
+                if buffer[i] in EARLY_SPLIT_CHARS:
+                    boundary_pos = i
+                    break
+
         # Forced split at the last space past MAX_CHUNK_LEN.
         if boundary_pos == -1 and len(buffer) >= MAX_CHUNK_LEN:
             sp = buffer.rfind(" ", 0, MAX_CHUNK_LEN)
@@ -156,6 +184,7 @@ def _extract_sentences(buffer: str) -> tuple[list[str], str]:
 
         sentence = buffer[: boundary_pos + 1].strip()
         buffer = buffer[boundary_pos + 1 :].lstrip()
+        first = False
         if sentence and len(sentence) > 2:
             sentences.append(sentence)
 
@@ -411,6 +440,9 @@ class StreamingSpeaker:
         self._lock: asyncio.Lock | None = None
         self._queue: asyncio.Queue[tuple[str, asyncio.Task | None] | None] | None = None
         self._player: asyncio.Task | None = None
+        # Monotonic time the first response token arrived; cleared once the
+        # first audio of the utterance actually starts playing.
+        self.first_token_at: float | None = None
 
     def _get_lock(self) -> asyncio.Lock:
         if self._lock is None:
@@ -435,6 +467,10 @@ class StreamingSpeaker:
             try:
                 audio = await task
                 if audio is not None:
+                    if self.first_token_at is not None:
+                        dt = time.perf_counter() - self.first_token_at
+                        print(f"⏱ First audio in {dt * 1000:.0f}ms after first token")
+                        self.first_token_at = None
                     audio_state.note_spoken(sentence)
                     loop = asyncio.get_running_loop()
                     await loop.run_in_executor(None, _play, *audio)
@@ -454,6 +490,7 @@ class StreamingSpeaker:
     async def drain(self) -> None:
         """Stop the player and block until all queued audio has finished."""
         async with self._get_lock():
+            self.first_token_at = None
             player = self._player
             if player is None or player.done():
                 self._player = None
@@ -471,6 +508,7 @@ class StreamingSpeaker:
     def interrupt(self) -> None:
         """Cut playback immediately and discard everything queued (safe from
         the event-loop thread; leaves the mic's input stream untouched)."""
+        self.first_token_at = None
         _stop_playback()
         player = self._player
         self._player = None
@@ -536,6 +574,11 @@ class TTSHandler:
             self._utterance_lock = asyncio.Lock()
         return self._utterance_lock
 
+    def _note_first_token(self) -> None:
+        """Stamp the moment the first response token arrives (per utterance)."""
+        if self._speaker.first_token_at is None:
+            self._speaker.first_token_at = time.perf_counter()
+
     async def on_partial(self, event: PartialResponse) -> None:
         async with self._get_utterance_lock():
             if self._discard_until_next_turn:
@@ -547,6 +590,7 @@ class TTSHandler:
             if not event.text:
                 return
             self._session_id = event.session_id
+            self._note_first_token()
             self._visible += event.text
             self._buf += event.text
             await self._speak_complete_sentences()
@@ -570,6 +614,7 @@ class TTSHandler:
             # thinking gate, so the mic can't slip in between the two.
             if not self._started:
                 await self._mark_speaking()
+            self._note_first_token()
 
             # Speak only what streaming hasn't covered. When the streamed text
             # is a prefix of the final, merge the buffered fragment with the
@@ -650,7 +695,11 @@ class TTSHandler:
             self._resume_task = None
 
     async def _speak_complete_sentences(self) -> None:
-        sentences, self._buf = _extract_sentences(self._buf)
+        # early_first only applies to the very first sentence of an utterance:
+        # once anything has been pushed (_started), normal granularity resumes.
+        sentences, self._buf = _extract_sentences(
+            self._buf, early_first=not self._started
+        )
         for sentence in sentences:
             await self._mark_speaking()
             await self._speaker.push(sentence)
