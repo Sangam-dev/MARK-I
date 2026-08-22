@@ -85,9 +85,11 @@ ONSET_TOLERANCE_CHUNKS = 3
 
 # Text self-echo guard: last-resort filter for transcripts that near-duplicate
 # what the assistant just said (the AEC path + correlation gate do the real work).
+# The gate tolerates the short mis-heard fragments the echo produces (2–3 words,
+# ~45% token overlap), so it must be looser than the old 4-words / 0.6 defaults.
 SELF_ECHO_WINDOW_SECS = float(os.getenv("KANCHA_SELF_ECHO_WINDOW_S", "6.0"))
-SELF_ECHO_RATIO = float(os.getenv("KANCHA_SELF_ECHO_RATIO", "0.6"))
-SELF_ECHO_MIN_WORDS = int(os.getenv("KANCHA_SELF_ECHO_MIN_WORDS", "4"))
+SELF_ECHO_RATIO = float(os.getenv("KANCHA_SELF_ECHO_RATIO", "0.45"))
+SELF_ECHO_MIN_WORDS = int(os.getenv("KANCHA_SELF_ECHO_MIN_WORDS", "2"))
 
 
 def _word_tokens(text: str) -> list[str]:
@@ -128,6 +130,19 @@ _THRESHOLD_MIN = 0.01
 # Sustained above-threshold speech required before the assistant's audio is
 # cut (barge-in) — a brief blip never interrupts.
 BARGE_IN_CONFIRM_SECS = float(os.getenv("KANCHA_BARGE_IN_CONFIRM_SECS", "0.4"))
+
+# While the assistant is speaking (or its reverb tail is ringing), the mic
+# hears its own voice as a QUIET residual — AEC leaves a speech-like signal
+# that Silero VAD can't reject by content, and correlation can't separate it
+# (AEC decorrelates the linear echo). The one reliable discriminator is
+# volume: a real user talking into the mic is far louder than that residual
+# (measured: echo residual block-RMS ~0.04, reverb tail ~0.005). Blocks
+# below this floor while the assistant is speaking are treated as its own
+# echo and ignored — this is what breaks the self-listening loop while still
+# letting genuine barge-in (loud user speech) cut the assistant.
+PLAYBACK_SPEECH_FLOOR = float(
+    os.getenv("KANCHA_PLAYBACK_SPEECH_FLOOR", "0.08")
+)
 
 SILENCE_HALLUCINATIONS = {
     "thank you",
@@ -448,10 +463,24 @@ async def listen(
                 loop.call_soon_threadsafe(stop_event.set)
                 return
 
+            if audio_state.playback_recent:
+                # The assistant is speaking (or its reverb tail is ringing).
+                # The mic hears its own voice as a QUIET residual that AEC
+                # leaves behind — speech-like enough to trip Silero, too
+                # decorrelated to catch by correlation. A real user talking
+                # into the mic is far louder than that residual, so blocks
+                # below the floor are our own echo: ignore them outright.
+                # (Barge-in still works: loud user speech clears the floor and
+                # flows into the speech/barge-in logic below.)
+                block_rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
+                if block_rms < PLAYBACK_SPEECH_FLOOR:
+                    return
+
             if audio_state.matches_playback(indata[:, 0]):
-                # The mic hears our own voice (echo leak or reverb tail) —
-                # correlated with the exact played waveform. Ignore it; real
-                # user speech doesn't correlate, so barge-in still works.
+                # The mic hears our own voice (strong linear echo leak or
+                # reverb tail) — correlated with the exact played waveform.
+                # Ignore it; real user speech doesn't correlate, so barge-in
+                # still works.
                 return
 
             total_chunks += 1

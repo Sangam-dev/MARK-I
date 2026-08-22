@@ -24,16 +24,18 @@ Supported actions:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("kancha.actions.desktop_control")
 
 # ── Optional deps ────────────────────────────────────────────────────────────
 try:
@@ -61,11 +63,33 @@ def _base_dir() -> Path:
 
 def _get_api_key() -> str:
     """
-    Load Gemini API key.
+    Load a Gemini API key.
+
     Preference order:
-      1. OS keyring  (service="jarvis", username="gemini_api_key")
-      2. config/api_keys.json  (fallback)
+      1. The shared key pool (reasoning.llm_client_mulapi) — so desktop
+         automation rides the same rotation/cooldown state as chat.
+      2. Raw env vars (GEMINI_API_KEY_1..9, GEMINI_API_KEY, GOOGLE_API_KEY).
+      3. OS keyring  (service="jarvis", username="gemini_api_key")
+      4. config/api_keys.json  (fallback)
     """
+    try:
+        from reasoning.llm_client_mulapi import get_pool  # noqa: PLC0415
+
+        for entry in get_pool().entries():
+            if entry.is_available:
+                return entry.key
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Key pool unavailable for desktop_control (%s) — using env", exc)
+
+    for i in range(1, 10):
+        key = os.getenv(f"GEMINI_API_KEY_{i}", "").strip()
+        if key:
+            return key
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        key = os.getenv(name, "").strip()
+        if key:
+            return key
+
     if _HAS_KEYRING:
         val = _keyring.get_password("jarvis", "gemini_api_key")
         if val:
@@ -953,7 +977,14 @@ Output ONLY valid Python code. No explanation, no markdown, no backticks.
 Task: {task}"""
 
     try:
-        resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        resp = client.models.generate_content(
+            model=os.getenv(
+                "GEMINI_MODEL",
+                os.getenv("gemini-flash-lite-latest")
+                .split(",")[0],
+            ),
+            contents=prompt,
+        )
         return resp.text.strip()
     except Exception as e:
         return f"ERROR: {e}"

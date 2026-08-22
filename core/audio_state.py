@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 
 import numpy as np
@@ -13,13 +14,18 @@ DEFAULT_TTS_COOLDOWN_SECS = 0.3
 # Reference kept of the exact PCM the speaker played (resampled to the mic
 # rate), so STT can detect its own echo by correlation instead of by text.
 _MIC_RATE = 16000
-_PLAYBACK_REF_SECS = 1.0
+_PLAYBACK_REF_SECS = float(os.getenv("KANCHA_ECHO_REF_S", "2.0"))
 # How long after playback ends the echo gate stays armed (reverb tail).
 _PLAYBACK_TAIL_SECS = float(os.getenv("KANCHA_ECHO_TAIL_S", "0.5"))
 # Correlation stride when matching a mic block against the playback buffer.
 _CORR_STRIDE = 160
 # Normalized cross-correlation above which a mic block is our own voice.
-_CORR_THRESHOLD = float(os.getenv("KANCHA_ECHO_CORR", "0.4"))
+# Kept HIGH (backstop only): on this hardware AEC decorrelates the linear
+# echo, so low thresholds also fire on real user speech and would break
+# barge-in. The primary self-echo defense is the playback-time volume floor
+# in input/stt.py (PLAYBACK_SPEECH_FLOOR); this gate only catches strong
+# linear echo leaks (AEC off / imperfect).
+_CORR_THRESHOLD = float(os.getenv("KANCHA_ECHO_CORR", "0.5"))
 
 
 class AudioState:
@@ -47,9 +53,11 @@ class AudioState:
         self._max_recent_spoken = 8
 
         # Exact played waveform (16k float32 mono) + when last written, for
-        # STT's correlation echo gate.
+        # STT's correlation echo gate. Guarded by a lock: ``_play`` feeds it
+        # from the executor thread while the PortAudio callback reads it.
         self._playback_ref = np.zeros(0, dtype=np.float32)
         self._last_playback_at = 0.0
+        self._playback_lock = threading.Lock()
 
     def note_spoken(self, text: str) -> None:
         """Record a sentence that actually started playing aloud."""
@@ -64,10 +72,11 @@ class AudioState:
         if samples_16k is None or samples_16k.size == 0:
             return
         ref = np.asarray(samples_16k, dtype=np.float32).reshape(-1)
-        buf = np.concatenate([self._playback_ref, ref])
-        max_len = int(_MIC_RATE * _PLAYBACK_REF_SECS)
-        self._playback_ref = buf[-max_len:]
-        self._last_playback_at = time.monotonic()
+        with self._playback_lock:
+            buf = np.concatenate([self._playback_ref, ref])
+            max_len = int(_MIC_RATE * _PLAYBACK_REF_SECS)
+            self._playback_ref = buf[-max_len:]
+            self._last_playback_at = time.monotonic()
 
     @property
     def playback_recent(self) -> bool:
@@ -83,25 +92,26 @@ class AudioState:
         the mic block. Correlated audio is the assistant's own voice — an echo
         the gate should ignore; a real user utterance does not correlate.
         """
-        if not self.playback_recent or self._playback_ref.size == 0:
+        if not self.playback_recent:
             return False
         blk = np.asarray(block, dtype=np.float32).reshape(-1)
         nb = blk.size
-        ref = self._playback_ref
-        if ref.size < nb:
-            return False
-        blk = blk - blk.mean()
-        bnorm = np.linalg.norm(blk)
-        if bnorm < 1e-6:
-            return False
-        for start in range(0, ref.size - nb + 1, _CORR_STRIDE):
-            win = ref[start : start + nb] - ref[start : start + nb].mean()
-            wnorm = np.linalg.norm(win)
-            if wnorm < 1e-6:
-                continue
-            corr = float(np.dot(blk, win) / (bnorm * wnorm))
-            if corr >= _CORR_THRESHOLD:
-                return True
+        with self._playback_lock:
+            ref = self._playback_ref
+            if ref.size < nb:
+                return False
+            blk = blk - blk.mean()
+            bnorm = np.linalg.norm(blk)
+            if bnorm < 1e-6:
+                return False
+            for start in range(0, ref.size - nb + 1, _CORR_STRIDE):
+                win = ref[start : start + nb] - ref[start : start + nb].mean()
+                wnorm = np.linalg.norm(win)
+                if wnorm < 1e-6:
+                    continue
+                corr = float(np.dot(blk, win) / (bnorm * wnorm))
+                if corr >= _CORR_THRESHOLD:
+                    return True
         return False
 
     @property

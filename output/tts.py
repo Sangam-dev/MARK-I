@@ -21,7 +21,7 @@ import time
 import numpy as np
 
 from core.aec import ensure_routing as _ensure_aec_routing
-from core.audio_state import audio_state
+from core.audio_state import _MIC_RATE, audio_state
 
 try:
     from kokoro_onnx import Kokoro
@@ -351,19 +351,30 @@ def _play(data, samplerate: int) -> None:
     """
     _playback_interrupted.clear()
     data = _limit(np.asarray(data, dtype=np.float32))
-    # Record the exact played waveform (mic rate) so STT's echo gate can
-    # correlate the mic against it, and re-assert AEC routing so the
-    # playback is inside the echo reference. Both are best-effort.
-    audio_state.note_playback(_resample_to_16k(data, samplerate))
+    ref16 = _resample_to_16k(data, samplerate)
     _ensure_aec_routing()
     stream = None
     try:
         sd.play(data, samplerate)
         stream = sd.get_stream()
+        # Feed the echo reference progressively, in lockstep with the audio
+        # actually leaving the speakers. STT's correlation gate compares the
+        # mic against what was JUST played; feeding the whole sentence up
+        # front would leave the buffer holding *future* audio while the mic
+        # is hearing the *current* part (which has already been evicted).
+        started = time.monotonic()
+        fed = 0
         while stream is not None and stream.active:
             if _playback_interrupted.is_set():
                 break
+            elapsed = time.monotonic() - started
+            target = min(len(ref16), int(elapsed * _MIC_RATE))
+            if target > fed:
+                audio_state.note_playback(ref16[fed:target])
+                fed = target
             time.sleep(0.02)
+        if fed < len(ref16):
+            audio_state.note_playback(ref16[fed:])
     except Exception:  # noqa: BLE001
         pass
     finally:

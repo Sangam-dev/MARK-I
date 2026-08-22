@@ -128,7 +128,7 @@ def _synthesize_with_groq(query: str, results: list[dict[str, str]] | str) -> st
 # ── Gemini (Google Search grounding), rotating across 8 keys ────────────────
 
 # Reads GEMINI_API_KEY_1 .. GEMINI_API_KEY_8 (skips any that are unset).
-_GEMINI_KEY_ENV_VARS: list[str] = [f"GEMINI_API_KEY_{i}" for i in range(7, 0, -1)]
+_GEMINI_KEY_ENV_VARS: list[str] = [f"GEMINI_API_KEY_{i}" for i in range(1, 6)]
 
 _gemini_last_good_idx: int = 0
 
