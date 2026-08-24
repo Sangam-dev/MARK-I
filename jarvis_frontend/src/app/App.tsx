@@ -3,9 +3,11 @@ import { motion, AnimatePresence } from "motion/react";
 import { wsClient } from "./lib/wsClient";
 import {
     api,
+    LLM_PROVIDERS,
     type FactOut,
     type HistoryTurn,
     type SettingsModel,
+    type LLMProviderName,
     type HealthInfo,
     type RAGDocument,
     type RAGStats,
@@ -151,6 +153,8 @@ export interface PanelData {
     wsLatencyMs: number | null;
     onToggleTts: () => void;
     onToggleVoiceMode: () => void;
+    onCycleLlmProvider: () => void;
+    providerError: string | null;
     // RAG knowledge base — backs the upload widget in the FILES panel.
     ragDocuments: RAGDocument[] | null;
     ragStats: RAGStats | null;
@@ -435,10 +439,22 @@ function PanelContent({ id, data }: { id: PanelId; data: PanelData }) {
                                 : "DISABLED"}
                         </span>
                     </div>
+                    <div
+                        style={{ ...row, cursor: "pointer" }}
+                        className="no-drag"
+                        role="button"
+                        tabIndex={0}
+                        onClick={data.onCycleLlmProvider}
+                        title={data.providerError ?? undefined}
+                    >
+                        <span style={dim}>LLM PROVIDER</span>
+                        <span style={data.providerError ? { color: "#e5534b" } : val}>
+                            {(s?.llm_provider ?? "gemini").toUpperCase()}
+                        </span>
+                    </div>
                     {(
                         [
                             ["LANGUAGE", "EN-US"],
-                            ["LLM PROVIDER", "Gemini"],
                             ["SESSION", s?.session_id ?? "default"],
                         ] as [string, string][]
                     ).map(([k, v]) => (
@@ -449,7 +465,9 @@ function PanelContent({ id, data }: { id: PanelId; data: PanelData }) {
                     ))}
                     <div style={{ fontSize: 9, opacity: 0.35, marginTop: 6 }}>
                         Click TTS / VOICE MODE to toggle — takes effect on the
-                        next backend restart.
+                        next backend restart. Click LLM PROVIDER to cycle
+                        gemini → groq → ollama — switches immediately (falls
+                        back if the target is unavailable).
                     </div>
                 </>
             );
@@ -1399,6 +1417,7 @@ export default function App() {
             tts_enabled: !(settingsData?.tts_enabled ?? true),
             voice_mode: settingsData?.voice_mode ?? false,
             session_id: settingsData?.session_id ?? "default",
+            llm_provider: settingsData?.llm_provider ?? "gemini",
         };
         setSettingsData(next);
         api.updateSettings(next).catch((err) =>
@@ -1411,11 +1430,34 @@ export default function App() {
             tts_enabled: settingsData?.tts_enabled ?? true,
             voice_mode: !(settingsData?.voice_mode ?? false),
             session_id: settingsData?.session_id ?? "default",
+            llm_provider: settingsData?.llm_provider ?? "gemini",
         };
         setSettingsData(next);
         api.updateSettings(next).catch((err) =>
             console.warn("[AURA] failed to save settings:", err),
         );
+    };
+
+    // Cycles gemini -> groq -> ollama -> gemini. Optimistic, but reverts
+    // when the backend refuses the swap (missing keys, Ollama offline) —
+    // a 409 carries the reason, which we surface in the console and as
+    // the row's transient value.
+    const [providerError, setProviderError] = useState<string | null>(null);
+    const cycleLlmProvider = () => {
+        if (!settingsData) return;
+        const current = settingsData.llm_provider ?? "gemini";
+        const idx = LLM_PROVIDERS.indexOf(current);
+        const nextProvider = LLM_PROVIDERS[(idx + 1) % LLM_PROVIDERS.length];
+        const previous = settingsData;
+        const next: SettingsModel = { ...previous, llm_provider: nextProvider };
+        setSettingsData(next);
+        api.updateSettings(next)
+            .then(() => setProviderError(null))
+            .catch((err) => {
+                console.warn("[AURA] provider swap refused:", err?.message ?? err);
+                setSettingsData(previous);
+                setProviderError(String(err?.message ?? err));
+            });
     };
 
     const panelData: PanelData = {
@@ -1428,6 +1470,8 @@ export default function App() {
         wsLatencyMs,
         onToggleTts: toggleTts,
         onToggleVoiceMode: toggleVoiceMode,
+        onCycleLlmProvider: cycleLlmProvider,
+        providerError,
         ragDocuments,
         ragStats,
         onRagChanged: () => setRagVersion((v) => v + 1),

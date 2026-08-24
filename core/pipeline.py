@@ -74,7 +74,12 @@ from planning.orchestrator import TaskOrchestrator
 from planning.planner import Planner
 from planning.scheduler import PlanScheduler
 from reasoning.coordinator import ReasoningCoordinator
-from reasoning.llm_client import FORWARD, REVERSE, GeminiClient
+from reasoning.llm_client import FORWARD, REVERSE
+from reasoning.providers.registry import (
+    ProviderRouter,
+    SwappableClient,
+    set_shared_router,
+)
 from tasks.executor import (
     TaskExecutor,
     attach_monitor_loop,
@@ -135,9 +140,11 @@ class Pipeline:
 
     bus: EventBus
     memory: MemoryManager
-    llm: GeminiClient
+    llm: SwappableClient
     #: Second client on the opposite key lane — the Task LLM's.
-    task_llm: GeminiClient
+    task_llm: SwappableClient
+    #: Owns the live provider per lane and performs validated hot-swaps.
+    llm_router: ProviderRouter
     nlu: NLUClassifier
     coordinator: ReasoningCoordinator
     task_executor: TaskExecutor
@@ -418,20 +425,29 @@ async def build_pipeline(
         session_id=session_id,
         sink=jsonl_sink(data_dir / "token_log.jsonl"),
     )
-    # Two clients over ONE shared key pool, on opposite lanes.
+    # Two lanes over the active provider, on opposite ends of its
+    # credential list.
     #
-    # The Conversation LLM starts at GEMINI_API_KEY_1 and walks forward;
-    # the Task LLM starts at the last key and walks backward. They only
-    # land on the same key once everything between them is cooling or
-    # dead. This matters because both roles routinely run inside one
-    # turn — the controller streams its acknowledgement while the planner
+    # The Conversation LLM starts at credential 1 and walks forward; the
+    # Task LLM starts at the last one and walks backward. They only land
+    # on the same credential once everything between them is cooling or
+    # dead. This matters because both roles routinely run inside one turn
+    # — the controller streams its acknowledgement while the planner
     # decomposes — and on a single lane that was two requests queued
     # against one key's per-minute quota.
     #
-    # Key *health* stays shared: a key one lane exhausts is exhausted for
-    # both, so neither rediscovers it the hard way.
-    llm = GeminiClient(token_log=token_log, lane="conversation", lane_direction=FORWARD)
-    await llm.initialize()
+    # Credential *health* stays shared within a provider, so neither lane
+    # rediscovers an exhausted key the hard way. Which provider is active
+    # (gemini | groq | ollama) comes from memory/data/settings.json and can
+    # be hot-swapped at runtime via ProviderRouter.swap() — the settings
+    # API calls it when the user toggles the LLM PROVIDER row.
+    llm_router = ProviderRouter(token_log=token_log)
+    llm_router.register_lane("conversation", FORWARD)
+    llm_router.register_lane("task", REVERSE)
+    await llm_router.start()
+    set_shared_router(llm_router)
+
+    llm = SwappableClient(llm_router, "conversation")
 
     # Warm the Conversation LLM's connection + model in the background so
     # the first user turn (and every preemptive guess) doesn't pay TTFT on
@@ -439,8 +455,7 @@ async def build_pipeline(
     # delay pipeline startup.
     asyncio.create_task(llm.prewarm(), name="llm_prewarm")
 
-    task_llm = GeminiClient(token_log=token_log, lane="task", lane_direction=REVERSE)
-    await task_llm.initialize()
+    task_llm = SwappableClient(llm_router, "task")
 
     # ── NLU ───────────────────────────────────────────────────────────────
     # Built but deliberately NOT subscribed to the bus. User input goes to
@@ -564,6 +579,7 @@ async def build_pipeline(
         memory=memory,
         llm=llm,
         task_llm=task_llm,
+        llm_router=llm_router,
         nlu=nlu,
         coordinator=coordinator,
         task_executor=task_executor,

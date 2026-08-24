@@ -46,11 +46,16 @@ class SettingsModel(BaseModel):
     TTSHandler is registered once at pipeline build time. Toggling this at
     runtime does not hot-swap the handler yet (see answers/guide.md,
     "known limitations").
+
+    `llm_provider` is the exception: the PUT route asks the shared
+    ProviderRouter to validate + activate it live, persisting only on
+    success (see api/routes/settings.py).
     """
 
     tts_enabled: bool = True
     voice_mode: bool = False
     session_id: str = "default"
+    llm_provider: Literal["gemini", "groq", "ollama"] = "gemini"
 
 
 # ── REST: alarms ─────────────────────────────────────────────────────────────

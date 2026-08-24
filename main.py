@@ -172,10 +172,16 @@ async def _run(args: argparse.Namespace) -> None:
 
     bus.subscribe(ShutdownRequested, _handle_shutdown)
 
-    # len() over the public surface: `pool` is a KeyLane once lanes are in
-    # use, and a lane shares the pool's keys without owning the list.
-    key_count = len(pipeline.llm.pool) if pipeline.llm.pool else 0
-    logger.info("GeminiClient initialised  (%d API key(s) in pool)", key_count)
+    # Credential count is provider-specific; reach through the swappable
+    # facade defensively so any backend (or none) logs something sane.
+    _inner = getattr(pipeline.llm, "_router", None)
+    _active = _inner.client_for("conversation") if _inner else None
+    key_count = len(getattr(_active, "pool", []) or [])
+    logger.info(
+        "LLM initialised  (provider=%s, %d credential(s))",
+        getattr(pipeline.llm, "provider_name", "unknown"),
+        key_count,
+    )
     logger.info("Memory initialised  (structured facts=SQLite, vector/RAG=disabled)")
     logger.info(
         "ReasoningCoordinator registered  "

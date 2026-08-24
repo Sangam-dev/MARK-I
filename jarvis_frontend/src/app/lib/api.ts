@@ -26,8 +26,22 @@ async function putJson<T>(path: string, body: unknown): Promise<T> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`PUT ${path} -> ${res.status}`);
+  if (!res.ok) throw new Error(await detailOf(res));
   return res.json() as Promise<T>;
+}
+
+/** FastAPI puts human-readable reasons in `detail` (e.g. a refused LLM
+ * provider swap: "Groq failed health check on lane 'conversation'"). */
+async function detailOf(res: Response): Promise<string> {
+  try {
+    const body = await res.json();
+    if (body?.detail) {
+      return typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+    }
+  } catch {
+    // Non-JSON error body — fall through to the status code.
+  }
+  return `${res.status}`;
 }
 
 async function deleteJson<T>(path: string): Promise<T> {
@@ -72,10 +86,15 @@ export interface HistoryTurn {
   metadata?: Record<string, unknown>;
 }
 
+export type LLMProviderName = "gemini" | "groq" | "ollama";
+
+export const LLM_PROVIDERS: LLMProviderName[] = ["gemini", "groq", "ollama"];
+
 export interface SettingsModel {
   tts_enabled: boolean;
   voice_mode: boolean;
   session_id: string;
+  llm_provider: LLMProviderName;
 }
 
 export interface HealthInfo {
