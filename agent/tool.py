@@ -1287,6 +1287,7 @@ class OpenCodeTool:
             "unavailable": "The OpenCode server could not be reached.",
             "timeout": "The agent ran out of time.",
             "agent_error": "The agent could not complete the task.",
+            "server_error": "The agent's model refused the work.",
             "not_found": "That delegated session no longer exists on the server.",
             "network_error": "The connection to the agent failed."
         }

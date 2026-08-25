@@ -353,10 +353,13 @@ class OpenCodeClient:
     ) -> OpenCodeResult:
         """Send *text* to *session_id* and wait for the agent to finish.
 
-        Tries the configured model first and then, when it returns an
-        ``agent_error`` (a provider outage), each :attr:`fallback_models
-        <agent.config.OpenCodeConfig.fallback_models>` in turn — the
-        first attempt that neither succeeds nor errors this way wins.
+        Tries the configured model first and then — when the failure is
+        model-side, i.e. an ``agent_error`` (HTTP 200 with an error inside)
+        or a ``server_error`` (408/429/5xx from a live server) — each
+        :attr:`fallback_models <agent.config.OpenCodeConfig.fallback_models>`
+        in turn; the first attempt that neither succeeds nor errors this way
+        wins. Non-model failures (dead server, bad session id, timeouts)
+        return immediately: rotating models cannot fix those.
 
         On success ``data`` carries ``text`` (the agent's reply),
         ``tools`` (the tools it used), ``tokens`` and ``cost``.
@@ -376,15 +379,19 @@ class OpenCodeClient:
             return _failure("invalid_argument", "There is nothing to send.")
 
         # The primary model, then any configured fallbacks, tried in order
-        # when the previous one fails with an agent_error — the class of
-        # failure a provider outage arrives as. A delegation is one prompt
-        # on a fresh session, and a failed attempt produces no agent
-        # output, so re-sending the same task under the next model is safe.
+        # when the previous one fails with a MODEL-SIDE error: an
+        # agent_error (HTTP 200 + error inside) or a server_error
+        # (408/429/5xx — e.g. a retired free-tier model answering 500).
+        # A delegation is one prompt on a fresh session, and a failed
+        # attempt produces no agent output, so re-sending the same task
+        # under the next model is safe. Dead-server/network/timeout kinds
+        # return immediately — no model swap can fix those.
+        rotate_on = {"agent_error", "server_error"}
         models = (self._config.model, *self._config.fallback_models)
         last: OpenCodeResult | None = None
         for index, model_id in enumerate(models):
             result = await self._prompt_once(session_id, text, directory, model_id)
-            if result.success or result.error_kind != "agent_error":
+            if result.success or result.error_kind not in rotate_on:
                 return result
             last = result
             remaining = models[index + 1 :]
@@ -687,7 +694,16 @@ class OpenCodeClient:
         if response.status_code == 404:
             return _failure("not_found", _http_error_message(body, 404))
         if response.status_code >= 400:
-            return _failure("unavailable", _http_error_message(body, response.status_code))
+            # Provider/model outages arrive as 408/429/5xx from a LIVE
+            # server — those are worth retrying under the next fallback
+            # model. Other 4xx (bad request, auth) are not model-specific;
+            # rotating would just replay the same mistake.
+            kind = (
+                "server_error"
+                if response.status_code in {408, 429, 500, 502, 503, 504}
+                else "unavailable"
+            )
+            return _failure(kind, _http_error_message(body, response.status_code))
         if not isinstance(body, dict):
             if not expect_json:
                 # Some endpoints answer 200 with `true` or 204 with

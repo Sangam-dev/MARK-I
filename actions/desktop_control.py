@@ -308,7 +308,7 @@ def focus_window(app_name: str) -> str:
             win_id = matched.split()[0]
             subprocess.run(["wmctrl", "-ia", win_id], capture_output=True)
             title = matched.split(None, 3)[-1] if len(matched.split(None, 3)) >= 4 else matched
-            return f"Focused: {title.strip()} (via wmctrl id)"
+            return f"Focused: {title.strip()}"
 
     # ── xdotool fallback ─────────────────────────────────────────────────────
     if _check_tool("xdotool"):

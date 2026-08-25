@@ -13,7 +13,7 @@ Environment variables (all optional, all prefixed ``KANCHA_OPENCODE_``)::
     KANCHA_OPENCODE_PORT             int    (default 0 — let the OS pick)
     KANCHA_OPENCODE_BINARY           path   (default opencode)
     KANCHA_OPENCODE_PROVIDER         str    (default opencode)
-    KANCHA_OPENCODE_MODEL            str    (default deepseek-v4-flash-free)
+    KANCHA_OPENCODE_MODEL            str    (default big-pickle)
     KANCHA_OPENCODE_FALLBACK_MODELS  str    (comma-separated model ids, default the
                                            other Zen free models)
     KANCHA_OPENCODE_AGENT            str    (default build)
@@ -34,7 +34,7 @@ delegated task could rewrite the assistant mid-conversation. It defaults
 to a separate directory instead; point it at a project deliberately.
 
 **The default model costs nothing and needs no key.** Delegation runs on
-OpenCode's own free tier (``opencode/deepseek-v4-flash-free``), so it does not spend
+OpenCode's own free tier (``opencode/big-pickle``), so it does not spend
 the assistant's Gemini quota and does not depend on any key in ``.env``.
 Point ``KANCHA_OPENCODE_PROVIDER``/``_MODEL`` elsewhere and OpenCode will
 discover that provider's credentials from the environment on its own
@@ -119,33 +119,33 @@ class OpenCodeConfig:
     binary: str = "opencode"
 
     # ── Model selection ──────────────────────────────────────────────
-    # OpenCode's own default, on its hosted Zen gateway's free tier: no
-    # API key, no cost, 200k context. DeepSeek V4 Flash Free scores higher
-    # on SWE-bench than the previous default (big-pickle) at the same
-    # context size. The assistant's Gemini keys are a finite shared pool
-    # already split between the Conversation and Task LLMs (see
-    # reasoning/llm_client_mulapi.py), and a delegated build is thousands
-    # of tokens over many turns — putting that on the same pool would
-    # starve the conversation to run the agent.
+    # OpenCode's own hosted Zen gateway, free tier: no API key, no cost.
+    # Primary is big-pickle; deepseek-v4-flash-free (the previous default)
+    # now answers HTTP 500 "Unexpected server error" on every call, so it
+    # was demoted to LAST fallback — if Zen revives it, it rejoins the
+    # rotation automatically. The assistant's Gemini keys are a finite
+    # shared pool already split between the Conversation and Task LLMs
+    # (see reasoning/llm_client_mulapi.py), and a delegated build is
+    # thousands of tokens over many turns — putting that on the same pool
+    # would starve the conversation to run the agent.
     #
     # Not every Zen model is free. The paid ones (claude-sonnet-4-6,
     # gpt-5.x, …) return "No payment method" unless one is on file, which
-    # arrives as an agent_error, not a crash.
+    # arrives as an agent_error/server_error, not a crash.
     provider: str = "opencode"
-    model: str = "deepseek-v4-flash-free"
-    #: Model ids tried, in order, when the primary returns an agent_error —
-    #: the class of failure a provider outage arrives as ("Upstream request
-    #: failed: Endpoint is unavailable"). All on the same provider, so this
-    #: needs no key: they are the other free Zen models. A primary outage
+    model: str = "big-pickle"
+    #: Model ids tried, in order, when the primary fails with a model-side
+    #: error (agent_error or server_error — see OpenCodeClient.prompt).
+    #: All on the same provider, so this needs no key. A primary outage
     #: then costs one quick failing call before the task runs under a
     #: working model instead of being reported broken.
     fallback_models: tuple[str, ...] = (
-        "big-pickle",
         "hy3-free",
         "laguna-s-2.1-free",
         "mimo-v2.5-free",
         "nemotron-3-ultra-free",
         "nemotron-3.5-lightning-free",
+        "deepseek-v4-flash-free",
     )
     #: OpenCode agent profile: "build" edits files and runs commands,
     #: "plan" is read-only. Research tasks work under either.
@@ -213,16 +213,16 @@ class OpenCodeConfig:
             port=_env_int("KANCHA_OPENCODE_PORT", 0, minimum=0),
             binary=_env_str("KANCHA_OPENCODE_BINARY", "opencode"),
             provider=_env_str("KANCHA_OPENCODE_PROVIDER", "opencode"),
-            model=_env_str("KANCHA_OPENCODE_MODEL", "deepseek-v4-flash-free"),
+            model=_env_str("KANCHA_OPENCODE_MODEL", "big-pickle"),
             fallback_models=_env_list(
                 "KANCHA_OPENCODE_FALLBACK_MODELS",
                 (
-                    "big-pickle",
                     "hy3-free",
                     "laguna-s-2.1-free",
                     "mimo-v2.5-free",
                     "nemotron-3-ultra-free",
                     "nemotron-3.5-lightning-free",
+                    "deepseek-v4-flash-free",
                 ),
             ),
             agent=_env_str("KANCHA_OPENCODE_AGENT", "build"),
