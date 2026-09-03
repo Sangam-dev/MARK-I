@@ -2,5 +2,5 @@
   "tts_enabled": true,
   "voice_mode": true,
   "session_id": "default",
-  "llm_provider": "groq"
+  "llm_provider": "gemini"
 }

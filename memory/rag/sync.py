@@ -65,7 +65,7 @@ logger = logging.getLogger("kancha.memory.rag.sync")
 # exactly 40; we accept 3+ so a hand-edited file still parses.
 _MIN_SEPARATOR_DASHES = 3
 
-_KNOWN_HEADERS = {"timestamp", "type", "title"}
+_KNOWN_HEADERS = {"timestamp", "type", "title", "topic", "status"}
 
 
 def _is_separator(line: str) -> bool:
@@ -84,6 +84,8 @@ class RagFileEntry:
     content: str
     entry_type: str = "note"
     timestamp: str = ""
+    topic: str = ""
+    status: str = "active"
 
     def to_entry_dict(self) -> dict[str, Any]:
         """Shape expected by :meth:`RAGManager.index_conversation_entries`."""
@@ -92,6 +94,8 @@ class RagFileEntry:
             "title": self.title,
             "content": self.content,
             "timestamp": self.timestamp,
+            "topic": self.topic,
+            "status": self.status,
         }
 
 
@@ -209,6 +213,8 @@ def parse_rag_file(text: str) -> tuple[list[RagFileEntry], int]:
                 content=content,
                 entry_type=headers.get("type", "").strip() or "note",
                 timestamp=headers.get("timestamp", "").strip(),
+                topic=headers.get("topic", "").strip(),
+                status=headers.get("status", "").strip() or "active",
             )
         )
 

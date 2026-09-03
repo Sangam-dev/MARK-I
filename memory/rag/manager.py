@@ -299,7 +299,11 @@ class RAGManager:
             metadata: dict[str, Any] = {
                 "origin": origin,
                 "session_id": session_id,
+                "status": str(entry.get("status", "active")).strip() or "active",
             }
+            topic = str(entry.get("topic", "")).strip().casefold()
+            if topic:
+                metadata["topic"] = topic
             # Preserve the original write time when replaying the audit
             # log, so recency ordering in the UI stays truthful.
             recorded_at = str(entry.get("timestamp", "")).strip()
@@ -314,6 +318,17 @@ class RAGManager:
                 metadata=metadata,
             )
             try:
+                if topic and metadata["status"] == "active":
+                    for previous in await self._store.list_documents():
+                        previous_metadata = previous.get("metadata") or {}
+                        if (
+                            previous_metadata.get("topic") == topic
+                            and previous_metadata.get("status", "active") == "active"
+                            and previous.get("id") != document.id
+                        ):
+                            await self._store.set_document_status(
+                                previous["id"], "superseded", document.id
+                            )
                 result = await self.index_document(
                     document, semantic_dedupe=semantic_dedupe
                 )
@@ -566,7 +581,7 @@ class RAGManager:
         try:
             matches = await self._store.search(
                 embedding=embedding,
-                top_k=effective_k,
+            top_k=max(effective_k * 4, 20),
                 threshold=effective_threshold,
                 doc_types=doc_types,
             )
@@ -574,7 +589,12 @@ class RAGManager:
             logger.warning("Vector search failed: %s", exc)
             return []
 
-        results = [RetrievedChunk.from_match(match) for match in matches]
+        active_matches = [
+            match for match in matches
+            if str(match.metadata.get("status", "active")).casefold()
+            not in {"superseded", "expired", "deleted"}
+        ]
+        results = [RetrievedChunk.from_match(match) for match in active_matches[:effective_k]]
         logger.info(
             "Retrieved %d/%d chunk(s) in %.0fms for %.60r "
             "(threshold=%.2f, top_score=%.3f)",

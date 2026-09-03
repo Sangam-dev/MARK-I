@@ -36,6 +36,10 @@ class StructuredMemory:
                 key TEXT NOT NULL,
                 value TEXT NOT NULL,
                 session_id TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'profile',
+                status TEXT NOT NULL DEFAULT 'active',
+                source TEXT NOT NULL DEFAULT 'conversation',
+                observed_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -55,6 +59,25 @@ class StructuredMemory:
             CREATE INDEX IF NOT EXISTS idx_tasks_session_status
                 ON tasks(session_id, status);
         """)
+        # Keep existing structured.db files usable while adding lifecycle
+        # fields to the original facts table.
+        for column, definition in (
+            ("category", "TEXT NOT NULL DEFAULT 'profile'"),
+            ("status", "TEXT NOT NULL DEFAULT 'active'"),
+            ("source", "TEXT NOT NULL DEFAULT 'conversation'"),
+            ("observed_at", "TEXT"),
+        ):
+            try:
+                await self._conn.execute(
+                    f"ALTER TABLE facts ADD COLUMN {column} {definition}"
+                )
+            except aiosqlite.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_facts_session_status "
+            "ON facts(session_id, status)"
+        )
         await self._conn.commit()
 
     async def clear_session(self, session_id: str) -> int:
@@ -80,9 +103,16 @@ class StructuredMemory:
     # --- Fact methods ---
 
     async def store_fact(
-        self, key: str, value: str, session_id: str
+        self,
+        key: str,
+        value: str,
+        session_id: str,
+        *,
+        category: str = "profile",
+        source: str = "conversation",
+        observed_at: str | None = None,
     ) -> str:
-        """Store or update a fact."""
+        """Store or update the active value for a stable fact key."""
         if not self._conn:
             raise MemoryError("Database not initialized")
 
@@ -99,10 +129,11 @@ class StructuredMemory:
             # Update existing
             await self._conn.execute(
                 """
-                UPDATE facts SET value = ?, updated_at = ?
+                UPDATE facts SET value = ?, category = ?, status = 'active',
+                    source = ?, observed_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (value, now, existing["id"]),
+                (value, category, source, observed_at, now, existing["id"]),
             )
             record_id = existing["id"]
         else:
@@ -110,10 +141,15 @@ class StructuredMemory:
             record_id = str(uuid.uuid4())
             await self._conn.execute(
                 """
-                INSERT INTO facts (id, key, value, session_id, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO facts
+                    (id, key, value, session_id, category, status, source,
+                     observed_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
                 """,
-                (record_id, key, value, session_id, now, now),
+                (
+                    record_id, key, value, session_id, category, source,
+                    observed_at, now, now,
+                ),
             )
         await self._conn.commit()
         return record_id
@@ -124,7 +160,8 @@ class StructuredMemory:
             raise MemoryError("Database not initialized")
 
         cursor = await self._conn.execute(
-            "SELECT value FROM facts WHERE session_id = ? AND key = ?",
+            "SELECT value FROM facts WHERE session_id = ? AND key = ? "
+            "AND status = 'active'",
             (session_id, key),
         )
         row = await cursor.fetchone()
@@ -136,7 +173,13 @@ class StructuredMemory:
             raise MemoryError("Database not initialized")
 
         cursor = await self._conn.execute(
-            "SELECT id, key, value, created_at, updated_at FROM facts WHERE session_id = ?",
+                 """
+                 SELECT id, key, value, category, status, source, observed_at,
+                     created_at, updated_at
+                 FROM facts
+                 WHERE session_id = ? AND status = 'active'
+                 ORDER BY updated_at DESC
+                 """,
             (session_id,),
         )
         rows = await cursor.fetchall()
@@ -145,11 +188,27 @@ class StructuredMemory:
                 "id": row["id"],
                 "key": row["key"],
                 "value": row["value"],
+                "category": row["category"],
+                "status": row["status"],
+                "source": row["source"],
+                "observed_at": row["observed_at"],
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
             }
             for row in rows
         ]
+
+    async def expire_fact(self, key: str, session_id: str) -> bool:
+        """Mark a current fact inactive without deleting its audit history."""
+        if not self._conn:
+            raise MemoryError("Database not initialized")
+        cursor = await self._conn.execute(
+            "UPDATE facts SET status = 'expired', updated_at = ? "
+            "WHERE session_id = ? AND key = ? AND status = 'active'",
+            (datetime.utcnow().isoformat(), session_id, key),
+        )
+        await self._conn.commit()
+        return cursor.rowcount > 0
 
     # --- Task methods ---
 

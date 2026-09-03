@@ -1765,6 +1765,18 @@ class ReasoningCoordinator:
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
 
+    async def drain_background(self, timeout: float = 3.0) -> None:
+        """Finish queued memory writes before their backends are closed."""
+        tasks = tuple(self._bg_tasks)
+        if not tasks:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Background memory writes exceeded %.1fs shutdown budget", timeout)
+
     async def _persist_response_memory(
         self, payload: dict[str, Any], session_id: str = "default"
     ) -> None:

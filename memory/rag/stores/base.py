@@ -59,6 +59,12 @@ class VectorStore(ABC):
     async def delete_document(self, document_id: str) -> int:
         """Delete a document and all of its chunks. Returns chunks removed."""
 
+    async def set_document_status(
+        self, document_id: str, status: str, superseded_by: str = ""
+    ) -> bool:
+        """Mark a document active, superseded, or expired when supported."""
+        return False
+
     @abstractmethod
     async def update_document(
         self, document: Document, records: list[VectorRecord]

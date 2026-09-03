@@ -151,6 +151,33 @@ class ChromaVectorStore(VectorStore):
         logger.info("Deleted document %s (%d chunk(s))", document_id, len(ids))
         return len(ids)
 
+    async def set_document_status(
+        self, document_id: str, status: str, superseded_by: str = ""
+    ) -> bool:
+        collection = self._require()
+        found = collection.get(where={"document_id": document_id}, include=["metadatas"])
+        ids = found.get("ids", []) if found else []
+        metadatas = found.get("metadatas", []) if found else []
+        if not ids:
+            return False
+        updated = []
+        for flat_meta in metadatas:
+            metadata = self._rehydrate(flat_meta)
+            metadata["status"] = status
+            if superseded_by:
+                metadata["superseded_by"] = superseded_by
+            updated.append({
+                "document_id": metadata.get("document_id", document_id),
+                "content_hash": metadata.get("content_hash", ""),
+                "title": metadata.get("title", "Untitled"),
+                "source": metadata.get("source", ""),
+                "doc_type": metadata.get("doc_type", "document"),
+                "created_at": metadata.get("created_at", utc_now()),
+                "extra": json.dumps(metadata),
+            })
+        collection.update(ids=ids, metadatas=updated)
+        return True
+
     # ── reads ────────────────────────────────────────────────────────
 
     async def search(

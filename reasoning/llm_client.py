@@ -32,8 +32,9 @@ Respond with ONLY one JSON object, no markdown, no code fences, no preamble:
   "task": {"task_type": "...", "instruction": "...", "parameters": {},
            "expected_result": "...", "context": {}, "follow_up": false},
   "message": "Your reply to the user",
-  "sql": [{"key": "...", "value": "..."}],
-  "rag": [{"type": "...", "title": "...", "content": "..."}]
+    "sql": [{"key": "...", "value": "...", "category": "..."}],
+    "rag": [{"type": "...", "title": "...", "content": "...",
+                     "topic": "...", "status": "active"}]
 }
 
 Rules:
@@ -51,17 +52,24 @@ Rules:
 - Long values (essay, email, report) go inside the JSON as ONE line
   using \\n for line breaks. Never a real newline, never text outside
   the object, no sentence before "{", nothing after "}".
-- "sql" is OPTIONAL structured memory: short key/value facts
-  (preferences, profile, settings, relationships). Keys update in
-  place; never duplicate a key; values are a phrase, not a paragraph.
+- "sql" is OPTIONAL current structured memory: short key/value facts
+    (preferences, profile, settings, relationships, current state). Include
+    "category" as one of profile, preference, setting, relationship, or
+    current_state. Keys update in place; never duplicate a key; values are a
+    phrase, not a paragraph. Do not put historical events, completed work,
+    old opinions, or temporary observations here.
 - "rag" is OPTIONAL semantic memory: self-contained passages worth
   recalling — experiences, research, technical documentation, project
   progress, learning summaries, design decisions, debugging solutions.
-  Each entry has "type", "title" and "content", a standalone paragraph.
+    Each entry has "type", "title", "content", and a stable "topic" when
+    it describes a person, preference, project, or event. Use status
+    "active" for the latest statement and "superseded" only when explicitly
+    correcting an existing topic.
   NEVER put greetings, chit-chat, one-off questions, temporary context,
   or restatements of the request in "rag".
-- Choose by size: a short key/value pair is "sql"; a paragraph that
-  must stand alone is "rag". Most turns need neither.
+- Choose by meaning first, then size: current reusable state is "sql";
+    historical events, explanations, and searchable passages are "rag".
+    Most turns need neither.
 - Omit "sql", "rag" and "task" entirely when there is nothing to store.
   Never return empty arrays, never return null.
 """

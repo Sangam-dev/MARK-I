@@ -112,11 +112,21 @@ class MemoryManager:
         for item in items or []:
             if not isinstance(item, dict):
                 continue
-            key = item.get("key")
+            key = str(item.get("key", "")).strip()
             value = item.get("value")
-            if key is None or value is None:
+            category = str(item.get("category", "profile")).strip().casefold()
+            if not key or value is None or category not in {
+                "profile", "preference", "setting", "relationship", "current_state"
+            }:
                 continue
-            await self._structured.store_fact(str(key), str(value), self._session_id)
+            await self._structured.store_fact(
+                key,
+                str(value).strip(),
+                self._session_id,
+                category=category,
+                source=str(item.get("source", "conversation")),
+                observed_at=str(item.get("observed_at", "")).strip() or None,
+            )
             saved += 1
         return saved
 
@@ -135,6 +145,8 @@ class MemoryManager:
                 type_=str(item.get("type", "")),
                 title=str(item.get("title", "")),
                 content=str(item.get("content", "")),
+                topic=str(item.get("topic", "")),
+                status=str(item.get("status", "active")),
             )
             for item in items or []
             if isinstance(item, dict) and str(item.get("content", "")).strip()
@@ -152,7 +164,9 @@ class MemoryManager:
         return Path(__file__).resolve().parent / "rag.txt"
 
     @staticmethod
-    def _format_rag_entry(type_: str, title: str, content: str) -> str:
+    def _format_rag_entry(
+        type_: str, title: str, content: str, topic: str = "", status: str = "active"
+    ) -> str:
         """Render one RAG entry block for ``rag.txt``."""
         timestamp = datetime.utcnow().isoformat()
         return (
@@ -160,6 +174,8 @@ class MemoryManager:
             f"Timestamp: {timestamp}\n"
             f"Type: {type_}\n"
             f"Title: {title}\n"
+            f"Topic: {topic}\n"
+            f"Status: {status}\n"
             f"\n"
             f"{content}\n"
             f"\n"

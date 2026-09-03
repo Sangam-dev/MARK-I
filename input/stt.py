@@ -618,7 +618,7 @@ async def transcribe(audio: np.ndarray) -> str:
 
     result = await asyncio.to_thread(
         client.audio.transcriptions.create,
-        model="whisper-large-v3-turbo",
+        model="whisper-large-v3",
         file=("audio.wav", wav_bytes, "audio/wav"),
         language="en",
     )

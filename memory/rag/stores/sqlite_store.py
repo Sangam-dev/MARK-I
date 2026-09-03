@@ -213,6 +213,43 @@ class SQLiteVectorStore(VectorStore):
         logger.info("Deleted document %s (%d chunk(s))", document_id, removed)
         return removed
 
+    async def set_document_status(
+        self, document_id: str, status: str, superseded_by: str = ""
+    ) -> bool:
+        db = self._db()
+        async with db.execute(
+            "SELECT metadata FROM rag_documents WHERE id = ?", (document_id,)
+        ) as cursor:
+            document = await cursor.fetchone()
+        if document is None:
+            return False
+
+        metadata = json.loads(document["metadata"] or "{}")
+        metadata["status"] = status
+        if superseded_by:
+            metadata["superseded_by"] = superseded_by
+        await db.execute(
+            "UPDATE rag_documents SET metadata = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(metadata), utc_now(), document_id),
+        )
+        async with db.execute(
+            "SELECT id, metadata FROM rag_chunks WHERE document_id = ?",
+            (document_id,),
+        ) as cursor:
+            chunks = await cursor.fetchall()
+        for chunk in chunks:
+            chunk_metadata = json.loads(chunk["metadata"] or "{}")
+            chunk_metadata["status"] = status
+            if superseded_by:
+                chunk_metadata["superseded_by"] = superseded_by
+            await db.execute(
+                "UPDATE rag_chunks SET metadata = ? WHERE id = ?",
+                (json.dumps(chunk_metadata), chunk["id"]),
+            )
+        await db.commit()
+        self._invalidate()
+        return True
+
     # ── reads ────────────────────────────────────────────────────────
 
     async def _load_matrix(self) -> tuple[np.ndarray, list[dict[str, Any]]]:

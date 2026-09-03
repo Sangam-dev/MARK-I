@@ -617,6 +617,11 @@ async def shutdown_pipeline(pipeline: Pipeline, drain_timeout: float = 3.0) -> N
     except asyncio.TimeoutError:
         logger.warning("Bus drain timed out — some handlers may not have completed")
 
+    try:
+        await pipeline.coordinator.drain_background(timeout=drain_timeout)
+    except Exception as exc:
+        logger.warning("Background memory drain error (non-fatal): %s", exc)
+
     await pipeline.bus.close()
 
     try:
