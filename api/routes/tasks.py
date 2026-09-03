@@ -8,6 +8,8 @@ by a REST call from the UI.
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter
 
 from actions.alarms import cancel_alarms, list_alarms, set_alarm
@@ -18,17 +20,17 @@ router = APIRouter(prefix="/alarms", tags=["alarms"])
 
 @router.get("", response_model=ActionResult)
 async def get_alarms() -> ActionResult:
-    result = list_alarms()
+    result = await asyncio.to_thread(list_alarms)
     return ActionResult(success=result.success, message=result.message)
 
 
 @router.post("", response_model=ActionResult)
 async def create_alarm(body: AlarmCreateRequest) -> ActionResult:
-    result = set_alarm(body.command, body.delay_seconds)
+    result = await asyncio.to_thread(set_alarm, body.command, body.delay_seconds)
     return ActionResult(success=result.success, message=result.message)
 
 
 @router.delete("", response_model=ActionResult)
 async def clear_alarms() -> ActionResult:
-    result = cancel_alarms()
+    result = await asyncio.to_thread(cancel_alarms)
     return ActionResult(success=result.success, message=result.message)

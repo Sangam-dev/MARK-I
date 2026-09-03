@@ -22,11 +22,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import ValidationError
 
 from api.bridge import attach_bridge
+from api.auth import get_auth_token, verify_token
 from api.routes import files, health, history, rag, tasks, weather
 from api.routes import memory as memory_routes
 from api.routes import settings as settings_routes
@@ -45,6 +46,7 @@ logger = logging.getLogger("kancha.api.server")
 # Single-user desktop app: one process == one session. See
 # answers/integration_plan.md section 6 ("single session assumption").
 DEFAULT_SESSION_ID = os.getenv("KANCHA_SESSION_ID", "default")
+API_PORT = os.getenv("AURA_BACKEND_PORT", os.getenv("KANCHA_API_PORT", "8765"))
 DATA_DIR = Path(__file__).resolve().parent.parent / "memory" / "data"
 
 
@@ -132,6 +134,7 @@ def _start_gated_voice_session(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    get_auth_token()
     pipeline = await build_pipeline(
         session_id=DEFAULT_SESSION_ID,
         data_dir=DATA_DIR,
@@ -178,25 +181,45 @@ app = FastAPI(title="KANCHA API", lifespan=lifespan)
 # the local machine. See answers/guide.md, "Security posture".
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        f"http://localhost:{API_PORT}",
+        f"http://127.0.0.1:{API_PORT}",
+        "null",
+    ],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.include_router(health.router, prefix="/api")
-app.include_router(memory_routes.router, prefix="/api")
-app.include_router(history.router, prefix="/api")
-app.include_router(tasks.router, prefix="/api")
-app.include_router(files.router, prefix="/api")
-app.include_router(weather.router, prefix="/api")
-app.include_router(settings_routes.router, prefix="/api")
-app.include_router(rag.router, prefix="/api")
+_api_auth = [Depends(verify_token)]
+app.include_router(health.router, prefix="/api", dependencies=_api_auth)
+app.include_router(memory_routes.router, prefix="/api", dependencies=_api_auth)
+app.include_router(history.router, prefix="/api", dependencies=_api_auth)
+app.include_router(tasks.router, prefix="/api", dependencies=_api_auth)
+app.include_router(files.router, prefix="/api", dependencies=_api_auth)
+app.include_router(weather.router, prefix="/api", dependencies=_api_auth)
+app.include_router(settings_routes.router, prefix="/api", dependencies=_api_auth)
+app.include_router(rag.router, prefix="/api", dependencies=_api_auth)
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     pipeline: Pipeline = websocket.app.state.pipeline
+    await websocket.accept()
+    try:
+        auth_message = await websocket.receive_json()
+    except (WebSocketDisconnect, ValueError):
+        await websocket.close(code=1008, reason="Authentication required")
+        return
+
+    if (
+        not isinstance(auth_message, dict)
+        or auth_message.get("type") != "auth"
+        or auth_message.get("token") != get_auth_token()
+    ):
+        await websocket.close(code=1008, reason="Invalid token")
+        return
+
     await manager.connect(websocket)
     try:
         while True:

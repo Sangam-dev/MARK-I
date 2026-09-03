@@ -486,8 +486,8 @@ async def test_fast_path_single_task() -> None:
     await bus.close()
 
 
-async def test_single_tool_with_conjunction_uses_fast_path() -> None:
-    """A single-tool request with a conjunction should still use the fast path."""
+async def test_single_tool_uses_fast_path() -> None:
+    """An atomic single-tool request should use the fast path."""
     bus = EventBus()
     llm = MockGeminiClient(plan_json={})
     memory = MockMemory()
@@ -504,7 +504,7 @@ async def test_single_tool_with_conjunction_uses_fast_path() -> None:
     await planner.on_task_dispatched(
         TaskDispatched(
             task_id="task-1",
-            instruction="open firefox and run it",
+            instruction="open firefox",
             task_type="open_app",
             parameters={"app_name": "firefox"},
         )

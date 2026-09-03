@@ -37,6 +37,8 @@ export interface ServerMessage<T = unknown> {
 
 type Listener<T = unknown> = (payload: T, message: ServerMessage<T>) => void;
 
+import { getAuthToken } from "./auth";
+
 const DEFAULT_WS_URL = "ws://127.0.0.1:8765/ws";
 
 function resolveWsUrl(): string {
@@ -68,7 +70,13 @@ class WsClient {
     const ws = new WebSocket(resolveWsUrl());
     this.ws = ws;
 
-    ws.onopen = () => {
+    ws.onopen = async () => {
+      const token = await getAuthToken();
+      if (ws !== this.ws || ws.readyState !== WebSocket.OPEN || !token) {
+        ws.close();
+        return;
+      }
+      ws.send(JSON.stringify({ type: "auth", token }));
       this._connected = true;
       this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
       this.emit("_open", {});

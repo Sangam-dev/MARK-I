@@ -17,21 +17,26 @@ import re
 import sys
 import threading
 import time
+from typing import Any
 
 import numpy as np
 
 from core.aec import ensure_routing as _ensure_aec_routing
 from core.audio_state import _MIC_RATE, audio_state
 
+_kokoro_error: Exception | None = None
+Kokoro: Any
+ort: Any
+sd: Any
 try:
     from kokoro_onnx import Kokoro
     import onnxruntime as ort
     import sounddevice as sd
-except ImportError:
-    sys.exit(
-        "Run: pip install kokoro-onnx sounddevice  "
-        "(plus the Kokoro model files — see output/tts.py KOKORO_MODEL_DIR)"
-    )
+except ImportError as _import_error:
+    _kokoro_error = _import_error
+    Kokoro = None
+    ort = None
+    sd = None
 
 import logging
 
@@ -46,6 +51,9 @@ from core.events import (
 )
 
 logger = logging.getLogger("kancha.output.tts")
+
+if _kokoro_error is not None:
+    logger.warning("Kokoro TTS unavailable; voice output is degraded: %s", _kokoro_error)
 
 _speaking_lock: asyncio.Lock | None = None
 
@@ -208,7 +216,7 @@ def _clean(text: str) -> str:
     return text.strip()
 
 
-_kokoro: Kokoro | None = None
+_kokoro: Any = None
 _kokoro_synth_lock: asyncio.Lock | None = None
 
 
@@ -243,7 +251,7 @@ def _preload_nvidia_libs() -> None:
             pass
 
 
-def _get_kokoro() -> Kokoro:
+def _get_kokoro() -> Any:
     """Load (once) the local Kokoro model; warmed up at boot via TTSHandler.warmup.
 
     The ONNX session is built explicitly so TTS runs on the GPU when
@@ -468,8 +476,11 @@ class StreamingSpeaker:
     async def _player_loop(self) -> None:
         """Consume synthesis tasks in order, playing each when ready; exits
         on the ``None`` sentinel pushed by :meth:`drain`."""
+        queue = self._queue
+        if queue is None:
+            return
         while True:
-            item = await self._queue.get()
+            item = await queue.get()
             if item is None:
                 break
             sentence, task = item
@@ -495,6 +506,7 @@ class StreamingSpeaker:
             return
         async with self._get_lock():
             self._ensure_player()
+            assert self._queue is not None
             this = asyncio.create_task(_synthesize(sentence))
             await self._queue.put((sentence, this))
 
@@ -507,6 +519,7 @@ class StreamingSpeaker:
                 self._player = None
                 self._queue = None
                 return
+            assert self._queue is not None
             await self._queue.put(None)
             try:
                 await player

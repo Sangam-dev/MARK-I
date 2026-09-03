@@ -727,6 +727,17 @@ def classify_tool_request(text: str) -> ToolDecision | None:
 
     lowered = cleaned.lower()
 
+    if lowered in {
+        "exit",
+        "quit",
+        "goodbye",
+        "good bye",
+        "close aura",
+        "close the assistant",
+        "stop the assistant",
+    }:
+        return ToolDecision(task_name="quit_app", parameters={})
+
     # "focus X" / "bring X to the front" — check before _OPEN_RE so it
     # doesn't get stolen by the open_app path. These always mean an
     # existing window.

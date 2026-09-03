@@ -2,6 +2,8 @@ import { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, screen } from "el
 import { fileURLToPath } from "url";
 import path from "path";
 import { spawn } from "child_process";
+import fs from "fs";
+import os from "os";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 if (process.platform === "linux") {
     app.commandLine.appendSwitch("ozone-platform-hint", "x11");
@@ -263,15 +265,21 @@ ipcMain.on("manual-compact", () => {
     if (!isCompact && !isAnimating)
         enterCompact();
 });
+ipcMain.handle("get-auth-token", () => {
+    const tokenPath = path.join(os.homedir(), ".kancha", "auth_token");
+    return fs.readFileSync(tokenPath, "utf8").trim();
+});
 // Frontend voice command ("quit"/"exit") → stop backend and exit. The
 // renderer only fires this after the spoken confirmation has finished.
-ipcMain.on("quit-app", quitApp);
+ipcMain.on("quit-app", (_event, confirmation) => {
+    if (confirmation !== true)
+        return;
+    quitApp();
+});
 ipcMain.on("restore-full", () => {
     if (isCompact && !isAnimating)
         exitCompact();
 }); // cube click → restore
-ipcMain.on("compact-ready", () => { });
-ipcMain.on("set-click-through", () => { });
 app.on("window-all-closed", () => app.quit());
 // Make sure the spawned Python backend never outlives the Electron app.
 app.on("before-quit", stopBackend);

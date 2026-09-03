@@ -13,17 +13,6 @@ import {
     type RAGStats,
 } from "./lib/api";
 
-declare global {
-    interface Window {
-        electronAPI?: {
-            onEnterCompact: (cb: () => void) => () => void;
-            onEnterFull: (cb: () => void) => () => void;
-            requestRestore: () => void;
-            requestQuit: () => void;
-        };
-    }
-}
-
 type AState = "sleeping" | "idle" | "listening" | "thinking" | "speaking";
 type PanelId =
     | "settings"
@@ -1307,7 +1296,7 @@ export default function App() {
                 const deadline = Date.now() + 8000;
                 const tryQuit = () => {
                     if (DONE_STATES.has(astateRef.current) || Date.now() >= deadline) {
-                        window.electronAPI?.requestQuit?.();
+                        window.electronAPI?.requestQuit?.(true);
                         return;
                     }
                     setTimeout(tryQuit, 200);
@@ -1480,11 +1469,11 @@ export default function App() {
     // IPC: main process tells us to switch mode
     // Main drives the timing — it sends enter-compact/enter-full at the right moment
     useEffect(() => {
-        const offCompact = window.electronAPI?.onEnterCompact(() => {
+        const offCompact = window.electronAPI?.onEnterCompact?.(() => {
             setPanel(null);
             setMode("compact");
         });
-        const offFull = window.electronAPI?.onEnterFull(() => {
+        const offFull = window.electronAPI?.onEnterFull?.(() => {
             setMode("full");
         });
         return () => {
@@ -1719,7 +1708,7 @@ export default function App() {
                 title="Click to restore AURA"
                 onClick={() => {
                     if (mode === "compact")
-                        window.electronAPI?.requestRestore();
+                        window.electronAPI?.requestRestore?.();
                 }}
                 style={{
                     position: "absolute",

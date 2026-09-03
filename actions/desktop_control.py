@@ -24,6 +24,7 @@ Supported actions:
 from __future__ import annotations
 
 import json
+import ast
 import logging
 import os
 import re
@@ -928,6 +929,33 @@ def _execute_sandboxed(code: str, player=None) -> str:
     if not code or code == "UNSAFE":
         return "This action cannot be performed safely with the available tools."
 
+    try:
+        tree = ast.parse(code, mode="exec")
+    except SyntaxError as exc:
+        return f"Execution error: {exc}"
+
+    allowed_roots = {"Path", "time", "shutil", "os_path", "jarvis_input", "print", "desktop"}
+    allowed_attributes = {
+        ("time", "sleep"),
+        ("shutil", "copy2"), ("shutil", "copytree"), ("shutil", "disk_usage"),
+        ("os_path", "exists"), ("os_path", "isfile"), ("os_path", "isdir"),
+        ("jarvis_input", "click"), ("jarvis_input", "type_text"),
+        ("jarvis_input", "hotkey"), ("jarvis_input", "screenshot"),
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom, ast.Lambda, ast.FunctionDef, ast.ClassDef)):
+            return "This action cannot be performed safely with the available tools."
+        if isinstance(node, ast.Name) and node.id not in allowed_roots:
+            return "This action cannot be performed safely with the available tools."
+        if isinstance(node, ast.Attribute):
+            if not isinstance(node.value, ast.Name) or (node.value.id, node.attr) not in allowed_attributes:
+                return "This action cannot be performed safely with the available tools."
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id != "Path":
+                return "This action cannot be performed safely with the available tools."
+            if isinstance(node.func, ast.Attribute) and not isinstance(node.func.value, ast.Name):
+                return "This action cannot be performed safely with the available tools."
+
     sandbox      = _build_sandbox()
     output_lines: list[str] = []
     sandbox["__builtins__"]["print"] = lambda *a, **_: output_lines.append(
@@ -980,12 +1008,11 @@ Task: {task}"""
         resp = client.models.generate_content(
             model=os.getenv(
                 "GEMINI_MODEL",
-                os.getenv("gemini-flash-lite-latest")
-                .split(",")[0],
+                "gemini-2.0-flash",
             ),
             contents=prompt,
         )
-        return resp.text.strip()
+        return (resp.text or "").strip()
     except Exception as e:
         return f"ERROR: {e}"
 

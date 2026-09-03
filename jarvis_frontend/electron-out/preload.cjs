@@ -12,7 +12,8 @@ electron_1.contextBridge.exposeInMainWorld('electronAPI', {
     },
     // Ask the main process to restore the full orb (fired when the cube is clicked).
     requestRestore: () => electron_1.ipcRenderer.send('restore-full'),
+    getAuthToken: () => electron_1.ipcRenderer.invoke('get-auth-token'),
     // Ask the main process to stop the backend and exit (fired after a spoken
     // "quit"/"exit" confirmation, and by the tray's "Quit AURA" via main directly).
-    requestQuit: () => electron_1.ipcRenderer.send('quit-app'),
+    requestQuit: (confirmation = false) => electron_1.ipcRenderer.send('quit-app', confirmation),
 });

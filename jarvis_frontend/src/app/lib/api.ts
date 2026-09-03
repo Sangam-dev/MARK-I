@@ -7,6 +7,8 @@
  * when wiring a new panel to real backend data.
  */
 
+import { getAuthToken } from "./auth";
+
 const DEFAULT_HTTP_URL = "http://127.0.0.1:8765";
 
 function resolveHttpUrl(): string {
@@ -15,15 +17,22 @@ function resolveHttpUrl(): string {
 }
 
 async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(`${resolveHttpUrl()}${path}`);
+  const token = await getAuthToken();
+  const res = await fetch(`${resolveHttpUrl()}${path}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
   if (!res.ok) throw new Error(`GET ${path} -> ${res.status}`);
   return res.json() as Promise<T>;
 }
 
 async function putJson<T>(path: string, body: unknown): Promise<T> {
+  const token = await getAuthToken();
   const res = await fetch(`${resolveHttpUrl()}${path}`, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
     body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(await detailOf(res));
@@ -45,7 +54,11 @@ async function detailOf(res: Response): Promise<string> {
 }
 
 async function deleteJson<T>(path: string): Promise<T> {
-  const res = await fetch(`${resolveHttpUrl()}${path}`, { method: "DELETE" });
+  const token = await getAuthToken();
+  const res = await fetch(`${resolveHttpUrl()}${path}`, {
+    method: "DELETE",
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
   if (!res.ok) throw new Error(`DELETE ${path} -> ${res.status}`);
   return res.json() as Promise<T>;
 }
@@ -57,7 +70,12 @@ async function deleteJson<T>(path: string): Promise<T> {
  * than "415".
  */
 async function postForm<T>(path: string, form: FormData): Promise<T> {
-  const res = await fetch(`${resolveHttpUrl()}${path}`, { method: "POST", body: form });
+  const token = await getAuthToken();
+  const res = await fetch(`${resolveHttpUrl()}${path}`, {
+    method: "POST",
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body: form,
+  });
   if (!res.ok) {
     let detail = `${res.status}`;
     try {

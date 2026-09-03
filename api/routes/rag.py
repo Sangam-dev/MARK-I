@@ -37,6 +37,7 @@ from api.schemas import (
 router = APIRouter(prefix="/rag", tags=["rag"])
 
 logger = logging.getLogger("kancha.api.routes.rag")
+MAX_UPLOAD_SIZE = 50 * 1024 * 1024
 
 
 def _require_rag(request: Request):
@@ -91,7 +92,11 @@ async def upload_document(
     service = _require_ingest(request)
 
     try:
+        if file.size is not None and file.size > MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=413, detail="File too large")
         data = await file.read()
+        if len(data) > MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=413, detail="File too large")
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Could not read upload: {exc}")
     finally:

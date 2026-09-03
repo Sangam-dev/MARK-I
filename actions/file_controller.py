@@ -2,7 +2,9 @@ import os
 import re
 import shutil
 import platform
+import subprocess
 import time
+from fnmatch import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
@@ -19,13 +21,25 @@ _SAFE_ROOTS: list[Path] = [
     Path.home(),
 ]
 
+_DENY_PATTERNS = (
+    ".ssh", ".gnupg", ".aws", ".config", ".env",
+    "*.pem", "*.key", "id_rsa", "id_ed25519",
+)
+
 def _is_safe_path(target: Path) -> bool:
     """Verilen path _SAFE_ROOTS içinde mi? Değilse işlemi reddet."""
     try:
         resolved = target.resolve()
-        return any(
+        inside_safe_root = any(
             resolved == root.resolve() or resolved.is_relative_to(root.resolve())
             for root in _SAFE_ROOTS
+        )
+        if not inside_safe_root:
+            return False
+        return not any(
+            fnmatch(part.lower(), pattern.lower())
+            for part in resolved.parts
+            for pattern in _DENY_PATTERNS
         )
     except Exception:
         return False
@@ -528,6 +542,27 @@ def resolve_fuzzy_name(
         return None, [(e.name, str(e.path)) for _, e in best[:max_results]]
     return None, []
 
+
+def resolve_and_open(name: str) -> str:
+    """Resolve a spoken file name and open it with the desktop handler."""
+    path, candidates = resolve_fuzzy_name(name)
+    if candidates:
+        listed = "; ".join(f"{label} ({location})" for label, location in candidates)
+        return f"Multiple possible matches: {listed}"
+    if not path:
+        return f"Could not find a file matching {name!r}."
+
+    try:
+        if _OS == "Linux":
+            subprocess.Popen(["xdg-open", path])
+        elif _OS == "Darwin":
+            subprocess.Popen(["open", path])
+        else:
+            os.startfile(path)  # type: ignore[attr-defined]
+        return f"Opened: {_pretty(Path(path))}"
+    except Exception as exc:
+        return f"Could not open {path}: {exc}"
+
 def _safe_trash(target: Path) -> str:
 
     if not _SEND2TRASH:
@@ -931,6 +966,9 @@ def file_controller(
 
         elif action == "read":
             return read_file(path, name=name)
+
+        elif action == "open":
+            return resolve_and_open(name or path)
 
         elif action == "write":
             return write_file(

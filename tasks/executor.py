@@ -273,8 +273,11 @@ class TaskExecutor:
             return
 
         try:
-            result = await self._dispatch(
-                event.task_name, dict(event.parameters), event.session_id
+            result = await asyncio.wait_for(
+                self._dispatch(
+                    event.task_name, dict(event.parameters), event.session_id
+                ),
+                timeout=30.0,
             )
         except Exception as exc:
             logger.exception("Task %s failed with exception", event.task_name)
