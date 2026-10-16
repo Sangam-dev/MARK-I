@@ -354,11 +354,7 @@ class OpenAICompatClient(LLMProvider):
                     data = await self._post_chat(
                         messages, model, max_tokens, api_key=entry.api_key
                     )
-                    text = (
-                        data.get("choices", [{}])[0].get("message", {}).get("content")
-                        or ""
-                    )
-                    return text
+                    return self._extract_content(data) or ""
                 except Exception as exc:  # noqa: BLE001
                     action = self._classify(exc, entry, model)
                     if action == "dead":
@@ -377,6 +373,18 @@ class OpenAICompatClient(LLMProvider):
             await self._lane.advance_active()
         raise RuntimeError(
             f"{self.provider_label}: all credentials + models exhausted"
+        )
+
+    @staticmethod
+    def _extract_content(data: dict[str, Any]) -> str:
+        """Pull the assistant text out of a non-stream response body.
+
+        Overridable so wire-format variants (see
+        :class:`reasoning.providers.ollama.OllamaClient`) can parse their
+        own envelope; the default is the OpenAI ``choices`` shape.
+        """
+        return (
+            data.get("choices", [{}])[0].get("message", {}).get("content") or ""
         )
 
     async def _open_stream(
@@ -509,11 +517,17 @@ class OpenAICompatClient(LLMProvider):
             return
 
         buffer: list[str] = []
+        stream_started = time.perf_counter()
         try:
             gen = await self._try_with_active_key(
                 self._messages_from_history(history, full_system),
                 is_stream=True,
                 max_tokens=max_output_tokens,
+            )
+            logger.info(
+                "%s TTFT: first token after %.2fs",
+                self.provider_label,
+                time.perf_counter() - stream_started,
             )
             async for chunk in gen:
                 buffer.append(chunk)

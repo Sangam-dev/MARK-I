@@ -25,6 +25,7 @@ from reasoning.llm_client import GeminiClient
 
 from reasoning.providers.base import LLMProvider
 from reasoning.providers.gemini_adapter import GeminiAdapter
+from reasoning.providers.ollama import OllamaClient
 from reasoning.providers.openai_compat import (
     OpenAICompatClient,
     ProviderConfig,
@@ -46,7 +47,7 @@ class ProviderSpec:
 
     name: str
     label: str
-    kind: str  # "gemini" | "openai_compat"
+    kind: str  # "gemini" | "openai_compat" | "ollama"
     base_url: str = ""
     key_prefix: str = ""
     model_env: str = ""
@@ -76,12 +77,12 @@ PROVIDERS: dict[str, ProviderSpec] = {
     "ollama": ProviderSpec(
         name="ollama",
         label="Ollama",
-        kind="openai_compat",
-        base_url=os.getenv("KANCHA_OLLAMA_BASE_URL", "http://localhost:11434/v1"),
+        kind="ollama",
+        base_url=os.getenv("KANCHA_OLLAMA_BASE_URL", "http://localhost:11434"),
         model_env="KANCHA_OLLAMA_LLM_MODEL",
         fallbacks_env="KANCHA_OLLAMA_LLM_FALLBACKS",
-        default_models=("llama3.2",),
-        notes="local daemon, no credentials",
+        default_models=("qwen3:8b",),
+        notes="local daemon via native /api/chat: thinking off, model pinned",
     ),
 }
 
@@ -122,15 +123,17 @@ async def _build_client(
             )
         )
     else:
-        client = OpenAICompatClient(
-            ProviderConfig(
-                name=spec.name,
-                base_url=spec.base_url,
-                key_prefix=spec.key_prefix,
-                model_env=spec.model_env,
-                fallbacks_env=spec.fallbacks_env,
-                default_models=list(spec.default_models),
-            ),
+        config = ProviderConfig(
+            name=spec.name,
+            base_url=spec.base_url,
+            key_prefix=spec.key_prefix,
+            model_env=spec.model_env,
+            fallbacks_env=spec.fallbacks_env,
+            default_models=list(spec.default_models),
+        )
+        client_cls = OllamaClient if spec.kind == "ollama" else OpenAICompatClient
+        client = client_cls(
+            config,
             token_log=token_log,
             lane=lane,
             lane_direction=lane_direction,
