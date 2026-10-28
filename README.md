@@ -193,7 +193,7 @@ kancha/
 Requires **Python 3.12+** and [`uv`](https://github.com/astral-sh/uv).
 
 ```bash
-git clone <repo-url>
+git clone [<repo-url>](https://github.com/Sangam-dev/MARK-I.git)
 cd kancha
 uv sync
 ```
